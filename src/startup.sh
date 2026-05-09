@@ -375,14 +375,22 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
+# 6b. SMS reply bridge (optional — needs TWILIO_* in .env, skip with SKIP_SMS_BRIDGE=1)
+if [ "${SKIP_SMS_BRIDGE:-}" = "1" ]; then
+  echo "  ~ sms bridge (skipped via SKIP_SMS_BRIDGE)"
+elif grep -q "^TWILIO_ACCOUNT_SID=." .env 2>/dev/null && grep -q "^TWILIO_AUTH_TOKEN=." .env 2>/dev/null && grep -q "^TWILIO_PHONE_NUMBER=." .env 2>/dev/null; then
+  if ! pgrep -f "sms-bridge" > /dev/null 2>&1; then
+    echo "  Starting SMS reply bridge..."
+    python3 src/sms-bridge.py > logs/sms-bridge.log 2>&1 &
+    echo "  ✓ sms bridge"
+  else
+    echo "  ✓ sms bridge (already running)"
+  fi
+else
+  echo "  ~ sms bridge (TWILIO_* env missing — optional)"
+fi
+
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
-#
-# `python3` on $PATH is unpredictable across installs (miniconda, system,
-# Homebrew). The bridge itself self-rescues by re-execing under a known-good
-# interpreter (see top of src/discord-bridge.py), but launching it with the
-# right one in the first place avoids the wasted process + traceback noise.
-# Probe a fixed list of candidates in priority order; first one with discord.py
-# wins. Same probe is also what's used in the bridge's rescue fallback.
 if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" "$HOME/.claude/channels/discord/.env" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
