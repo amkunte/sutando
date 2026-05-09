@@ -20,6 +20,7 @@ Checks:
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -810,16 +811,31 @@ def run_all_checks() -> list[dict]:
 
     # Messaging bridges (optional — only check if configured and not skipped)
     skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
+    skip_sms = (env_path.exists() and "SKIP_SMS_BRIDGE=1" in env_path.read_text()) or os.environ.get("SKIP_SMS_BRIDGE") == "1"
     channels_dir = Path.home() / ".claude" / "channels"
-    for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge")]:
+    # sms-bridge is configured in workspace .env (TWILIO_*) rather than ~/.claude/channels/.
+    # Configured = all three TWILIO_* vars present AND non-empty in .env.
+    sms_configured = False
+    if env_path.exists():
+        env_text = env_path.read_text()
+        sms_configured = all(
+            re.search(rf"^{k}=[^\s\"']+", env_text, re.MULTILINE)
+            for k in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+        )
+    for name, proc_name in [("telegram-bridge", "telegram-bridge"), ("discord-bridge", "discord-bridge"), ("sms-bridge", "sms-bridge")]:
         channel_name = name.replace("-bridge", "")
         if channel_name == "telegram" and skip_telegram:
             continue
-        env_file = channels_dir / channel_name / ".env"
-        access_file = channels_dir / channel_name / "access.json"
-        # Check if configured via either .env or access.json
-        if not env_file.exists() and not access_file.exists():
-            continue
+        if channel_name == "sms":
+            # Different config path: workspace .env (TWILIO_*), not ~/.claude/channels/sms/.
+            if skip_sms or not sms_configured:
+                continue
+        else:
+            env_file = channels_dir / channel_name / ".env"
+            access_file = channels_dir / channel_name / "access.json"
+            # Check if configured via either .env or access.json
+            if not env_file.exists() and not access_file.exists():
+                continue
         try:
             # Anchor on the .py suffix so we don't match unrelated processes
             # whose command line happens to contain "discord-bridge" (shell
