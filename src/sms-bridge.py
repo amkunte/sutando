@@ -97,7 +97,20 @@ def parse_task_file(path: Path) -> dict | None:
     return out
 
 
+DELIVERY_CHECK_DELAY = 4   # seconds to wait before polling status
+DELIVERY_FAIL_STATES = {"undelivered", "failed"}
+DELIVERY_OK_STATES = {"delivered", "sent", "queued", "sending", "accepted"}
+
+
+def _twilio_auth_header() -> str:
+    auth = (TWILIO_ACCOUNT_SID + ":" + TWILIO_AUTH_TOKEN).encode()
+    return "Basic " + base64.b64encode(auth).decode()
+
+
 def send_sms(to_num: str, body: str) -> tuple[bool, str]:
+    """Enqueue an SMS via Twilio. Returns (ok, sid_or_err) where ok=True means
+    the message was accepted by Twilio (HTTP 201). Delivery status comes
+    later via twilio_message_status()."""
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER):
         return False, "missing TWILIO_* env"
     url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
@@ -108,8 +121,7 @@ def send_sms(to_num: str, body: str) -> tuple[bool, str]:
         "Body": body,
     }).encode()
     req = urllib.request.Request(url, data=data)
-    auth = (TWILIO_ACCOUNT_SID + ":" + TWILIO_AUTH_TOKEN).encode()
-    req.add_header("Authorization", "Basic " + base64.b64encode(auth).decode())
+    req.add_header("Authorization", _twilio_auth_header())
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             payload = json.loads(resp.read())
@@ -124,6 +136,34 @@ def send_sms(to_num: str, body: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def twilio_message_status(sid: str) -> tuple[str, str]:
+    """Fetch (status, error_code) for a Twilio Message SID. Empty strings on error."""
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and sid):
+        return "", ""
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages/{sid}.json"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", _twilio_auth_header())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read())
+            return payload.get("status", ""), str(payload.get("error_code") or "")
+    except Exception:
+        return "", ""
+
+
+def telegram_fallback(body: str, reason: str) -> bool:
+    """Drop a proactive- file so the existing telegram-bridge delivers it.
+    Use when SMS shows undeliverable so the owner still gets the reply."""
+    try:
+        RESULTS_DIR.mkdir(exist_ok=True)
+        ts = int(time.time() * 1000)
+        path = RESULTS_DIR / f"proactive-sms-fallback-{ts}.txt"
+        path.write_text(f"[SMS undelivered: {reason} — sent via Telegram instead]\n\n{body}")
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
     load_env()
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER):
@@ -135,6 +175,9 @@ def main() -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
 
     pending: dict[str, str] = {}  # task_id -> from_number
+    # SIDs we've enqueued but haven't yet confirmed delivery for.
+    # value = (task_id, sender, body, sent_ts)
+    in_flight: dict[str, tuple[str, str, str, float]] = {}
     print(f"SMS bridge started. Polling tasks/ + results/ every {POLL_SECS}s.", flush=True)
 
     # Backfill: any existing tasks/ files from twilio_sms get registered so that
@@ -181,17 +224,51 @@ def main() -> None:
             sender = pending[task_id]
             ok, sid_or_err = send_sms(sender, body)
             if ok:
-                print(f"  → SMS to {sender} (sid={sid_or_err}, {len(body)}b)", flush=True)
+                print(f"  → SMS enqueued to {sender} (sid={sid_or_err}, {len(body)}b)", flush=True)
+                # Don't unlink yet — wait for delivery status to confirm. If
+                # carrier rejects (e.g. A2P 10DLC error 30034), we fall back
+                # to Telegram so the owner still gets the reply.
+                in_flight[sid_or_err] = (task_id, sender, body, time.time())
                 result_path.unlink(missing_ok=True)
                 pending.pop(task_id, None)
             else:
-                # Permanent failure (4xx) shouldn't loop forever — drop after 5 min.
+                # HTTP-level failure (Twilio rejected the request, e.g. auth) —
+                # fall back to Telegram once, then drop. Don't loop forever.
                 age = time.time() - result_path.stat().st_mtime
-                if age > 300:
+                if age > 60:
                     print(f"  giving up on {task_id} after {int(age)}s: {sid_or_err}", flush=True)
+                    telegram_fallback(body, f"twilio enqueue failed: {sid_or_err}")
+                    result_path.unlink(missing_ok=True)
                     pending.pop(task_id, None)
                 else:
-                    print(f"  send failed for {task_id}: {sid_or_err} (will retry)", flush=True)
+                    print(f"  enqueue failed for {task_id}: {sid_or_err} (will retry)", flush=True)
+
+        # 3. Verify delivery status for in-flight messages. If Twilio reports
+        # undelivered/failed, fall back to Telegram so the user still gets it.
+        # We give Twilio a few seconds before checking — initial state is
+        # always "queued" and only flips once the carrier responds.
+        now = time.time()
+        for sid in list(in_flight.keys()):
+            task_id, sender, body, sent_ts = in_flight[sid]
+            age = now - sent_ts
+            if age < DELIVERY_CHECK_DELAY:
+                continue
+            status, err = twilio_message_status(sid)
+            if status in DELIVERY_FAIL_STATES:
+                print(f"  ✗ SMS {sid} status={status} err={err} → Telegram fallback", flush=True)
+                telegram_fallback(body, f"twilio status={status} err={err}")
+                in_flight.pop(sid, None)
+            elif status in {"delivered", "sent"}:
+                print(f"  ✓ SMS {sid} delivered", flush=True)
+                in_flight.pop(sid, None)
+            elif age > 60:
+                # Stuck in queued/sending for >60s — treat as failed and fall back.
+                print(f"  ⚠ SMS {sid} stuck status={status} after {int(age)}s → Telegram fallback", flush=True)
+                telegram_fallback(body, f"twilio stuck status={status}")
+                in_flight.pop(sid, None)
+            elif status and status not in DELIVERY_OK_STATES:
+                # Unknown status — log once and let it age out.
+                print(f"  ? SMS {sid} unexpected status={status}", flush=True)
 
         time.sleep(POLL_SECS)
 
