@@ -1527,6 +1527,16 @@ const server = createServer(async (req, res) => {
   </Connect>
 </Response>`);
 
+		} else if (path === '/twilio/sms' && req.method === 'POST') {
+			const form = new URLSearchParams(await readBody(req));
+			const sender = form.get('From') ?? 'unknown';
+			const body = form.get('Body') ?? '';
+			console.log(`${ts()} [SMS] from=${sender} body=${body.slice(0, 80)}`);
+			const taskId = `task-${Date.now()}`;
+			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: SMS from ${sender}: ${body}\nsource: twilio_sms\nfrom: ${sender}\n`;
+			writeFileSync(join(WORKSPACE_DIR, 'tasks', `${taskId}.txt`), taskContent);
+			twimlResponse(res, `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Message>Got it. Sutando is on it.</Message></Response>`);
+
 		} else if (path === '/twilio/status' && req.method === 'POST') {
 			const form = new URLSearchParams(await readBody(req));
 			const sid = form.get('CallSid') ?? '';
