@@ -3579,6 +3579,7 @@ function renderAmazonOrdersHtml(rawJson: string): string {
       <thead>
         <tr>
           <th data-key="item" data-table="active">Item</th>
+          <th data-key="total_spent" data-table="active" class="amount">Price</th>
           <th data-key="status" data-table="active">Status</th>
           <th data-key="ordered_date" data-table="active">Ordered</th>
           <th data-key="shipped_date" data-table="active">Shipped</th>
@@ -3594,6 +3595,7 @@ function renderAmazonOrdersHtml(rawJson: string): string {
       <thead>
         <tr>
           <th data-key="item" data-table="delivered">Item</th>
+          <th data-key="total_spent" data-table="delivered" class="amount">Price</th>
           <th data-key="status" data-table="delivered">Status</th>
           <th data-key="ordered_date" data-table="delivered">Ordered</th>
           <th data-key="shipped_date" data-table="delivered">Shipped</th>
@@ -3642,10 +3644,20 @@ function renderAmazonOrdersHtml(rawJson: string): string {
     const orders = data.orders || [];
     const inProgress = orders.filter(o => o.status !== 'delivered');
     const delivered = orders.filter(o => o.status === 'delivered');
+    let totalSpent = 0;
+    let pricedCount = 0;
+    for (const o of orders) {
+      if (typeof o.total_spent === 'number') {
+        totalSpent += o.total_spent;
+        pricedCount++;
+      }
+    }
+    const unpriced = orders.length - pricedCount;
     summary.innerHTML = \`
       <div class="stat"><div class="label">Total</div><div class="value">\${orders.length}</div><div class="sub">since \${escHtml(data.since || '2026-01-01')}</div></div>
       <div class="stat in-progress"><div class="label">In progress</div><div class="value">\${inProgress.length}</div><div class="sub">ordered + shipped</div></div>
       <div class="stat delivered"><div class="label">Delivered</div><div class="value">\${delivered.length}</div><div class="sub">in this window</div></div>
+      <div class="stat"><div class="label">Total spent</div><div class="value">$\${totalSpent.toFixed(2)}</div><div class="sub">\${pricedCount}/\${orders.length} priced\${unpriced > 0 ? ' • ' + unpriced + ' grocery' : ''}</div></div>
     \`;
   }
 
@@ -3662,20 +3674,32 @@ function renderAmazonOrdersHtml(rawJson: string): string {
     diffBanner.innerHTML = '<div style="font-size:13px;margin-bottom:14px;padding:10px 14px;background:#181826;border-radius:8px;border-left:3px solid #4ecca3;">Since last scan: ' + parts.join(' • ') + '</div>';
   }
 
+  function fmtPrice(o) {
+    if (typeof o.total_spent !== 'number') return '<span class="date-cell muted">—</span>';
+    if (o.total_spent === 0) return '<span class="date-cell muted">$0 <span style="font-size:10px;opacity:0.7">(gift card)</span></span>';
+    return '<span class="date-cell" style="color:#e8e8ee;font-weight:500">$' + o.total_spent.toFixed(2) + '</span>';
+  }
+
   function sortAndRender(orders, tbody, sortKey, sortDir) {
     orders.sort((a, b) => {
       let av = a[sortKey], bv = b[sortKey];
-      if (av === null || av === undefined) av = '';
-      if (bv === null || bv === undefined) bv = '';
-      if (typeof av === 'string') av = av.toLowerCase();
-      if (typeof bv === 'string') bv = bv.toLowerCase();
+      // Numeric sort for price
+      if (sortKey === 'total_spent') {
+        av = typeof av === 'number' ? av : -1;
+        bv = typeof bv === 'number' ? bv : -1;
+      } else {
+        if (av === null || av === undefined) av = '';
+        if (bv === null || bv === undefined) bv = '';
+        if (typeof av === 'string') av = av.toLowerCase();
+        if (typeof bv === 'string') bv = bv.toLowerCase();
+      }
       if (av < bv) return sortDir === 'asc' ? -1 : 1;
       if (av > bv) return sortDir === 'asc' ? 1 : -1;
       return 0;
     });
     tbody.innerHTML = '';
     if (orders.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">No orders.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No orders.</td></tr>';
       return;
     }
     for (const o of orders) {
@@ -3683,6 +3707,7 @@ function renderAmazonOrdersHtml(rawJson: string): string {
       const channelClass = (o.channel || 'amazon').replace(/[^a-z-]/g, '');
       tr.innerHTML = \`
         <td><div class="item">\${escHtml(o.item)}</div><div class="channel \${channelClass}">\${escHtml((o.channel || 'amazon').replace('-', ' '))}\${o.split_shipment ? ' · split' : ''}</div></td>
+        <td class="amount" style="text-align:right;font-variant-numeric:tabular-nums">\${fmtPrice(o)}</td>
         <td><span class="status \${escHtml(o.status || 'ordered')}">\${escHtml((o.status || 'ordered').replace(/_/g, ' '))}</span></td>
         <td>\${fmtDate(o.ordered_date)}</td>
         <td>\${fmtDate(o.shipped_date)}</td>
@@ -3717,12 +3742,14 @@ function renderAmazonOrdersHtml(rawJson: string): string {
     th.addEventListener('click', () => {
       const k = th.dataset.key;
       const tableType = th.dataset.table;
+      // String columns default ascending; date/price columns default descending (most recent / largest first)
+      const defaultDescKeys = new Set(['ordered_date', 'shipped_date', 'delivered_date', 'total_spent']);
       if (tableType === 'active') {
         if (k === activeSortKey) activeSortDir = (activeSortDir === 'asc' ? 'desc' : 'asc');
-        else { activeSortKey = k; activeSortDir = (k === 'item' || k === 'status') ? 'asc' : 'desc'; }
+        else { activeSortKey = k; activeSortDir = defaultDescKeys.has(k) ? 'desc' : 'asc'; }
       } else {
         if (k === deliveredSortKey) deliveredSortDir = (deliveredSortDir === 'asc' ? 'desc' : 'asc');
-        else { deliveredSortKey = k; deliveredSortDir = (k === 'item' || k === 'status') ? 'asc' : 'desc'; }
+        else { deliveredSortKey = k; deliveredSortDir = defaultDescKeys.has(k) ? 'desc' : 'asc'; }
       }
       renderTables();
     });
