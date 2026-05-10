@@ -28,6 +28,8 @@ Agent-driven scan (Gmail MCP access). The cron fires the prompt in `scan-prompt.
       "delivered_date": "YYYY-MM-DD or null",
       "status": "ordered|shipped|out_for_delivery|delivered",
       "split_shipment": false,
+      "total_spent": 88.18,
+      "currency": "USD",
       "notes": "optional"
     }
   ],

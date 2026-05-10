@@ -20,6 +20,12 @@ For each message returned, extract from the subject line:
 - The status (Ordered / Shipped / Out for delivery / Delivered)
 - The date
 
+For each "Ordered:" email (sender `auto-confirm@amazon.com`), call `get_thread` and read the body to extract:
+- The full (un-truncated) item name(s) — the body has the full strings, useful for the `item` field
+- `total_spent` — the `Grand Total: X USD` line. If $0.00, it was paid via gift card / rewards points; record `total_spent: 0.00` and add a note with the item subtotal so the owner has the line-item value.
+
+Whole Foods / Amazon Fresh confirmation emails do NOT include a total in the email — set `total_spent: null` for those orders.
+
 For multi-item orders (subjects ending in "and N more items"), use the first item name as the canonical title and add `"split_shipment": true` if multiple "Shipped" emails exist for the same first-item title.
 
 ## Dedupe and merge
