@@ -3045,6 +3045,288 @@ function escapeHtml(s: string): string {
 	return String(s).replace(/[<>&"']/g, c => (({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'} as Record<string, string>)[c] || c));
 }
 
+// /amazon page — renders skills/amazon-orders/state/orders.json as a sortable
+// table grouped by status (in-progress at top, delivered below).
+function renderAmazonOrdersHtml(rawJson: string): string {
+	let data: any;
+	try { data = JSON.parse(rawJson); } catch (e: any) { data = { last_scan: null, orders: [], scan_history: [], _parse_error: e?.message }; }
+	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
+	const dataJson = JSON.stringify(data).replace(/</g, '\\u003c');
+
+	return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amazon Orders — Sutando</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #e8e8ee; padding: 24px; min-height: 100vh; }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+  h1 { font-size: 22px; font-weight: 700; }
+  h2 { font-size: 14px; font-weight: 600; color: #a0a0b0; margin: 24px 0 10px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .subtitle { color: #707080; font-size: 13px; }
+  .meta { display: flex; gap: 20px; font-size: 13px; color: #888; margin: 12px 0 20px; flex-wrap: wrap; align-items: center; }
+  .meta strong { color: #c0c0d0; font-weight: 600; }
+  .scan-btn { background: #1e4028; color: #4ecca3; border: 1px solid #2a4a36; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .scan-btn:hover:not(:disabled) { background: #2a503a; }
+  .scan-btn:disabled { background: #1a1a2a; color: #444; border-color: #2a2a3e; cursor: wait; }
+  .scan-status { font-size: 12px; color: #4ecca3; margin-left: 8px; }
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .stat { background: #14141e; border: 1px solid #1e1e2a; border-radius: 10px; padding: 14px 16px; }
+  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #707080; margin-bottom: 6px; }
+  .stat .value { font-size: 24px; font-weight: 700; color: #e8e8ee; }
+  .stat .sub { font-size: 11px; color: #888; margin-top: 4px; }
+  .stat.in-progress .value { color: #f0ad4e; }
+  .stat.delivered .value { color: #4ecca3; }
+
+  table { width: 100%; border-collapse: collapse; background: #14141e; border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #1e1e2a; font-size: 13px; }
+  th { background: #1a1a26; color: #a0a0b0; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; cursor: pointer; user-select: none; }
+  th:hover { color: #e8e8ee; }
+  th.sort-asc::after { content: ' ▲'; color: #4ecca3; }
+  th.sort-desc::after { content: ' ▼'; color: #4ecca3; }
+  tbody tr:hover { background: #181826; }
+
+  .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .status.delivered { background: #1e4028; color: #4ecca3; }
+  .status.shipped { background: #1e3a5f; color: #60a5fa; }
+  .status.out_for_delivery { background: #2a3a18; color: #a3e055; }
+  .status.ordered { background: #2a2418; color: #f0ad4e; }
+
+  .item { color: #e8e8ee; font-weight: 500; max-width: 360px; word-wrap: break-word; }
+  .channel { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 3px; }
+  .channel.amazon { color: #ff9900; }
+  .channel.whole-foods { color: #74c365; }
+  .channel.amazon-fresh { color: #2bbf64; }
+  .notes { color: #707080; font-size: 11px; font-style: italic; max-width: 240px; }
+  .date-cell { color: #a0a0b0; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .date-cell.muted { color: #555; }
+
+  .empty { text-align: center; padding: 40px; color: #555; }
+  footer { margin-top: 32px; color: #555; font-size: 11px; text-align: center; }
+  footer a { color: #888; text-decoration: none; }
+  footer a:hover { color: #4ecca3; }
+
+  details { margin-top: 24px; }
+  details summary { cursor: pointer; color: #707080; font-size: 12px; padding: 8px 0; }
+  details summary:hover { color: #a0a0b0; }
+  pre { background: #0a0a12; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 11px; color: #a0a0b0; margin-top: 8px; max-height: 300px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>📦 Amazon Orders</h1>
+      <div class="subtitle">since 2026-01-01 · scanned from Gmail</div>
+      <div style="margin-left:auto"><a href="/" style="color:#707080;font-size:12px;text-decoration:none;border:1px solid #2a2a3e;padding:5px 12px;border-radius:6px;">← Dashboard</a></div>
+    </header>
+
+    <div class="meta">
+      <span><strong>Last scan:</strong> ${escapeHtml(lastScan)}</span>
+      <button class="scan-btn" id="scanBtn" onclick="triggerScan()">⟳ Scan now</button>
+      <span class="scan-status" id="scanStatus"></span>
+    </div>
+
+    <div id="summary" class="summary"></div>
+
+    <div id="diff-banner"></div>
+
+    <h2 id="section-active-title">In progress</h2>
+    <table id="active-table">
+      <thead>
+        <tr>
+          <th data-key="item" data-table="active">Item</th>
+          <th data-key="status" data-table="active">Status</th>
+          <th data-key="ordered_date" data-table="active">Ordered</th>
+          <th data-key="shipped_date" data-table="active">Shipped</th>
+          <th data-key="delivered_date" data-table="active">Delivered</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody id="active-tbody"></tbody>
+    </table>
+
+    <h2 id="section-delivered-title">Delivered</h2>
+    <table id="delivered-table">
+      <thead>
+        <tr>
+          <th data-key="item" data-table="delivered">Item</th>
+          <th data-key="status" data-table="delivered">Status</th>
+          <th data-key="ordered_date" data-table="delivered">Ordered</th>
+          <th data-key="shipped_date" data-table="delivered">Shipped</th>
+          <th data-key="delivered_date" data-table="delivered">Delivered</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody id="delivered-tbody"></tbody>
+    </table>
+
+    <details>
+      <summary>Raw JSON</summary>
+      <pre id="raw-json"></pre>
+    </details>
+
+    <footer>
+      Order data lives at <code>skills/amazon-orders/state/orders.json</code> (gitignored).<br>
+      Auto-scan every 6 hours via the <code>amazon-orders-scan</code> cron. Source: Gmail receipts via Claude MCP.
+    </footer>
+  </div>
+
+<script>
+  const data = ${dataJson};
+  const activeTbody = document.getElementById('active-tbody');
+  const deliveredTbody = document.getElementById('delivered-tbody');
+  const summary = document.getElementById('summary');
+  const diffBanner = document.getElementById('diff-banner');
+  const rawJson = document.getElementById('raw-json');
+  const lastDiff = (data.scan_history && data.scan_history.length) ? data.scan_history[data.scan_history.length - 1] : { added: [], delivered_since_last: [] };
+
+  let activeSortKey = 'ordered_date';
+  let activeSortDir = 'desc';
+  let deliveredSortKey = 'delivered_date';
+  let deliveredSortDir = 'desc';
+
+  function escHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function fmtDate(d) {
+    if (!d) return '<span class="date-cell muted">—</span>';
+    return '<span class="date-cell">' + escHtml(d) + '</span>';
+  }
+
+  function renderSummary() {
+    const orders = data.orders || [];
+    const inProgress = orders.filter(o => o.status !== 'delivered');
+    const delivered = orders.filter(o => o.status === 'delivered');
+    summary.innerHTML = \`
+      <div class="stat"><div class="label">Total</div><div class="value">\${orders.length}</div><div class="sub">since \${escHtml(data.since || '2026-01-01')}</div></div>
+      <div class="stat in-progress"><div class="label">In progress</div><div class="value">\${inProgress.length}</div><div class="sub">ordered + shipped</div></div>
+      <div class="stat delivered"><div class="label">Delivered</div><div class="value">\${delivered.length}</div><div class="sub">in this window</div></div>
+    \`;
+  }
+
+  function renderDiffBanner() {
+    const a = lastDiff.added || [];
+    const d = lastDiff.delivered_since_last || [];
+    if (a.length === 0 && d.length === 0) {
+      diffBanner.innerHTML = '<div style="font-size:12px;color:#555;margin-bottom:14px;">No changes since previous scan.</div>';
+      return;
+    }
+    const parts = [];
+    if (a.length) parts.push('<span style="color:#f0ad4e">+' + a.length + ' newly ordered: ' + a.map(escHtml).join(', ') + '</span>');
+    if (d.length) parts.push('<span style="color:#4ecca3">' + d.length + ' delivered since last scan: ' + d.map(escHtml).join(', ') + '</span>');
+    diffBanner.innerHTML = '<div style="font-size:13px;margin-bottom:14px;padding:10px 14px;background:#181826;border-radius:8px;border-left:3px solid #4ecca3;">Since last scan: ' + parts.join(' • ') + '</div>';
+  }
+
+  function sortAndRender(orders, tbody, sortKey, sortDir) {
+    orders.sort((a, b) => {
+      let av = a[sortKey], bv = b[sortKey];
+      if (av === null || av === undefined) av = '';
+      if (bv === null || bv === undefined) bv = '';
+      if (typeof av === 'string') av = av.toLowerCase();
+      if (typeof bv === 'string') bv = bv.toLowerCase();
+      if (av < bv) return sortDir === 'asc' ? -1 : 1;
+      if (av > bv) return sortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+    tbody.innerHTML = '';
+    if (orders.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No orders.</td></tr>';
+      return;
+    }
+    for (const o of orders) {
+      const tr = document.createElement('tr');
+      const channelClass = (o.channel || 'amazon').replace(/[^a-z-]/g, '');
+      tr.innerHTML = \`
+        <td><div class="item">\${escHtml(o.item)}</div><div class="channel \${channelClass}">\${escHtml((o.channel || 'amazon').replace('-', ' '))}\${o.split_shipment ? ' · split' : ''}</div></td>
+        <td><span class="status \${escHtml(o.status || 'ordered')}">\${escHtml((o.status || 'ordered').replace(/_/g, ' '))}</span></td>
+        <td>\${fmtDate(o.ordered_date)}</td>
+        <td>\${fmtDate(o.shipped_date)}</td>
+        <td>\${fmtDate(o.delivered_date)}</td>
+        <td><span class="notes">\${escHtml(o.notes || '')}</span></td>
+      \`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  function renderTables() {
+    const orders = (data.orders || []).slice();
+    const inProgress = orders.filter(o => o.status !== 'delivered');
+    const delivered = orders.filter(o => o.status === 'delivered');
+
+    document.getElementById('section-active-title').textContent = \`In progress (\${inProgress.length})\`;
+    document.getElementById('section-delivered-title').textContent = \`Delivered (\${delivered.length})\`;
+
+    sortAndRender(inProgress, activeTbody, activeSortKey, activeSortDir);
+    sortAndRender(delivered, deliveredTbody, deliveredSortKey, deliveredSortDir);
+
+    document.querySelectorAll('th[data-key]').forEach(th => {
+      th.classList.remove('sort-asc', 'sort-desc');
+      const tableType = th.dataset.table;
+      const key = tableType === 'active' ? activeSortKey : deliveredSortKey;
+      const dir = tableType === 'active' ? activeSortDir : deliveredSortDir;
+      if (th.dataset.key === key) th.classList.add(dir === 'asc' ? 'sort-asc' : 'sort-desc');
+    });
+  }
+
+  document.querySelectorAll('th[data-key]').forEach(th => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.key;
+      const tableType = th.dataset.table;
+      if (tableType === 'active') {
+        if (k === activeSortKey) activeSortDir = (activeSortDir === 'asc' ? 'desc' : 'asc');
+        else { activeSortKey = k; activeSortDir = (k === 'item' || k === 'status') ? 'asc' : 'desc'; }
+      } else {
+        if (k === deliveredSortKey) deliveredSortDir = (deliveredSortDir === 'asc' ? 'desc' : 'asc');
+        else { deliveredSortKey = k; deliveredSortDir = (k === 'item' || k === 'status') ? 'asc' : 'desc'; }
+      }
+      renderTables();
+    });
+  });
+
+  async function triggerScan() {
+    const btn = document.getElementById('scanBtn');
+    const status = document.getElementById('scanStatus');
+    btn.disabled = true;
+    status.textContent = '⏳ queueing...';
+    try {
+      const r = await fetch('/amazon/scan', { method: 'POST' });
+      const j = await r.json();
+      if (j.ok) {
+        status.textContent = '✓ ' + j.message;
+        let elapsed = 0;
+        const poll = setInterval(async () => {
+          elapsed += 5;
+          if (elapsed > 240) { clearInterval(poll); btn.disabled = false; status.textContent = '⚠ scan still running — refresh in a moment'; return; }
+          const fresh = await fetch('/amazon/data').then(r => r.json()).catch(() => null);
+          if (fresh && fresh.last_scan && fresh.last_scan !== data.last_scan) {
+            clearInterval(poll);
+            status.textContent = '✓ scan complete — refreshing...';
+            setTimeout(() => location.reload(), 800);
+          }
+        }, 5000);
+      } else {
+        status.textContent = '✗ ' + (j.error || 'failed');
+        btn.disabled = false;
+      }
+    } catch (e) {
+      status.textContent = '✗ ' + (e.message || 'network error');
+      btn.disabled = false;
+    }
+  }
+
+  rawJson.textContent = JSON.stringify(data, null, 2);
+  renderSummary();
+  renderDiffBanner();
+  renderTables();
+</script>
+</body>
+</html>`;
+}
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -3293,6 +3575,47 @@ const server = createServer((req, res) => {
 			writeFileSync(`tasks/${taskId}.txt`, taskContent);
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+		}
+		return;
+	}
+
+	// Amazon orders dashboard. Reads skills/amazon-orders/state/orders.json.
+	if (url.pathname === '/amazon') {
+		try {
+			const dataPath = 'skills/amazon-orders/state/orders.json';
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"since":"2026-01-01","orders":[],"scan_history":[]}';
+			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+			res.end(renderAmazonOrdersHtml(raw));
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'text/plain' });
+			res.end('Error reading orders: ' + (e?.message || String(e)));
+		}
+		return;
+	}
+	if (url.pathname === '/amazon/data') {
+		try {
+			const dataPath = 'skills/amazon-orders/state/orders.json';
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"since":"2026-01-01","orders":[],"scan_history":[]}';
+			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+			res.end(raw);
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: e?.message || String(e) }));
+		}
+		return;
+	}
+	if (url.pathname === '/amazon/scan' && req.method === 'POST') {
+		try {
+			const taskId = `task-${Date.now()}`;
+			const promptPath = 'skills/amazon-orders/scan-prompt.md';
+			const promptBody = existsSync(promptPath) ? readFileSync(promptPath, 'utf-8') : '(scan-prompt.md missing — run Amazon orders scan)';
+			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Amazon orders scan (out-of-cycle, triggered from /amazon UI). Follow the instructions in skills/amazon-orders/scan-prompt.md verbatim:\n\n${promptBody}\nsource: web\nfrom: amazon-orders-ui\n`;
+			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min).' }));
 		} catch (e: any) {
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
