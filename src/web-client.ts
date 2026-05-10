@@ -3544,6 +3544,9 @@ function renderAmazonOrdersHtml(rawJson: string): string {
   .notes { color: #707080; font-size: 11px; font-style: italic; max-width: 240px; }
   .date-cell { color: #a0a0b0; font-variant-numeric: tabular-nums; font-size: 12px; }
   .date-cell.muted { color: #555; }
+  .date-cell.return-started { color: #f0ad4e; }
+  .date-cell.refund-issued { color: #4ecca3; font-weight: 500; }
+  .stat.returned .value { color: #b48cff; }
 
   .empty { text-align: center; padding: 40px; color: #555; }
   footer { margin-top: 32px; color: #555; font-size: 11px; text-align: center; }
@@ -3584,6 +3587,8 @@ function renderAmazonOrdersHtml(rawJson: string): string {
           <th data-key="ordered_date" data-table="active">Ordered</th>
           <th data-key="shipped_date" data-table="active">Shipped</th>
           <th data-key="delivered_date" data-table="active">Delivered</th>
+          <th data-key="returns_started_date" data-table="active">Return started</th>
+          <th data-key="refund_issued_date" data-table="active">Refund issued</th>
           <th>Notes</th>
         </tr>
       </thead>
@@ -3600,6 +3605,8 @@ function renderAmazonOrdersHtml(rawJson: string): string {
           <th data-key="ordered_date" data-table="delivered">Ordered</th>
           <th data-key="shipped_date" data-table="delivered">Shipped</th>
           <th data-key="delivered_date" data-table="delivered">Delivered</th>
+          <th data-key="returns_started_date" data-table="delivered">Return started</th>
+          <th data-key="refund_issued_date" data-table="delivered">Refund issued</th>
           <th>Notes</th>
         </tr>
       </thead>
@@ -3646,18 +3653,24 @@ function renderAmazonOrdersHtml(rawJson: string): string {
     const delivered = orders.filter(o => o.status === 'delivered');
     let totalSpent = 0;
     let pricedCount = 0;
+    let returnedCount = 0;
+    let refundedCount = 0;
     for (const o of orders) {
       if (typeof o.total_spent === 'number') {
         totalSpent += o.total_spent;
         pricedCount++;
       }
+      if (o.returns_started_date) returnedCount++;
+      if (o.refund_issued_date) refundedCount++;
     }
     const unpriced = orders.length - pricedCount;
+    const returnedSub = returnedCount > 0 ? \`\${refundedCount}/\${returnedCount} refunded\` : 'no returns';
     summary.innerHTML = \`
       <div class="stat"><div class="label">Total</div><div class="value">\${orders.length}</div><div class="sub">since \${escHtml(data.since || '2026-01-01')}</div></div>
       <div class="stat in-progress"><div class="label">In progress</div><div class="value">\${inProgress.length}</div><div class="sub">ordered + shipped</div></div>
       <div class="stat delivered"><div class="label">Delivered</div><div class="value">\${delivered.length}</div><div class="sub">in this window</div></div>
       <div class="stat"><div class="label">Total spent</div><div class="value">$\${totalSpent.toFixed(2)}</div><div class="sub">\${pricedCount}/\${orders.length} priced\${unpriced > 0 ? ' • ' + unpriced + ' grocery' : ''}</div></div>
+      <div class="stat returned"><div class="label">Returns</div><div class="value">\${returnedCount}</div><div class="sub">\${escHtml(returnedSub)}</div></div>
     \`;
   }
 
@@ -3699,7 +3712,7 @@ function renderAmazonOrdersHtml(rawJson: string): string {
     });
     tbody.innerHTML = '';
     if (orders.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">No orders.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No orders.</td></tr>';
       return;
     }
     for (const o of orders) {
@@ -3712,6 +3725,8 @@ function renderAmazonOrdersHtml(rawJson: string): string {
         <td>\${fmtDate(o.ordered_date)}</td>
         <td>\${fmtDate(o.shipped_date)}</td>
         <td>\${fmtDate(o.delivered_date)}</td>
+        <td>\${o.returns_started_date ? '<span class="date-cell return-started">' + escHtml(o.returns_started_date) + '</span>' : '<span class="date-cell muted">—</span>'}</td>
+        <td>\${o.refund_issued_date ? '<span class="date-cell refund-issued">' + escHtml(o.refund_issued_date) + '</span>' : '<span class="date-cell muted">—</span>'}</td>
         <td><span class="notes">\${escHtml(o.notes || '')}</span></td>
       \`;
       tbody.appendChild(tr);
@@ -3743,7 +3758,7 @@ function renderAmazonOrdersHtml(rawJson: string): string {
       const k = th.dataset.key;
       const tableType = th.dataset.table;
       // String columns default ascending; date/price columns default descending (most recent / largest first)
-      const defaultDescKeys = new Set(['ordered_date', 'shipped_date', 'delivered_date', 'total_spent']);
+      const defaultDescKeys = new Set(['ordered_date', 'shipped_date', 'delivered_date', 'total_spent', 'returns_started_date', 'refund_issued_date']);
       if (tableType === 'active') {
         if (k === activeSortKey) activeSortDir = (activeSortDir === 'asc' ? 'desc' : 'asc');
         else { activeSortKey = k; activeSortDir = defaultDescKeys.has(k) ? 'desc' : 'asc'; }
