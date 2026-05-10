@@ -30,6 +30,8 @@ Agent-driven scan (Gmail MCP access). The cron fires the prompt in `scan-prompt.
       "split_shipment": false,
       "total_spent": 88.18,
       "currency": "USD",
+      "returns_started_date": "YYYY-MM-DD or null",
+      "refund_issued_date": "YYYY-MM-DD or null",
       "notes": "optional"
     }
   ],
