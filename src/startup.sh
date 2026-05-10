@@ -229,6 +229,21 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
+# 6b. SMS reply bridge (optional — needs TWILIO_* in .env, skip with SKIP_SMS_BRIDGE=1)
+if [ "${SKIP_SMS_BRIDGE:-}" = "1" ]; then
+  echo "  ~ sms bridge (skipped via SKIP_SMS_BRIDGE)"
+elif grep -q "^TWILIO_ACCOUNT_SID=." .env 2>/dev/null && grep -q "^TWILIO_AUTH_TOKEN=." .env 2>/dev/null && grep -q "^TWILIO_PHONE_NUMBER=." .env 2>/dev/null; then
+  if ! pgrep -f "sms-bridge" > /dev/null 2>&1; then
+    echo "  Starting SMS reply bridge..."
+    python3 src/sms-bridge.py > logs/sms-bridge.log 2>&1 &
+    echo "  ✓ sms bridge"
+  else
+    echo "  ✓ sms bridge (already running)"
+  fi
+else
+  echo "  ~ sms bridge (TWILIO_* env missing — optional)"
+fi
+
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN)
 if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" "$HOME/.claude/channels/discord/.env" 2>/dev/null; then
   if ! python3 -c "import discord" 2>/dev/null; then
