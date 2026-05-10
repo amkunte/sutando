@@ -8,6 +8,7 @@ Use these Gmail queries (paginate as needed):
 
 ```
 from:(auto-confirm@amazon.com OR shipment-tracking@amazon.com OR order-update@amazon.com) after:2026/01/01
+from:return@amazon.com after:2026/01/01
 ```
 
 **Important:** do NOT search before 2026/01/01 even if pagination would let you. Owner has set this as the explicit history boundary.
@@ -27,6 +28,19 @@ For each "Ordered:" email (sender `auto-confirm@amazon.com`), call `get_thread` 
 Whole Foods / Amazon Fresh confirmation emails do NOT include a total in the email — set `total_spent: null` for those orders.
 
 For multi-item orders (subjects ending in "and N more items"), use the first item name as the canonical title and add `"split_shipment": true` if multiple "Shipped" emails exist for the same first-item title.
+
+## Returns / refunds (sender `return@amazon.com`)
+
+Return-related subject patterns:
+- **Return started** — "Your return summary" / "Return request confirmed for ..."
+- **Dropped off (in transit)** — "Your return drop off confirmation" / "Dropoff confirmed for ..."
+- **Refund issued** — "Your refund confirmation" / "Advance refund issued for ..."
+
+Match the item-title in the subject (or body) to an existing order in `orders.json`. For each matched order, populate:
+- `returns_started_date` — earliest "Return request confirmed" / "Your return summary" date for that item.
+- `refund_issued_date` — latest "refund issued" date for that item.
+
+If a single order had multiple items returned (e.g. a gift-card bundle), use earliest start + latest refund across all returns from that order. Items not present as their own entry in `orders.json` (because they were rolled into a bundle line) attach to the parent bundle order. Orders with no return emails get both fields `null`.
 
 ## Dedupe and merge
 
