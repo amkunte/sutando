@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Mac Mini deal finder — scrape Craigslist SF Bay, filter, dedupe, notify.
+Deal finder — scrape configured sources, filter, dedupe, notify.
 
-Run from cron (every 15 min) or manually:
+V1 sources: Craigslist (SF Bay). V2 (planned): eBay, Facebook Marketplace.
+Each is opt-in via searches.json (currently a single Mac Mini search).
+
+Run from cron (every 60 min) or manually:
     python3 scripts/scan.py [--dry-run] [--reset] [--verbose]
 
 Notifies on the first sight of any listing matching criteria.json:
@@ -10,6 +13,7 @@ Notifies on the first sight of any listing matching criteria.json:
 - Telegram via results/proactive-{ts}.txt (telegram-bridge picks it up)
 """
 import argparse
+import collections
 import datetime as dt
 import html
 import json
@@ -29,9 +33,8 @@ CRITERIA_PATH = STATE_DIR / "criteria.json"
 RESULTS_DIR = WORKSPACE / "results"
 
 UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.0 Safari/605.1.15"
+    "Sutando-Personal-Agent/1.0 "
+    "(+https://github.com/sonichi/sutando; one-user; deal-finder skill)"
 )
 HDRS = {
     "User-Agent": UA,
@@ -244,23 +247,6 @@ def fetch_listing_body(url: str) -> str:
     return body
 
 
-def post_age_str(post_html: str, now: dt.datetime) -> str:
-    m = re.search(r'<time[^>]+datetime="([^"]+)"', post_html)
-    if not m:
-        return "unknown"
-    try:
-        when = dt.datetime.fromisoformat(m.group(1))
-    except ValueError:
-        return "unknown"
-    delta = now - when.replace(tzinfo=None)
-    h = int(delta.total_seconds() // 3600)
-    if h < 1:
-        return f"{int(delta.total_seconds()//60)}m ago"
-    if h < 48:
-        return f"{h}h ago"
-    return f"{h//24}d ago"
-
-
 def send_sms(env: dict, body: str) -> tuple[bool, str]:
     sid = env.get("TWILIO_ACCOUNT_SID")
     token = env.get("TWILIO_AUTH_TOKEN")
@@ -291,7 +277,7 @@ def send_telegram(body: str) -> bool:
     try:
         RESULTS_DIR.mkdir(exist_ok=True)
         ts = int(time.time() * 1000)
-        path = RESULTS_DIR / f"proactive-mac-mini-{ts}.txt"
+        path = RESULTS_DIR / f"proactive-deal-finder-{ts}.txt"
         path.write_text(body)
         return True
     except Exception:
@@ -375,10 +361,14 @@ def main():
             print(f"  notify: sms={ok_sms} ({sid_or_err}) telegram_proactive={ok_tg}")
 
     if not args.dry_run and new_urls:
-        seen.update(new_urls)
-        # Trim to last 1000
-        seen_list = list(seen)[-1000:]
-        SEEN_PATH.write_text(json.dumps({"urls": seen_list}))
+        # Use an ordered deque so trimming keeps the newest 1000 entries
+        # deterministically (set-based slicing was non-deterministic — Chi #648).
+        prior = json.loads(SEEN_PATH.read_text()).get("urls", [])
+        seen_dq = collections.deque(prior, maxlen=1000)
+        for u in new_urls:
+            if u not in seen_dq:
+                seen_dq.append(u)
+        SEEN_PATH.write_text(json.dumps({"urls": list(seen_dq)}))
 
     print(f"Done. {len(listings)} scanned, {matches} matches, {len(new_urls)} newly seen.")
 
