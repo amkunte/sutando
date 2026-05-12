@@ -57,10 +57,22 @@ def load_env():
     return env
 
 
-def http_get(url: str, timeout: int = 20) -> str:
-    req = urllib.request.Request(url, headers=HDRS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def http_get(url: str, timeout: int = 20, retries: int = 1) -> str:
+    """GET with one retry on transient errors. Per Chi #648 review:
+    a single Craigslist hiccup shouldn't sys.exit the whole scan."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=HDRS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2.5)
+                continue
+            raise
+    raise last_err  # pragma: no cover  (defensive)
 
 
 def search_url(criteria: dict) -> str:
@@ -112,7 +124,10 @@ def parse_price(price_str: str) -> int | None:
 # Apple chip family: word boundary on both sides, optional pro/max/ultra suffix.
 # Whitelist single-digit M1–M9 only; reject things like 'M475' or 'M9340' (model numbers).
 CHIP_RE = re.compile(r"(?<![A-Za-z0-9])M([1-9])(?:\s*(?:pro|max|ultra))?(?![A-Za-z0-9])", re.IGNORECASE)
-RAM_RE = re.compile(r"(\d+)\s*(?:gb|gig|g)\s*(?:ram|memory|unified|of ram|of memory)?", re.IGNORECASE)
+# RAM regex requires explicit ram/memory context (Chi #648: previously the
+# context was optional, so "256GB SSD" matched as RAM and broke the floor check
+# for "M2 mini, 256GB SSD, 8GB RAM" → max(8,256) = 256).
+RAM_RE = re.compile(r"(\d+)\s*(?:gb|gig)\s*(?:ram|memory|unified|of ram|of memory)", re.IGNORECASE)
 SSD_RE = re.compile(r"(\d+)\s*(?:gb|tb)\s*(?:ssd|nvme|storage|hard drive|hd|hdd|disk)", re.IGNORECASE)
 TB_HINT = re.compile(r"(\d+(?:\.\d+)?)\s*tb\b", re.IGNORECASE)
 
@@ -141,17 +156,16 @@ def extract_chip(text: str) -> str | None:
 
 
 def extract_ram_gb(text: str) -> int | None:
-    """Find the most plausible RAM size mentioned. Heuristic: prefer matches near 'ram'/'memory'."""
+    """Find the most plausible RAM size mentioned. RAM_RE now requires explicit
+    ram/memory context (Chi #648), so any candidate it surfaces is real RAM."""
     candidates = []
     for m in RAM_RE.finditer(text):
         n = int(m.group(1))
-        # Reject silly values (1, 2 GB likely refers to something else; >256 likely SSD).
+        # Reject silly values (1, 2 GB likely refers to something else; >256 unlikely for a Mac mini).
         if 4 <= n <= 256:
             candidates.append(n)
     if not candidates:
         return None
-    # Prefer the lowest plausible value mentioned with "ram"/"memory" context — but parsing
-    # explicit context per match is fragile, so fall back to max() of plausible candidates.
     return max(candidates)
 
 
@@ -248,28 +262,36 @@ def fetch_listing_body(url: str) -> str:
 
 
 def send_sms(env: dict, body: str) -> tuple[bool, str]:
+    """Send SMS to every comma-separated number in OWNER_NUMBER. Chi #648:
+    previously only the first number was used despite the split-by-comma."""
     sid = env.get("TWILIO_ACCOUNT_SID")
     token = env.get("TWILIO_AUTH_TOKEN")
     from_num = env.get("TWILIO_PHONE_NUMBER")
-    to_num = env.get("OWNER_NUMBER", "").split(",")[0].strip()
-    if not (sid and token and from_num and to_num):
+    recipients = [n.strip() for n in env.get("OWNER_NUMBER", "").split(",") if n.strip()]
+    if not (sid and token and from_num and recipients):
         return False, "missing TWILIO_* / OWNER_NUMBER"
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-    data = urllib.parse.urlencode({
-        "From": from_num,
-        "To": to_num,
-        "Body": body[:1500],
-    }).encode()
-    req = urllib.request.Request(url, data=data)
-    auth = (sid + ":" + token).encode()
     import base64
-    req.add_header("Authorization", "Basic " + base64.b64encode(auth).decode())
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read())
-            return True, payload.get("sid", "")
-    except Exception as e:
-        return False, str(e)
+    auth = base64.b64encode((sid + ":" + token).encode()).decode()
+    sids = []
+    last_err = None
+    for to_num in recipients:
+        data = urllib.parse.urlencode({
+            "From": from_num,
+            "To": to_num,
+            "Body": body[:1500],
+        }).encode()
+        req = urllib.request.Request(url, data=data)
+        req.add_header("Authorization", "Basic " + auth)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read())
+                sids.append(payload.get("sid", ""))
+        except Exception as e:
+            last_err = e
+    if sids:
+        return True, ",".join(sids)
+    return False, str(last_err) if last_err else "unknown error"
 
 
 def send_telegram(body: str) -> bool:
@@ -306,6 +328,11 @@ def main():
     args = ap.parse_args()
 
     env = load_env()
+    # SKIP_DEAL_FINDER=1 short-circuits the run (Chi #648 consistency with
+    # telegram-bridge / sms-bridge). Honoured from both .env and shell env.
+    if os.environ.get("SKIP_DEAL_FINDER") == "1" or env.get("SKIP_DEAL_FINDER") == "1":
+        print("SKIP_DEAL_FINDER=1 — exiting silently")
+        return
     criteria = json.loads(CRITERIA_PATH.read_text())
 
     if args.reset:
@@ -339,7 +366,9 @@ def main():
             if args.verbose:
                 print(f"  skip (price ${li['price_int']}): {li['title']}")
             continue
-        # Listing detail
+        # Listing detail — sleep 1s between detail fetches (Chi #648) so a fast
+        # match-cluster doesn't burst N requests at Craigslist in <1s.
+        time.sleep(1)
         body = fetch_listing_body(li["url"])
         li["body"] = body
         ok, reason = passes(criteria, li)
