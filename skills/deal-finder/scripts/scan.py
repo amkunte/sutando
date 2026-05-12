@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Mac Mini deal finder — scrape Craigslist SF Bay, filter, dedupe, notify.
+Deal finder — scrape configured sources, filter, dedupe, notify.
 
-Run from cron (every 15 min) or manually:
+V1 sources: Craigslist (SF Bay). V2 (planned): eBay, Facebook Marketplace.
+Each is opt-in via searches.json (currently a single Mac Mini search).
+
+Run from cron (every 60 min) or manually:
     python3 scripts/scan.py [--dry-run] [--reset] [--verbose]
 
 Notifies on the first sight of any listing matching criteria.json:
@@ -10,6 +13,7 @@ Notifies on the first sight of any listing matching criteria.json:
 - Telegram via results/proactive-{ts}.txt (telegram-bridge picks it up)
 """
 import argparse
+import collections
 import datetime as dt
 import html
 import json
@@ -29,9 +33,8 @@ CRITERIA_PATH = STATE_DIR / "criteria.json"
 RESULTS_DIR = WORKSPACE / "results"
 
 UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.0 Safari/605.1.15"
+    "Sutando-Personal-Agent/1.0 "
+    "(+https://github.com/sonichi/sutando; one-user; deal-finder skill)"
 )
 HDRS = {
     "User-Agent": UA,
@@ -54,10 +57,22 @@ def load_env():
     return env
 
 
-def http_get(url: str, timeout: int = 20) -> str:
-    req = urllib.request.Request(url, headers=HDRS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def http_get(url: str, timeout: int = 20, retries: int = 1) -> str:
+    """GET with one retry on transient errors. Per Chi #648 review:
+    a single Craigslist hiccup shouldn't sys.exit the whole scan."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=HDRS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2.5)
+                continue
+            raise
+    raise last_err  # pragma: no cover  (defensive)
 
 
 def search_url(criteria: dict) -> str:
@@ -109,7 +124,10 @@ def parse_price(price_str: str) -> int | None:
 # Apple chip family: word boundary on both sides, optional pro/max/ultra suffix.
 # Whitelist single-digit M1–M9 only; reject things like 'M475' or 'M9340' (model numbers).
 CHIP_RE = re.compile(r"(?<![A-Za-z0-9])M([1-9])(?:\s*(?:pro|max|ultra))?(?![A-Za-z0-9])", re.IGNORECASE)
-RAM_RE = re.compile(r"(\d+)\s*(?:gb|gig|g)\s*(?:ram|memory|unified|of ram|of memory)?", re.IGNORECASE)
+# RAM regex requires explicit ram/memory context (Chi #648: previously the
+# context was optional, so "256GB SSD" matched as RAM and broke the floor check
+# for "M2 mini, 256GB SSD, 8GB RAM" → max(8,256) = 256).
+RAM_RE = re.compile(r"(\d+)\s*(?:gb|gig)\s*(?:ram|memory|unified|of ram|of memory)", re.IGNORECASE)
 SSD_RE = re.compile(r"(\d+)\s*(?:gb|tb)\s*(?:ssd|nvme|storage|hard drive|hd|hdd|disk)", re.IGNORECASE)
 TB_HINT = re.compile(r"(\d+(?:\.\d+)?)\s*tb\b", re.IGNORECASE)
 
@@ -138,17 +156,16 @@ def extract_chip(text: str) -> str | None:
 
 
 def extract_ram_gb(text: str) -> int | None:
-    """Find the most plausible RAM size mentioned. Heuristic: prefer matches near 'ram'/'memory'."""
+    """Find the most plausible RAM size mentioned. RAM_RE now requires explicit
+    ram/memory context (Chi #648), so any candidate it surfaces is real RAM."""
     candidates = []
     for m in RAM_RE.finditer(text):
         n = int(m.group(1))
-        # Reject silly values (1, 2 GB likely refers to something else; >256 likely SSD).
+        # Reject silly values (1, 2 GB likely refers to something else; >256 unlikely for a Mac mini).
         if 4 <= n <= 256:
             candidates.append(n)
     if not candidates:
         return None
-    # Prefer the lowest plausible value mentioned with "ram"/"memory" context — but parsing
-    # explicit context per match is fragile, so fall back to max() of plausible candidates.
     return max(candidates)
 
 
@@ -244,46 +261,37 @@ def fetch_listing_body(url: str) -> str:
     return body
 
 
-def post_age_str(post_html: str, now: dt.datetime) -> str:
-    m = re.search(r'<time[^>]+datetime="([^"]+)"', post_html)
-    if not m:
-        return "unknown"
-    try:
-        when = dt.datetime.fromisoformat(m.group(1))
-    except ValueError:
-        return "unknown"
-    delta = now - when.replace(tzinfo=None)
-    h = int(delta.total_seconds() // 3600)
-    if h < 1:
-        return f"{int(delta.total_seconds()//60)}m ago"
-    if h < 48:
-        return f"{h}h ago"
-    return f"{h//24}d ago"
-
-
 def send_sms(env: dict, body: str) -> tuple[bool, str]:
+    """Send SMS to every comma-separated number in OWNER_NUMBER. Chi #648:
+    previously only the first number was used despite the split-by-comma."""
     sid = env.get("TWILIO_ACCOUNT_SID")
     token = env.get("TWILIO_AUTH_TOKEN")
     from_num = env.get("TWILIO_PHONE_NUMBER")
-    to_num = env.get("OWNER_NUMBER", "").split(",")[0].strip()
-    if not (sid and token and from_num and to_num):
+    recipients = [n.strip() for n in env.get("OWNER_NUMBER", "").split(",") if n.strip()]
+    if not (sid and token and from_num and recipients):
         return False, "missing TWILIO_* / OWNER_NUMBER"
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-    data = urllib.parse.urlencode({
-        "From": from_num,
-        "To": to_num,
-        "Body": body[:1500],
-    }).encode()
-    req = urllib.request.Request(url, data=data)
-    auth = (sid + ":" + token).encode()
     import base64
-    req.add_header("Authorization", "Basic " + base64.b64encode(auth).decode())
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read())
-            return True, payload.get("sid", "")
-    except Exception as e:
-        return False, str(e)
+    auth = base64.b64encode((sid + ":" + token).encode()).decode()
+    sids = []
+    last_err = None
+    for to_num in recipients:
+        data = urllib.parse.urlencode({
+            "From": from_num,
+            "To": to_num,
+            "Body": body[:1500],
+        }).encode()
+        req = urllib.request.Request(url, data=data)
+        req.add_header("Authorization", "Basic " + auth)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read())
+                sids.append(payload.get("sid", ""))
+        except Exception as e:
+            last_err = e
+    if sids:
+        return True, ",".join(sids)
+    return False, str(last_err) if last_err else "unknown error"
 
 
 def send_telegram(body: str) -> bool:
@@ -291,7 +299,7 @@ def send_telegram(body: str) -> bool:
     try:
         RESULTS_DIR.mkdir(exist_ok=True)
         ts = int(time.time() * 1000)
-        path = RESULTS_DIR / f"proactive-mac-mini-{ts}.txt"
+        path = RESULTS_DIR / f"proactive-deal-finder-{ts}.txt"
         path.write_text(body)
         return True
     except Exception:
@@ -320,6 +328,11 @@ def main():
     args = ap.parse_args()
 
     env = load_env()
+    # SKIP_DEAL_FINDER=1 short-circuits the run (Chi #648 consistency with
+    # telegram-bridge / sms-bridge). Honoured from both .env and shell env.
+    if os.environ.get("SKIP_DEAL_FINDER") == "1" or env.get("SKIP_DEAL_FINDER") == "1":
+        print("SKIP_DEAL_FINDER=1 — exiting silently")
+        return
     criteria = json.loads(CRITERIA_PATH.read_text())
 
     if args.reset:
@@ -353,7 +366,9 @@ def main():
             if args.verbose:
                 print(f"  skip (price ${li['price_int']}): {li['title']}")
             continue
-        # Listing detail
+        # Listing detail — sleep 1s between detail fetches (Chi #648) so a fast
+        # match-cluster doesn't burst N requests at Craigslist in <1s.
+        time.sleep(1)
         body = fetch_listing_body(li["url"])
         li["body"] = body
         ok, reason = passes(criteria, li)
@@ -375,10 +390,14 @@ def main():
             print(f"  notify: sms={ok_sms} ({sid_or_err}) telegram_proactive={ok_tg}")
 
     if not args.dry_run and new_urls:
-        seen.update(new_urls)
-        # Trim to last 1000
-        seen_list = list(seen)[-1000:]
-        SEEN_PATH.write_text(json.dumps({"urls": seen_list}))
+        # Use an ordered deque so trimming keeps the newest 1000 entries
+        # deterministically (set-based slicing was non-deterministic — Chi #648).
+        prior = json.loads(SEEN_PATH.read_text()).get("urls", [])
+        seen_dq = collections.deque(prior, maxlen=1000)
+        for u in new_urls:
+            if u not in seen_dq:
+                seen_dq.append(u)
+        SEEN_PATH.write_text(json.dumps({"urls": list(seen_dq)}))
 
     print(f"Done. {len(listings)} scanned, {matches} matches, {len(new_urls)} newly seen.")
 
