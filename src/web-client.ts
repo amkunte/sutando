@@ -540,6 +540,11 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<!-- DOMPurify — agent results come from external task channels (Discord,
+     Telegram, voice, SMS) and aren't trusted input. marked@12 ships no
+     sanitizer by default, so unwrapped innerHTML on transcript replies would
+     execute embedded <script> / inline handlers. Sandbox before insertion. -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 </head>
 <body>
 
@@ -2085,12 +2090,17 @@ function sendText() {
                 clearInterval(poll);
                 const re = document.createElement('div');
                 re.className = 't-entry t-assistant';
-                // Render markdown if marked.js loaded; fall back to escaped text.
-                // Before this, headings/lists in long replies (e.g. skill suggestions)
-                // came through as raw "###" / "*" characters.
-                if (window.marked) {
+                // Render markdown if marked.js + DOMPurify both loaded; fall
+                // back to escaped textContent otherwise. Both required — marked
+                // alone would be unsafe innerHTML on agent results that
+                // originate from external task channels.
+                // Before this, headings/lists in long replies (e.g. skill
+                // suggestions) came through as raw "###" / "*" characters.
+                if (window.marked && window.DOMPurify) {
                   try {
-                    re.innerHTML = window.marked.parse(r.result, { breaks: true, gfm: true });
+                    re.innerHTML = window.DOMPurify.sanitize(
+                      window.marked.parse(r.result, { breaks: true, gfm: true })
+                    );
                   } catch (e) {
                     re.textContent = r.result;
                   }

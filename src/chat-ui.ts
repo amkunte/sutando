@@ -21,6 +21,11 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sutando — Chat</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<!-- DOMPurify — agent results come from external task channels (Discord,
+     Telegram, voice, SMS) and aren't trusted input. marked@12 ships no
+     sanitizer by default, so unwrapped innerHTML would execute embedded
+     <script> / inline handlers. Sandbox the rendered HTML before insertion. -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; overflow: hidden; }
@@ -244,8 +249,14 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   }
 
   function renderMarkdown(text) {
-    if (!window.marked) return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    try { return marked.parse(text); } catch (e) { return text; }
+    // Fall back to entity-escaped textContent if EITHER library failed to
+    // load (CDN offline, ad blocker, etc.). marked alone would be unsafe —
+    // without DOMPurify the innerHTML executes arbitrary HTML/JS from
+    // untrusted task channels. Match the existing fallback's escape style.
+    if (!window.marked || !window.DOMPurify) {
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    try { return DOMPurify.sanitize(marked.parse(text)); } catch (e) { return text; }
   }
 
   function appendMessage(role, content, save) {
