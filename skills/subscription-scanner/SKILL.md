@@ -14,7 +14,7 @@ The scan is **agent-driven**, not script-driven, because Gmail access lives in t
 
 ## Files
 
-- `scan-prompt.md` — the prompt text the agent runs to perform a scan. Updates here propagate via the cron config.
+- `scan-prompt.md` — the prompt text the agent runs to perform a scan. Updates here propagate via the cron config. **Personalize this file before first use** — the third Gmail-query line names specific senders tied to one user's actual subscriptions (Apple, Spotify, Anthropic, OpenAI, Netflix, Adobe, GitHub, 1Password, NYT, WSJ, Disney+, Hulu, Tesla insurance, Xfinity, …). Edit the `from:` list to match your subscriptions, or the scan will miss vendors not on the default list.
 - `state/subscriptions.json` — current list (gitignored — contains personal financial data)
 - `state/history/<YYYY-MM-DD>.json` — snapshots, for diff (also gitignored)
 
