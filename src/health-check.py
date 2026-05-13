@@ -982,6 +982,36 @@ def run_all_checks() -> list[dict]:
             # Check if configured via either .env or access.json
             if not env_file.exists() and not access_file.exists():
                 continue
+            # Treat obviously-placeholder env values as "not configured" so
+            # we don't loop hourly on a bridge that physically cannot start.
+            # Observed 2026-05-13 (twice): a 15-char placeholder
+            # DISCORD_BOT_TOKEN sat in ~/.claude/channels/discord/.env
+            # for 4 days (since May 9 setup), and even after being sidelined
+            # to .env.placeholder, something on the system recreated the
+            # placeholder file at 13:20 PT. Real Telegram bot tokens are
+            # ~45 chars; real Discord bot tokens are ~70 chars. Anything
+            # well below that floor cannot have come from the real API.
+            if env_file.exists() and not access_file.exists():
+                try:
+                    env_lines = env_file.read_text().splitlines()
+                    has_real_token = False
+                    for line in env_lines:
+                        if "=" not in line or line.lstrip().startswith("#"):
+                            continue
+                        key, _, val = line.partition("=")
+                        # Strip optional quotes that some users add
+                        val = val.strip().strip('"').strip("'")
+                        # 30-char floor is well below the smallest real
+                        # token shape (Telegram bot tokens ~45 chars,
+                        # Discord ~70). Generous enough to never reject
+                        # a real credential.
+                        if key.strip().endswith("_TOKEN") and len(val) >= 30:
+                            has_real_token = True
+                            break
+                    if not has_real_token:
+                        continue
+                except OSError:
+                    continue
         try:
             # Anchor on the .py suffix so we don't match unrelated processes
             # whose command line happens to contain "discord-bridge" (shell
