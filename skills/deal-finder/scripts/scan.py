@@ -134,13 +134,22 @@ TB_HINT = re.compile(r"(\d+(?:\.\d+)?)\s*tb\b", re.IGNORECASE)
 # Reject obvious accessory / replacement-parts listings — even if the title says
 # "mac mini", we don't want power cords, remotes, cables, adapters, hubs, replacement
 # parts (covers, fans, antennas, screws, logic boards alone).
+#
+# Bare nouns like `ram`, `keyboard`, `mouse`, `trackpad`, `cord`, `cable` were
+# previously over-matching every bundle listing ("Mac Mini M2 16GB RAM 512GB
+# SSD", "Mac mini bundle with keyboard and mouse", "Mac mini + USB-C cable"
+# all false-rejected — exactly the listings the skill is trying to find).
+# Chi caught this on PR #657 cold-review; explained the 36h streak of 0
+# matches. Refactored per his suggestion: bare nouns require an
+# "accessory-y" qualifier word adjacent.
 ACCESSORY_RE = re.compile(
-    r"\b(power\s*cord|cord|cable|adapter|adaptor|dongle|hub|stand|case|cover|housing|"
+    r"\b(power\s*cord|adapter|adaptor|dongle|hub|stand|case|cover|housing|"
     r"oem\b|replacement|antenna|cooling\s*fan|fan\b|speaker\b|screws?\b|logic\s*board|"
     r"power\s*supply|psu\b|"
-    r"remote\s*control|remote\b|keyboard|mouse|trackpad|magic\s*(?:mouse|trackpad|keyboard)|"
-    r"display\s*port|hdmi|usb-c|thunderbolt\s*cable|"
-    r"ram\b|memory\s*stick|ddr[2-5]?\b|ssd\s*only|hard\s*drive\s*only|sata)\b",
+    r"magic\s*(?:mouse|trackpad|keyboard)|"
+    r"display\s*port|hdmi\s*cable|usb-c\s*cable|thunderbolt\s*cable|"
+    r"(?:ram|memory\s*stick|ddr[2-5]?)\s*(?:stick|module|for\s*sale|only)|"
+    r"ssd\s*only|hard\s*drive\s*only|sata)\b",
     re.IGNORECASE,
 )
 # Mac minis on the M2+ have Apple Silicon — Intel-era listings (2010–2018) won't qualify.
