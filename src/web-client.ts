@@ -3371,11 +3371,35 @@ const server = createServer((req, res) => {
 		return;
 	}
 	if (url.pathname === '/paidsubscriptions/scan' && req.method === 'POST') {
+		// Localhost-only: this endpoint writes an owner-tier task file that
+		// the watcher processes with full agent privileges. Without this
+		// guard, anyone on the same LAN or a tailscale-funnel'd public URL
+		// could `curl -X POST http://<host>:8080/paidsubscriptions/scan`
+		// and silently enqueue arbitrary work. Per PR #651 Blocker 1.
+		// Reads req.socket.remoteAddress directly rather than a header
+		// (X-Forwarded-For et al. are spoofable). IPv4-mapped IPv6
+		// (::ffff:127.0.0.1) and IPv6 loopback (::1) are both localhost.
+		const remote = req.socket?.remoteAddress || '';
+		const isLocalhost = (
+			remote === '127.0.0.1' ||
+			remote === '::1' ||
+			remote === '::ffff:127.0.0.1'
+		);
+		if (!isLocalhost) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /paidsubscriptions/scan accepts localhost connections only' }));
+			return;
+		}
 		try {
 			const taskId = `task-${Date.now()}`;
-			const promptPath = 'skills/subscription-scanner/scan-prompt.md';
-			const promptBody = existsSync(promptPath) ? readFileSync(promptPath, 'utf-8') : '(scan-prompt.md missing — run subscription scan)';
-			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Follow the instructions in skills/subscription-scanner/scan-prompt.md verbatim:\n\n${promptBody}\nsource: web\nfrom: paidsubscriptions-ui\n`;
+			// Pointer (not inline) — prevents prompt-injection via
+			// header-shaped lines in scan-prompt.md (`source:`,
+			// `access_tier:`, etc.) being parsed as real task headers.
+			// Per PR #651 Blocker 2. The agent reads the file when it
+			// processes the task. `access_tier: owner` is explicit per
+			// Chi's review — relying on the absence-of-field default
+			// is fragile.
+			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: paidsubscriptions-ui\naccess_tier: owner\n`;
 			writeFileSync(`tasks/${taskId}.txt`, taskContent);
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
