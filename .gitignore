@@ -79,3 +79,14 @@ voice-state.json
 
 # Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid
+
+# Decommissioned single-target watcher (built 2026-05-09 for LG OLED77C5PUA
+# during Memorial Day window; fired at Amazon $1,650; owner purchased; cron
+# deleted + expires_at backdated). Keep files on disk in case owner wants to
+# revive for Black Friday — just don't track or noise up `git status`.
+skills/tv-price-watcher/
+
+# State file written by src/check-pending-questions.py to remember the
+# last-seen unanswered-question set across cron invocations. Pure runtime
+# state, no commit value.
+.last-pq-set
