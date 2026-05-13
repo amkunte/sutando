@@ -254,12 +254,21 @@ def passes(criteria: dict, listing: dict) -> tuple[bool, str]:
     return True, ("soft match (specs missing — review manually)" if soft else "match")
 
 
-def fetch_listing_body(url: str) -> str:
-    """Best-effort fetch of the listing description text."""
+def fetch_listing_body(url: str) -> str | None:
+    """Best-effort fetch of the listing description text.
+
+    Returns:
+        - The body text (possibly empty) on a successful fetch.
+        - None on fetch failure — caller should skip the listing rather
+          than fall through to a body-less soft-match. Per Chi PR #657
+          note 3: an empty body combined with
+          `soft_match_when_specs_missing: True` would notify the owner on
+          a network blip, masquerading as a real match.
+    """
     try:
         page = http_get(url, timeout=15)
     except Exception:
-        return ""
+        return None
     # The post body is in <section id="postingbody">…</section>.
     m = re.search(r'<section id="postingbody"[^>]*>(.*?)</section>', page, re.DOTALL)
     if not m:
@@ -359,6 +368,18 @@ def main():
         sys.exit(1)
 
     listings = parse_search_page(page)
+    # Parser-staleness warning: Craigslist's HTML changes occasionally and
+    # the LISTING_RE pattern is the single point of failure. A page that
+    # returned bytes but yielded zero listings is the canonical signature
+    # of a layout change — surface it early rather than letting the skill
+    # silently report 0 matches indefinitely. Per Chi #657 note 1.
+    if len(listings) == 0 and len(page) > 1000:
+        print(
+            f"WARN: 0 listings parsed from {len(page)}-byte page — "
+            f"LISTING_RE may be stale (Craigslist layout change?). "
+            f"URL: {url}",
+            file=sys.stderr,
+        )
     if args.verbose:
         print(f"Found {len(listings)} listings on page")
 
@@ -379,6 +400,14 @@ def main():
         # match-cluster doesn't burst N requests at Craigslist in <1s.
         time.sleep(1)
         body = fetch_listing_body(li["url"])
+        if body is None:
+            # Fetch failed — skip rather than fall through to soft-match
+            # on an empty body, which would notify owner on a network blip
+            # (Chi #657 note 3). The listing stays "unseen" so the next
+            # scan can re-attempt.
+            if args.verbose:
+                print(f"  skip (body fetch failed): {li['title']}")
+            continue
         li["body"] = body
         ok, reason = passes(criteria, li)
         if not ok:
