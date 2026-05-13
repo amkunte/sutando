@@ -115,6 +115,17 @@ STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
+# Persisted map of task_id → chat_id for in-flight replies. Without
+# persistence, any bridge restart between an incoming Telegram message
+# and the moment its result file is written silently orphans the reply
+# (the result file lands but pending_replies has no chat_id mapping for
+# it). Saw this live 2026-05-13: owner's RKLB question + popup complaint
+# orphaned for 12 min until manual rescue via direct API.
+PENDING_REPLIES_FILE = STATE_DIR / "telegram-bridge-pending.json"
+# Entries older than this are dropped on load — anything that's been
+# pending for a day is either a bug or a dropped task. Avoids unbounded
+# growth and spurious dispatch of very stale replies.
+PENDING_REPLIES_MAX_AGE_SEC = 24 * 3600
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -153,6 +164,60 @@ def extract_forward_note(msg: dict) -> str:
     if "forward_sender_name" in msg:
         return f" [forwarded from {msg['forward_sender_name']}]"
     return ""
+
+
+def _load_pending_replies() -> dict:
+    """Read pending_replies from disk. Drops entries older than max age.
+    Returns {task_id: chat_id} mapping (chat_id is int)."""
+    try:
+        raw = json.loads(PENDING_REPLIES_FILE.read_text())
+        now = time.time()
+        out = {}
+        for task_id, entry in raw.items():
+            # Schema: {"chat_id": int, "added_at": float (epoch)}
+            if not isinstance(entry, dict):
+                continue
+            if now - entry.get("added_at", 0) > PENDING_REPLIES_MAX_AGE_SEC:
+                continue
+            chat_id = entry.get("chat_id")
+            if isinstance(chat_id, int):
+                out[task_id] = chat_id
+        return out
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_pending_replies(pending: dict, ts_overrides: dict | None = None) -> None:
+    """Write pending_replies to disk. Silent on failure — persistence is a
+    defensive backstop, not a correctness guarantee, so don't crash the
+    bridge over a transient disk error.
+
+    ts_overrides lets us preserve `added_at` for entries we already have on
+    disk rather than rewriting them with `now()` on every save (which would
+    defeat the age-based pruning).
+    """
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        now = time.time()
+        existing = {}
+        try:
+            existing = json.loads(PENDING_REPLIES_FILE.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        payload = {}
+        for task_id, chat_id in pending.items():
+            if ts_overrides and task_id in ts_overrides:
+                added_at = ts_overrides[task_id]
+            elif task_id in existing and isinstance(existing.get(task_id), dict):
+                added_at = existing[task_id].get("added_at", now)
+            else:
+                added_at = now
+            payload[task_id] = {"chat_id": chat_id, "added_at": added_at}
+        tmp = PENDING_REPLIES_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(PENDING_REPLIES_FILE)  # atomic
+    except OSError:
+        pass
 
 
 def write_owner_activity(channel: str, summary: str) -> None:
@@ -563,7 +628,12 @@ def main():
     _recover_orphan_sending_files()
     offset = None
     allowed = load_allowed()
-    pending_replies = {}  # task_id -> chat_id
+    # Rehydrate pending_replies from disk so a restart doesn't orphan
+    # any in-flight task → chat_id mappings. See PENDING_REPLIES_FILE
+    # comment for the failure mode this guards against.
+    pending_replies = _load_pending_replies()
+    if pending_replies:
+        print(f"  Rehydrated {len(pending_replies)} pending replies from {PENDING_REPLIES_FILE.name}", flush=True)
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
@@ -718,6 +788,7 @@ def main():
                 )
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                _save_pending_replies(pending_replies)
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
@@ -814,6 +885,7 @@ def main():
             if result_file.exists():
                 reply_text = result_file.read_text().strip()
                 chat_id = pending_replies.pop(task_id)
+                _save_pending_replies(pending_replies)
                 # Parse markers via the unified module (#873). Telegram
                 # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
                 # sends attached files, and silently drops [channel:] redirects
