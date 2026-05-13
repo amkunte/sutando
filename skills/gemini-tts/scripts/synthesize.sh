@@ -1,85 +1,95 @@
 #!/bin/bash
-# Render text to speech via Gemini 3.1 Flash TTS (free tier).
-# Usage: synthesize.sh [--voice <name>] [--out <path>] -- "text"
+# Render text to speech via Google Gemini Flash TTS. Reads GEMINI_API_KEY from .env.
+# Usage: synthesize.sh [--voice <name>] [--out <path>] [--model <id>] -- "text"
+#
+# Free-tier eligible: gemini-2.5-flash-tts within 1500 req/day. Parallels
+# skills/openai-tts/scripts/synthesize.sh (same flag shape, different backend).
 set -euo pipefail
 
-VOICE="Kore"
+VOICE="Aoede"
 OUT=""
+MODEL="${GEMINI_TTS_MODEL:-gemini-2.5-flash-preview-tts}"
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --voice) VOICE="$2"; shift 2 ;;
     --out)   OUT="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
     --) shift; ARGS+=("$@"); break ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 
 TEXT="${ARGS[*]-}"
-[[ -n "$TEXT" ]] || { echo "Usage: synthesize.sh [--voice <name>] [--out <path>] -- \"text\"" >&2; exit 2; }
+[[ -n "$TEXT" ]] || { echo "Usage: synthesize.sh [--voice <name>] [--out <path>] [--model <id>] -- \"text\"" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 KEY="${GEMINI_API_KEY:-$(grep -E '^GEMINI_API_KEY=' "$REPO/.env" 2>/dev/null | cut -d= -f2-)}"
-[[ -n "$KEY" ]] || { echo "GEMINI_API_KEY missing" >&2; exit 1; }
+[[ -n "$KEY" ]] || { echo "GEMINI_API_KEY missing (set env or add to .env)" >&2; exit 1; }
 
-[[ -n "$OUT" ]] || OUT="$REPO/results/gemini-tts-$(date +%s).wav"
+[[ -n "$OUT" ]] || OUT="$REPO/results/gemini-tts-$(date +%s).mp3"
 mkdir -p "$(dirname "$OUT")"
 
-# Build JSON payload
+# Gemini TTS API: generateContent with audio modality + voice config
+# Endpoint: https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent
 PAYLOAD=$(python3 -c '
 import json, sys
+text, voice = sys.argv[1], sys.argv[2]
 print(json.dumps({
-    "contents": [{"parts": [{"text": sys.argv[1]}]}],
-    "generationConfig": {
-        "responseModalities": ["AUDIO"],
-        "speechConfig": {
-            "voiceConfig": {
-                "prebuiltVoiceConfig": {"voiceName": sys.argv[2]}
-            }
-        }
+  "contents": [{"parts": [{"text": text}]}],
+  "generationConfig": {
+    "responseModalities": ["AUDIO"],
+    "speechConfig": {
+      "voiceConfig": {
+        "prebuiltVoiceConfig": {"voiceName": voice}
+      }
     }
+  }
 }))
 ' "$TEXT" "$VOICE")
 
-# Call Gemini TTS API
-RESPONSE=$(curl -sSf \
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent?key=$KEY" \
-  -X POST \
+URL="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${KEY}"
+
+RESPONSE=$(curl -sSf "$URL" \
   -H "Content-Type: application/json" \
-  -d "$PAYLOAD")
+  -d "$PAYLOAD" 2>&1) || {
+    echo "Gemini TTS request failed:" >&2
+    echo "$RESPONSE" >&2
+    exit 1
+  }
 
-# Extract base64 audio and decode to WAV
-echo "$RESPONSE" | python3 -c '
-import json, sys, struct
+# Extract base64 audio data from response.candidates[0].content.parts[0].inlineData.data
+B64=$(echo "$RESPONSE" | python3 -c '
+import json, sys
+try:
+  d = json.load(sys.stdin)
+  parts = d["candidates"][0]["content"]["parts"]
+  for p in parts:
+    inline = p.get("inlineData") or p.get("inline_data")
+    if inline and "data" in inline:
+      print(inline["data"])
+      sys.exit(0)
+  print("ERR: no inlineData in response", file=sys.stderr)
+  sys.exit(2)
+except (KeyError, IndexError, json.JSONDecodeError) as e:
+  print(f"ERR: parse failed: {e}", file=sys.stderr)
+  sys.exit(2)
+')
 
-data = json.load(sys.stdin)
-audio_b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+[[ -n "$B64" ]] || { echo "Empty audio response from Gemini" >&2; exit 1; }
 
-import base64
-pcm = base64.b64decode(audio_b64)
-
-# Write WAV header (24kHz, mono, 16-bit PCM)
-out = sys.argv[1]
-with open(out, "wb") as f:
-    num_samples = len(pcm) // 2
-    sample_rate = 24000
-    bits = 16
-    channels = 1
-    byte_rate = sample_rate * channels * bits // 8
-    block_align = channels * bits // 8
-    data_size = len(pcm)
-    # RIFF header
-    f.write(b"RIFF")
-    f.write(struct.pack("<I", 36 + data_size))
-    f.write(b"WAVE")
-    # fmt chunk
-    f.write(b"fmt ")
-    f.write(struct.pack("<I", 16))
-    f.write(struct.pack("<HHIIHH", 1, channels, sample_rate, byte_rate, block_align, bits))
-    # data chunk
-    f.write(b"data")
-    f.write(struct.pack("<I", data_size))
-    f.write(pcm)
-' "$OUT"
+# Decode base64 → raw audio. Gemini returns 24kHz PCM by default; we wrap as MP3
+# via ffmpeg pipe. If ffmpeg missing, fall back to writing raw PCM with .pcm
+# suffix so the user knows.
+if command -v ffmpeg >/dev/null 2>&1; then
+  echo "$B64" | base64 -d | ffmpeg -hide_banner -loglevel error -y \
+    -f s16le -ar 24000 -ac 1 -i - "$OUT"
+else
+  # Fall back: write raw PCM
+  PCM_OUT="${OUT%.mp3}.pcm"
+  echo "$B64" | base64 -d > "$PCM_OUT"
+  echo "WARN: ffmpeg missing; wrote raw 24kHz PCM to $PCM_OUT instead of mp3" >&2
+  OUT="$PCM_OUT"
+fi
 
 echo "$OUT"

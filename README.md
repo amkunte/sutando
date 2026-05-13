@@ -2,9 +2,9 @@
 
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/uZHWXXmrCS) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Website](https://img.shields.io/badge/Web-sutando.ai-blue)](https://sutando.ai)
 
-**Summon your AI superpower — voice, vision, and autonomous action.**
+**My AI Stand — Realtime by Day, Coding Itself by Night.**
 
-It shares your screen, joins your meetings, makes phone calls, and builds itself.
+Voice, vision, screen, meetings, calls when I'm engaged. Learns my patterns, ships its own code when I'm not. Runs across my Macs, interacts with people & their Stands.
 
 It belongs entirely to you.
 
@@ -17,6 +17,23 @@ https://github.com/user-attachments/assets/a86ec34e-3b26-4011-824c-d2d124753c25
 > 24 tool calls. 6 tasks. 7 minutes. All by voice from a phone. Demo by [@liususan091219](https://github.com/liususan091219). [Watch on YouTube (full quality) →](https://youtu.be/NC0kdpLulUY)
 
 📺 [Watch the vision talk at UC Berkeley →](https://youtu.be/c39fJ2WAj6A?t=7719) — the idea behind Sutando, before it existed.
+
+---
+
+## 🎬 Recent autonomous output
+
+**Sutando WIRE** — Sutando reads the news, drafts the script, generates narration, renders the video. No editor, no animator, no narration session.
+- [Declassified, Debunked, Unexplained: 3 Pentagon UAP Files in 40 Seconds](https://youtu.be/eBvHemYhc2o) — ep002
+- [162 UAP Files Just Declassified. The Pentagon's Apollo 17 Photo](https://youtu.be/JoltTj3x410) — ep001
+
+[@sutando-ai channel](https://www.youtube.com/@sutando-ai) · [Sutando WIRE playlist](https://www.youtube.com/playlist?list=PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_)
+
+**Recent capability proofs:**
+- [An AI agent caught a bug humans missed — phantom voice sessions, found via anomaly detection](https://youtu.be/FeLfufsMJpY)
+- [42 Days of Sutando — a fleet-growth visualization](https://youtu.be/t2SQqR07T3c)
+- [The AI agent that presented live](https://youtu.be/tisE8YjmLdU)
+- [9-year-old planned her birthday party with AI agent — by voice](https://youtu.be/YuhWklKBP2Q)
+- [When one AI agent can't fix itself, it asks another — same owner or different](https://youtu.be/k_aNNEN_GAc)
 
 ---
 

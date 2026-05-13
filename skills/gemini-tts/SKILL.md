@@ -1,14 +1,14 @@
 ---
 name: gemini-tts
-description: "Render text to WAV via Gemini 3.1 Flash TTS (free tier). Use for video narration, demo voiceovers, audio notes."
+description: "Render text to mp3 via Google Gemini Flash TTS. Free-tier eligible (1500 req/day). Use for video narration, demo voiceovers, audio notes. Parallels openai-tts; default for make-viral-video."
 user-invocable: true
 ---
 
 # Gemini TTS
 
-Synthesize speech via Gemini 3.1 Flash TTS. Reads `GEMINI_API_KEY` from `.env`. Free within 1500 req/day quota.
+Synthesize speech via Google's `gemini-2.5-flash-preview-tts` (or `-pro-tts` / `-lite-preview-tts` per env override). Reads `GEMINI_API_KEY` from `.env`.
 
-This is offline synthesis — distinct from voice-agent's bidirectional Gemini Live audio.
+This is offline synthesis — distinct from voice-agent's bidirectional Gemini Live audio. Same model family, different surface (POST text → get audio bytes back, no streaming).
 
 **Usage**: `/gemini-tts [text]`
 
@@ -16,18 +16,41 @@ ARGUMENTS: $ARGUMENTS
 
 ## Voices
 
-`Kore` (default), `Puck`, `Charon`, `Fenrir`, `Aoede`, `Leda`, `Orus`, `Zephyr`.
+`Aoede` (default — alto, neutral), `Charon` (baritone, news-anchor), `Kore` (mid, expressive), `Puck` (high, conversational). Per Lucy's 2026-05-09 testing: Aoede is the closest match to OpenAI's `sage`.
 
-Use audio tags in text for expression: `[whispers]`, `[excitedly]`, `[slowly]`.
+## Model selection
+
+Default: `gemini-2.5-flash-preview-tts` (free tier, 1500 req/day, $0 within quota).
+
+Override via `GEMINI_TTS_MODEL` env var:
+- `gemini-2.5-pro-tts` — paid, higher fidelity
+- `gemini-2.5-flash-lite-preview-tts` — preview, faster
+- `gemini-3.1-flash-tts-preview` — preview
 
 ## Examples
 
 ```bash
 bash "$SKILL_DIR/scripts/synthesize.sh" -- "Hello, this is Sutando."
-bash "$SKILL_DIR/scripts/synthesize.sh" --voice Puck --out /tmp/intro.wav -- "Welcome to the demo."
+bash "$SKILL_DIR/scripts/synthesize.sh" --voice Charon --out /tmp/intro.mp3 -- "Hi."
+GEMINI_TTS_MODEL=gemini-2.5-pro-tts bash "$SKILL_DIR/scripts/synthesize.sh" -- "High-fidelity narration."
 ```
 
-Default output: `results/gemini-tts-{epoch}.wav`. Cost: $0 (free tier, 1500 req/day).
+Default output path: `results/gemini-tts-{epoch}.mp3`.
+
+## Cost
+
+Free tier: $0 within 1500 req/day quota. For our cadence (a few demos a day), stays free indefinitely.
+Paid (Flash): $0.50 / 1M input tokens + $10.00 / 1M output tokens.
+
+Compared to OpenAI TTS (`gpt-4o-mini-tts`) at ~$0.02 per 60s: Gemini Flash is free-equivalent for typical demo workloads.
+
+## When to fall back to openai-tts
+
+The `make-viral-video` skill auto-falls-back to OpenAI TTS when:
+- Gemini API returns 4xx/5xx
+- Gemini quota hit (429)
+- `GEMINI_API_KEY` missing
+- `TTS_PROVIDER=OPENAI` env override set
 
 ## If Invoked As A Slash Command
 
