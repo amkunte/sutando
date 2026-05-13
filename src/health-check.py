@@ -231,29 +231,67 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
 
 
 def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
-    """Return True if git's last-commit-time for src_file predates proc_start
-    AND the file has no uncommitted changes. Used to suppress stale-detection
-    false positives from git operations that bump mtime without changing
-    content. Silent-failure: returns False on any git error so real stale
-    deploys aren't hidden.
+    """Return True if src_file's content is byte-identical to what was on
+    disk at proc_start. Used to suppress stale-detection false positives
+    from git operations that bump mtime without actually changing content
+    (PR #253's original target — `git checkout` no-op-on-content).
+
+    Strategy: use the reflog to find what HEAD was at proc_start, then
+    compare `git show <old_head>:<path>` against the current file bytes.
+
+    Earlier (commit-time-based) logic had a hole: an upstream merge that
+    brings new file content via commits with timestamps PREDATING
+    proc_start would incorrectly return True. Concretely, observed
+    2026-05-13: I merged 14 commits from upstream/main at 12:36 PT;
+    Chi's PR #669 commit (a017d93, commit-time 11:10 PT) added a line to
+    src/voice-agent.ts. voice-agent process started 11:51 PT. The old
+    check saw commit-time (11:10) < proc_start (11:51) → returned True
+    → voice-agent stayed silently 'ok' while actually running old code.
+
+    Silent-failure: returns False on any git error so real stale deploys
+    aren't hidden.
     """
     try:
-        log = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", "HEAD", "--", str(src_file)],
+        src_mtime = src_file.stat().st_mtime
+        # Fast path: file untouched since process started → trivially
+        # cannot have diverged from what the process loaded.
+        if src_mtime <= proc_start:
+            return True
+
+        # mtime bumped after proc_start. Was it idempotent (git checkout
+        # no-op) or did content actually change? Resolve via reflog +
+        # content compare.
+        reflog = subprocess.run(
+            ["git", "reflog", "HEAD", "--format=%H",
+             f"--before=@{int(proc_start)}"],
             cwd=REPO_DIR, capture_output=True, text=True, timeout=5
         )
-        if log.returncode != 0 or not log.stdout.strip():
+        if reflog.returncode != 0 or not reflog.stdout.strip():
+            # Reflog has no entry at-or-before proc_start (sparse history,
+            # repo cloned after proc_start, etc.). Fail safe: assume changed.
             return False
-        commit_time = int(log.stdout.strip())
-        if commit_time >= proc_start:
-            # Real commit landed after proc_start — genuinely stale
+        old_head = reflog.stdout.splitlines()[0].strip()
+        if not old_head:
             return False
-        # No commits since proc_start; check for uncommitted edits
-        diff = subprocess.run(
-            ["git", "diff", "--quiet", "HEAD", "--", str(src_file)],
+
+        # Read the file's content at HEAD-as-of-proc_start. If src_file is
+        # not in that tree, git show errors → safely return False.
+        rel_path = src_file.relative_to(REPO_DIR)
+        show = subprocess.run(
+            ["git", "show", f"{old_head}:{rel_path}"],
             cwd=REPO_DIR, capture_output=True, timeout=5
         )
-        return diff.returncode == 0  # 0 = no diff
+        if show.returncode != 0:
+            return False
+
+        # Content match = mtime bump was idempotent = not stale.
+        # Also requires no uncommitted edits since old_head, since `git
+        # show` reads committed content only. If working tree has
+        # uncommitted edits beyond old_head, those WOULD have changed
+        # what the process sees only if applied post-proc_start — but
+        # since the src_mtime check above already confirms file was
+        # touched post-proc_start, any divergence is captured here.
+        return src_file.read_bytes() == show.stdout
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return False
 
