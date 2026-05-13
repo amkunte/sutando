@@ -370,13 +370,30 @@ def main():
                             f.unlink(missing_ok=True)
                             continue
                         owner_ids = load_allowed()
-                        if owner_ids:
-                            owner_id = next(iter(owner_ids))
+                        # Outgoing sends require a numeric chat_id (Telegram
+                        # `sendMessage` accepts int or "@channelusername"
+                        # but not a bare user @username — @username DM
+                        # doesn't resolve to a chat). The allowlist may
+                        # contain plain @usernames since PR #4 added the
+                        # incoming-auth feature, so filter to numeric
+                        # entries before picking one. Set iter order is
+                        # implementation-defined, so we can't rely on
+                        # JSON insertion order to pick the int.
+                        numeric_ids = [
+                            oid for oid in owner_ids
+                            if isinstance(oid, int) or (isinstance(oid, str) and oid.lstrip("-").isdigit())
+                        ]
+                        if numeric_ids:
+                            owner_id = int(numeric_ids[0])
                             try:
-                                send_reply(int(owner_id), text)
-                                print(f"  [proactive] sent to {owner_id}: {text[:80]}")
+                                send_reply(owner_id, text)
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                             except Exception as e:
-                                print(f"  [proactive] failed: {e}")
+                                print(f"  [proactive] failed: {e}", flush=True)
+                        elif owner_ids:
+                            # All entries are @usernames — proactive can't dispatch.
+                            # Surface loudly so the misconfig is visible in logs.
+                            print(f"  [proactive] skipped: allowFrom has no numeric chat_id (entries: {sorted(owner_ids)})", flush=True)
                         f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
