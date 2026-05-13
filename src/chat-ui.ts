@@ -54,8 +54,13 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   }
   .header a:hover { color: #e8e8ee; border-color: #3a3a52; }
   .header .clear-btn {
-    background: transparent; cursor: pointer; font-family: inherit;
+    color: #707080; font-size: 12px; font-family: inherit;
+    background: transparent; cursor: pointer;
+    border: 1px solid #2a2a3e; border-radius: 6px;
+    padding: 5px 12px;
+    transition: all 0.12s ease;
   }
+  .header .clear-btn:hover { color: #e8e8ee; border-color: #3a3a52; }
 
   .chat {
     flex: 1; overflow-y: auto; padding: 32px 0 16px;
@@ -197,7 +202,9 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     <div class="dot"></div>
     <div class="title">Sutando</div>
     <div class="subtitle" id="subtitle">core agent</div>
-    <button class="header clear-btn" id="clearBtn" style="color:#707080;font-size:12px;border:1px solid #2a2a3e;padding:5px 12px;border-radius:6px;margin-right:8px;background:transparent;cursor:pointer;font-family:inherit;">Clear</button>
+    <!-- Styling lives in the .header .clear-btn rule above. Per Chi #650:
+         dual styling (inline + class) creates surprise on future edits. -->
+    <button class="header clear-btn" id="clearBtn" style="margin-right:8px;">Clear</button>
     <a href="/" title="Open dashboard">Dashboard</a>
   </div>
 
@@ -228,7 +235,11 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   </div>
 
 <script>
-  const apiBase = 'http://' + location.hostname + ':7843';
+  // Preserve scheme so an https-served /chat doesn't downgrade to http.
+  // Per Chi's PR #650 review: hardcoded http: breaks tailscale-funnel'd
+  // deployments where the page is served over https — browser blocks the
+  // mixed-content request and the chat just hangs.
+  const apiBase = location.protocol + '//' + location.hostname + ':7843';
   const chatInner = document.getElementById('chatInner');
   const empty = document.getElementById('empty');
   const input = document.getElementById('input');
