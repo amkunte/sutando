@@ -295,10 +295,12 @@ def main():
                 chat_id = msg["chat"]["id"]
                 text = msg.get("text", "")
 
-                # Reload access list periodically
+                # Reload access list periodically. Accept either the numeric
+                # Telegram ID or the @username — friendlier onboarding since
+                # users usually know their username but not their numeric ID.
                 allowed = load_allowed()
-                if sender_id not in allowed:
-                    print(f"  Dropped message from non-allowed @{username}")
+                if sender_id not in allowed and username not in allowed:
+                    print(f"  Dropped message from non-allowed @{username} (id={sender_id})")
                     continue
 
                 # Record owner activity for status-aware-pivot
