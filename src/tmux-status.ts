@@ -3,8 +3,16 @@
 // before writing idle). Scrapes the CLI's tmux pane via `tmux capture-pane`
 // and categorizes the rendered state.
 //
-// Disabled by setting `SUTANDO_TMUX_SCRAPE=0`. Tmux session name override via
-// `SUTANDO_TMUX_SESSION` (default `sutando-core`).
+// Disabled by setting `SUTANDO_TMUX_SCRAPE=0`. Overrides:
+//   - `SUTANDO_TMUX_SESSION` — session name (default `sutando-core`)
+//   - `SUTANDO_TMUX_SOCKET`  — socket path  (default `/tmp/sutando-tmux.sock`)
+//
+// The socket-path override matters: `scripts/start-cli.sh` launches tmux with
+// a custom `-S /tmp/sutando-tmux.sock` socket (so Sutando.app can find the
+// same server across macOS sandbox-altered TMPDIRs). Without `-S`, this
+// scraper hits the default socket at `/private/tmp/tmux-501/default` —
+// where no sutando server lives — and silently emits "no such file" errors
+// once per minute. The session was effectively unfindable until 2026-05-13.
 //
 // All failure modes (tmux missing, timeout, parse error) return `idle` — this
 // is a best-effort hint, never ground-truth, never throws.
@@ -20,6 +28,7 @@ export type TmuxParseResult = {
 };
 
 const DEFAULT_SESSION = 'sutando-core';
+const DEFAULT_SOCKET = '/tmp/sutando-tmux.sock';
 const CACHE_TTL_MS = 3_000;
 const CAPTURE_TIMEOUT_MS = 500;
 const LINES_BACK = 30;
@@ -39,10 +48,11 @@ async function _refreshCache(): Promise<void> {
 	if (_refreshInFlight) return;
 	_refreshInFlight = true;
 	const session = process.env.SUTANDO_TMUX_SESSION || DEFAULT_SESSION;
+	const socket = process.env.SUTANDO_TMUX_SOCKET || DEFAULT_SOCKET;
 	try {
 		const { stdout } = await execFileAsync(
 			'tmux',
-			['capture-pane', '-t', session, '-pS', `-${LINES_BACK}`],
+			['-S', socket, 'capture-pane', '-t', session, '-pS', `-${LINES_BACK}`],
 			{ encoding: 'utf-8', timeout: CAPTURE_TIMEOUT_MS },
 		);
 		_cache = { ts: Date.now(), result: parseTmuxPane(stdout) };
