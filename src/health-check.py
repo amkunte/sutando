@@ -1026,17 +1026,36 @@ def run_all_checks() -> list[dict]:
                         continue
                 except OSError:
                     continue
+        # Distinguish pgrep "no matches" (rc 1) from transient probe failure
+        # (any other code or exception) — same fix shape as sutando-app
+        # below. Without it, a flaky probe fires a "bridge not running" warn
+        # task that's actually a false alarm.
+        probe_ok = False
+        pids: list[str] = []
         try:
             # Anchor on the .py suffix so we don't match unrelated processes
             # whose command line happens to contain "discord-bridge" (shell
             # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
             # name produces false-positive "multiple processes" warnings
             # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
-        except Exception:
-            pids = []
+            result = subprocess.run(
+                ["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode in (0, 1):
+                probe_ok = True
+                pids = [p for p in result.stdout.strip().split("\n") if p]
+        except (subprocess.SubprocessError, OSError):
+            probe_ok = False
+
+        if not probe_ok:
+            # Flaky probe — don't downgrade to "not running". Surface as ok-
+            # with-note so the dashboard sees it but emit_task_for_failures
+            # skips it (only failures, not ok, fire tasks).
+            checks.append({"name": name, "status": "ok", "detail": "probe failed transiently — assuming alive"})
+            continue
 
         if not pids:
             checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
