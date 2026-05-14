@@ -211,10 +211,28 @@ def presenter_mode_active():
 # Load access config
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "telegram" / "access.json"
 def load_allowed():
+    # Returns the allowFrom set from ~/.claude/channels/telegram/access.json.
+    # On error we return an empty set (deny-all) to keep the security default
+    # safe — but we MUST log loudly on parse/permission errors, otherwise a
+    # transient OS error (or a single corrupt write) silently rejects every
+    # incoming Telegram message and the bridge keeps passing the watchdog's
+    # process-alive check. Bare-except previously masked this entirely.
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return set(data.get("allowFrom", []))
-    except:
+    except FileNotFoundError:
+        # Legitimate uninitialized state — no config means no Telegram pairing
+        # has happened yet. Quiet return is correct here.
+        return set()
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        # Real fault — corrupt JSON, permission flip, disk error. Make it
+        # visible in logs/telegram-bridge.log so owner can debug rather than
+        # wondering why messages stopped arriving.
+        print(
+            f"WARN load_allowed: {type(e).__name__} reading {ACCESS_FILE}: {e}. "
+            f"Denying all messages until config is readable.",
+            flush=True,
+        )
         return set()
 
 def api(method, **params):
