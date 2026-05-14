@@ -214,7 +214,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Skip Conditions §(d)). Pause writes a future-dated sentinel; Resume
         // deletes it. Sentinel format: ISO-8601 expiry timestamp (UTC).
         // Auto-expires so a forgotten pause re-enables itself.
-        menu.addItem(NSMenuItem(title: "Pause Loop (30 min)", action: #selector(pauseLoop30), keyEquivalent: ""))
+        // Pause submenu — 30min auto-expire (default), 1hr auto-expire,
+        // or Indefinite (writes a year-2099 expiry so the sentinel-check
+        // in proactive-loop SKILL.md still works without code change).
+        let pauseSubmenu = NSMenu()
+        pauseSubmenu.addItem(NSMenuItem(title: "30 minutes", action: #selector(pauseLoop30), keyEquivalent: ""))
+        pauseSubmenu.addItem(NSMenuItem(title: "1 hour", action: #selector(pauseLoop1h), keyEquivalent: ""))
+        pauseSubmenu.addItem(NSMenuItem(title: "Indefinite (Resume to re-enable)", action: #selector(pauseLoopIndefinite), keyEquivalent: ""))
+        let pauseItem = NSMenuItem(title: "Pause Loop", action: nil, keyEquivalent: "")
+        pauseItem.submenu = pauseSubmenu
+        menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
@@ -475,6 +484,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// web UI polls the file and pins matching chips at the top of the
     /// starter tab.
     func refreshContextualChips() {
+        // Skip when loop is paused — quiets the menu bar during a meeting /
+        // dinner break. Guard at the function body (not just Timer
+        // callbacks) so startup one-shot calls also respect the pause.
+        if pauseSentinelActive() { return }
         var chips: [[String: String]] = []
 
         // 1. Open PRs authored by sonichi (both bots commit under this account).
@@ -1527,6 +1540,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var lastHealthCheckStart: Date = .distantPast
     func runHealthCheck() {
+        // Skip when loop is paused — health pings during a paused window
+        // would just produce noise. Guard at the function body (not just
+        // Timer callbacks) so startup one-shot calls also respect the pause.
+        if pauseSentinelActive() { return }
         // Throttle: never more than once per 60s, even if the Timer +
         // startup-fire happen to align.
         let now = Date()
@@ -1699,13 +1716,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    /// Pause the proactive loop for 30 minutes by writing the sentinel
-    /// the loop's skip-conditions check (per
-    /// `~/.claude/skills/proactive-loop/SKILL.md` Skip Conditions §(d)).
-    /// Format: ISO-8601 expiry timestamp (UTC). Auto-expires — forgetting
-    /// to resume just means the loop self-re-enables in 30 min.
-    @objc func pauseLoop30() {
-        let expiry = Date().addingTimeInterval(30 * 60)
+    /// Pause the proactive loop by writing the sentinel the loop's
+    /// skip-conditions check (per `~/.claude/skills/proactive-loop/SKILL.md`
+    /// Skip Conditions §(d)). Format: ISO-8601 expiry timestamp (UTC).
+    /// `30 min` and `1 hr` auto-expire — forgetting to resume just means
+    /// the loop self-re-enables. `Indefinite` writes a year-2099 expiry
+    /// so the sentinel-check still works without protocol changes; the
+    /// user must explicitly Resume Loop to re-enable.
+    func writePauseSentinel(seconds: TimeInterval, label: String) {
+        let expiry = Date().addingTimeInterval(seconds)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         let iso = formatter.string(from: expiry)
@@ -1714,11 +1733,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         do {
             try iso.write(toFile: path, atomically: true, encoding: .utf8)
-            let humanTime = DateFormatter.localizedString(from: expiry, dateStyle: .none, timeStyle: .short)
-            notify("Sutando", "Loop paused until \(humanTime). Click Resume Loop to re-enable sooner.")
+            notify("Sutando", "Loop paused (\(label)). Click Resume Loop to re-enable sooner.")
         } catch {
             notify("Sutando", "Loop pause failed: \(error.localizedDescription)")
         }
+    }
+
+    @objc func pauseLoop30() {
+        writePauseSentinel(seconds: 30 * 60, label: "30 min")
+    }
+
+    @objc func pauseLoop1h() {
+        writePauseSentinel(seconds: 60 * 60, label: "1 hr")
+    }
+
+    @objc func pauseLoopIndefinite() {
+        // Far-future expiry (2099-01-10T00:00:00Z) — far enough out that
+        // the sentinel-check treats it as permanent, but still uses the
+        // same ISO-8601 format so no protocol change downstream. Resume
+        // Loop deletes the sentinel.
+        let indefiniteExpiry = ISO8601DateFormatter().date(from: "2099-01-10T00:00:00Z") ?? Date().addingTimeInterval(365 * 24 * 60 * 60 * 75)
+        let secondsToFar = max(0, indefiniteExpiry.timeIntervalSinceNow)
+        writePauseSentinel(seconds: secondsToFar, label: "indefinite")
+    }
+
+    /// Returns true if the loop-pause sentinel exists AND its expiry is in
+    /// the future. Used by Timers (contextual-chips, health-check) to skip
+    /// their body during a pause window — keeps the menu-bar quiet during
+    /// a meeting/dinner break without disabling task watcher restarts.
+    func pauseSentinelActive() -> Bool {
+        let path = workspace + "/state/loop-paused-until.sentinel"
+        guard let iso = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              !iso.isEmpty else { return false }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let expiry = formatter.date(from: iso) else { return false }
+        return expiry > Date()
     }
 
     /// Resume the proactive loop by deleting the pause sentinel. No-op

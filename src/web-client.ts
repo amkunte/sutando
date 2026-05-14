@@ -312,6 +312,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   .task-status.done { background: #1e4028; color: #4ecca3; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .task-text { color: #d0d0d8; flex: 1; word-break: break-word; font-size: 16px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 1s yellow flash on a task-item when voice expand:N targets it.
+     Visual confirmation that the expand landed, independent of whether
+     the task has a result body to display. */
+  @keyframes task-flash-anim {
+    0% { background: rgba(255, 220, 100, 0.45); }
+    100% { background: transparent; }
+  }
+  .task-item.task-flash { animation: task-flash-anim 1s ease-out; }
   .task-text.expanded { white-space: normal; }
   .task-time { color: #777; font-size: 13px; flex-shrink: 0; }
   .task-expand {
@@ -1007,10 +1015,64 @@ function updateTask(taskId, status, text, result) {
 const expandedTasks = window.expandedTasks = loadPersistedExpanded();
 const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
-// Listen for external collapse/expand commands (from inline tools via AppleScript)
+// Listen for external collapse/expand commands (from inline tools via AppleScript).
+// Action is 'collapse' / 'expand' for all-tasks, or 'collapse:N' / 'expand:N' (1-based) for one.
 new MutationObserver(() => {
-  if (document.body.dataset.taskAction === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); document.body.dataset.taskAction = ''; }
-  if (document.body.dataset.taskAction === 'expand') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); document.body.dataset.taskAction = ''; }
+  const a = document.body.dataset.taskAction || '';
+  if (!a) return;
+  const [verb, idxStr] = a.split(':');
+  const idx = idxStr ? parseInt(idxStr, 10) : NaN;
+  // Per-task ops ("expand:3") must use the SAME ordering the user actually sees.
+  // The primary #tasks container is display:none — only the dr-content "tasks"
+  // sub-tab is visible, which renders top-10 by time desc with no filter
+  // (line 2308 below). Voice "expand task N" hitting a different list than
+  // what the user can see produces the bug Chi caught — voice targeted a
+  // 3-day-old timeout task because it ranked 3rd in the unsliced filtered
+  // observer list, but the user's "task 3" was a recent done task that
+  // wasn't in the filtered set.
+  const visibleIds = Object.entries(taskMap)
+    .sort((a, b) => b[1].time - a[1].time)
+    .slice(0, 10)
+    .map(([id]) => id);
+  // All-tasks ops ("expand"/"collapse" with no index) still use the broader
+  // filtered list — "expand all" should reach everything non-done, not just
+  // the visible 10.
+  const allIds = Object.entries(taskMap)
+    .filter(([, t]) => showDone || t.status !== 'done')
+    .sort((a, b) => b[1].time - a[1].time)
+    .map(([id]) => id);
+  if (Number.isInteger(idx) && idx >= 1 && idx <= visibleIds.length) {
+    const targetId = visibleIds[idx - 1];
+    if (verb === 'expand') {
+      // Add target. Do NOT reset userCollapsed — if the user just said
+      // "collapse all" → "expand task N", we want ONLY N visible.
+      // Resetting userCollapsed to false lets the API-poll auto-expand
+      // block re-add all working tasks on the next 3s tick, undoing the
+      // collapse and making per-task expand look like a no-op.
+      expandedTasks.add(targetId); userExpanded.add(targetId);
+    }
+    else if (verb === 'collapse') { expandedTasks.delete(targetId); userExpanded.delete(targetId); }
+    renderTasks();
+    // Visual flash on the targeted task-item across BOTH render paths
+    // (primary + dynamic-region). 50ms delay lets renderTasks() paint
+    // first. Querying after the delay also catches the dr-content
+    // element which re-renders on its own 3s tick — by the time the
+    // user issues subsequent commands the flash will have ridden the
+    // next dynamic-region paint too.
+    setTimeout(function() {
+      document.querySelectorAll('[data-taskid="' + targetId + '"]').forEach(function(el) {
+        el.classList.remove('task-flash');
+        // Force reflow so the animation re-triggers on repeat expand:N.
+        void el.offsetWidth;
+        el.classList.add('task-flash');
+        setTimeout(function() { el.classList.remove('task-flash'); }, 1100);
+      });
+    }, 50);
+  } else {
+    if (verb === 'collapse') { expandedTasks.clear(); userCollapsed = true; renderTasks(); }
+    else if (verb === 'expand') { allIds.forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); userCollapsed = false; renderTasks(); }
+  }
+  document.body.dataset.taskAction = '';
 }).observe(document.body, { attributes: true, attributeFilter: ['data-task-action'] });
 function toggleResult(taskId) {
   if (expandedTasks.has(taskId)) { expandedTasks.delete(taskId); userExpanded.delete(taskId); } else { expandedTasks.add(taskId); userExpanded.add(taskId); userCollapsed = false; }
@@ -1037,7 +1099,9 @@ document.addEventListener('click', function(e) {
   // handler and toggles before the user can copy.
   const sel = window.getSelection && window.getSelection();
   if (sel && sel.toString().length > 0) return;
-  const item = e.target.closest && e.target.closest('.task-item[data-taskid]');
+  // Only working-with-result items are clickable; data-taskid is on every
+  // task-item now (for flash), so gate the toggle on data-clickable.
+  const item = e.target.closest && e.target.closest('.task-item[data-clickable]');
   if (item) toggleResult(item.dataset.taskid);
 });
 // Collapse routing prefixes to a short category badge + clause head.
@@ -1112,7 +1176,7 @@ function renderTasks() {
   // of view within seconds. 30 keeps a longer history visible; localStorage
   // persistence above keeps results from being lost across refreshes.
   const sorted = visible.sort((a, b) => b[1].time - a[1].time).slice(0, 30);
-  container.innerHTML = sorted.map(([id, t]) => {
+  container.innerHTML = sorted.map(([id, t], i) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
@@ -1121,7 +1185,9 @@ function renderTasks() {
     // file is written — gating render on status === 'done' meant those
     // results never showed up in the UI even though they were in taskMap.
     const hasResult = !!t.result;
-    const clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
+    // Always emit data-taskid so flash + expand:N can target working tasks
+    // too. cursor:pointer + data-clickable only when there's a result to show.
+    const clickAttr = ' data-taskid="' + id + '"' + (hasResult ? ' data-clickable="1" style="cursor:pointer"' : '');
     const isExpanded = expandedTasks.has(id);
     const resultDisplay = isExpanded ? 'block' : 'none';
     const resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + t.result.replace(/</g,'&lt;') + '</div>' : '';
@@ -1144,7 +1210,12 @@ function renderTasks() {
     // Default-tag bare tasks (no [Channel] prefix) as [Voice] — the
     // overwhelming majority of un-prefixed tasks come from the voice agent.
     const taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
-    const displayText = isExpanded ? taggedRaw : summarizeTaskText(taggedRaw);
+    // Prepend the 1-based index INTO the display text so it always renders
+    // — earlier attempt with a separate <span class="task-num"> got
+    // zero-width even with min-width set (flex layout/min-content issue).
+    // Embedding sidesteps the layout question entirely.
+    const numPrefix = (i + 1) + '. ';
+    const displayText = numPrefix + (isExpanded ? taggedRaw : summarizeTaskText(taggedRaw));
     const textClass = isExpanded ? 'task-text expanded' : 'task-text';
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
@@ -2287,7 +2358,7 @@ function renderTabContent() {
     } else {
       var sorted = entries.sort(function(a,b) { return b[1].time - a[1].time; }).slice(0, 10);
       var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
-      container.innerHTML = sorted.map(function(entry) {
+      container.innerHTML = sorted.map(function(entry, i) {
         var id = entry[0], t = entry[1];
         var ago = Math.round((Date.now() - t.time) / 1000);
         var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
@@ -2296,7 +2367,9 @@ function renderTabContent() {
         // file is written. Same fix as the main renderTasks path above.
         var hasResult = !!t.result;
         var isExpanded = expandedTasks.has(id);
-        var clickAttr = hasResult ? ' data-taskid="' + id + '" style="cursor:pointer"' : '';
+        // Always emit data-taskid (matches primary renderTasks path) so flash
+        // + expand:N can target working tasks. cursor only when clickable.
+        var clickAttr = ' data-taskid="' + id + '"' + (hasResult ? ' data-clickable="1" style="cursor:pointer"' : '');
         var resultDisplay = isExpanded ? 'block' : 'none';
         var resultHtml = hasResult ? '<div id="result-' + id + '" style="display:' + resultDisplay + ';padding:8px 12px;color:#b8c8d8;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#0d1520;border-radius:8px;margin:4px 0 6px 30px">' + esc(t.result) + '</div>' : '';
         var rawText = t.text || id;
@@ -2304,7 +2377,10 @@ function renderTabContent() {
         // overwhelming majority of un-prefixed tasks come from the voice agent.
         // (Was [Sutando-core]; renamed 2026-05-03 per Chi's "rename to Voice".)
         var taggedRaw = /^\\[/.test(rawText) ? rawText : '[Voice] ' + rawText;
-        var displayText = isExpanded ? taggedRaw : summarizeTaskText(taggedRaw);
+        // Prepend 1-based index — same as the primary renderTasks path,
+        // so voice can target tasks by number on this dynamic-region list too.
+        var numPrefix = (i + 1) + '. ';
+        var displayText = numPrefix + (isExpanded ? taggedRaw : summarizeTaskText(taggedRaw));
         var textClass = isExpanded ? 'task-text expanded' : 'task-text';
         var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';
         return '<div class="task-item"' + clickAttr + '>' +

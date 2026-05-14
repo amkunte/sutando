@@ -149,6 +149,12 @@ export const pressKeyTool: ToolDefinition = {
 			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
 			'delete': 51, 'backspace': 51, 'space': 49,
 			'up': 126, 'down': 125, 'left': 123, 'right': 124,
+			// Common voice-spoken aliases — without these, the fallthrough to
+			// `keystroke "<key>"` types the literal string into the focused
+			// field instead of pressing the arrow. Observed 2026-05-13 voice
+			// call: Gemini called press_key(key="downarrow"); nothing scrolled.
+			'uparrow': 126, 'downarrow': 125, 'leftarrow': 123, 'rightarrow': 124,
+			'arrowup': 126, 'arrowdown': 125, 'arrowleft': 123, 'arrowright': 124,
 			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
 		};
 		const keyCode = keyMap[key.toLowerCase()];
@@ -540,15 +546,18 @@ export const cancelTaskTool: ToolDefinition = {
 export const toggleTasksTool: ToolDefinition = {
 	name: 'toggle_tasks',
 	description:
-		'Collapse or expand all tasks in the web UI. Use for: "collapse tasks", "expand tasks", "hide tasks", "show tasks". Instant.',
+		'Collapse or expand tasks in the web UI. Use for: "collapse tasks", "expand tasks", "hide tasks", "show tasks", "expand only the first task". Pass taskIndex=1 for "the first task", 2 for "the second", etc. (1-based, by display order); omit for all-tasks. Instant.',
 	parameters: z.object({
-		action: z.enum(['collapse', 'expand']).describe('"collapse" to hide all task results, "expand" to show them'),
+		action: z.enum(['collapse', 'expand']).describe('"collapse" to hide task results, "expand" to show them'),
+		taskIndex: z.number().int().min(1).optional().describe('1-based index of a single task to act on (by display order). Omit to act on all tasks.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { action } = args as { action: 'collapse' | 'expand' };
-		// Set data attribute on body — MutationObserver in the page picks it up and updates state
-		const js = `document.body.dataset.taskAction = \\\"${action}\\\"; \\\"done\\\"`;
+		const { action, taskIndex } = args as { action: 'collapse' | 'expand'; taskIndex?: number };
+		// Set data attribute on body — MutationObserver in the page picks it up and updates state.
+		// When taskIndex is set, encode as "expand:N" / "collapse:N"; handler in web-client.ts parses the suffix.
+		const actionStr = taskIndex ? `${action}:${taskIndex}` : action;
+		const js = `document.body.dataset.taskAction = \\\"${actionStr}\\\"; \\\"done\\\"`;
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome"
 				repeat with w in windows
@@ -561,7 +570,7 @@ export const toggleTasksTool: ToolDefinition = {
 				end repeat
 				return "not found"
 			end tell'`, { timeout: 5_000 });
-			console.log(`${ts()} [ToggleTasks] ${action}`);
+			console.log(`${ts()} [ToggleTasks] ${actionStr}`);
 			return { status: action === 'collapse' ? 'collapsed' : 'expanded' };
 		} catch (err) {
 			return { error: `Toggle tasks failed: ${err instanceof Error ? err.message : err}` };
