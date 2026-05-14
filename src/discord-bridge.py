@@ -606,18 +606,41 @@ seen_message_ids = set()  # Discord message IDs already processed
 
 # Load access config
 ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+
+# Bare-except previously here masked real faults (corrupt JSON, permission
+# flip, transient OS error) as the "pre-pairing legitimate state" outcome.
+# That left every Discord message rejected with no log signal. Same class as
+# PR #17 (health-check) and PR #18 (telegram-bridge). Each loader below now:
+#  - FileNotFoundError → quiet default (legitimate pre-config state)
+#  - JSONDecodeError / OSError / ValueError → loud WARN + safe default
+#  - Other exceptions propagate.
+
 def load_allowed():
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return set(data.get("allowFrom", []))
-    except Exception:
+    except FileNotFoundError:
         return set()  # empty = allow all DMs during pairing
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(
+            f"WARN load_allowed: {type(e).__name__} reading {ACCESS_FILE}: {e}. "
+            f"Falling back to empty allowlist.",
+            flush=True,
+        )
+        return set()
 
 def load_policy():
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return data.get("dmPolicy", "pairing")
-    except Exception:
+    except FileNotFoundError:
+        return "pairing"
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(
+            f"WARN load_policy: {type(e).__name__} reading {ACCESS_FILE}: {e}. "
+            f"Falling back to 'pairing' policy.",
+            flush=True,
+        )
         return "pairing"
 
 def load_channel_config(channel_id):
@@ -631,7 +654,14 @@ def load_channel_config(channel_id):
                 return (False, None)  # no mention required, all allowed
             return (cfg.get("requireMention", True), set(cfg.get("allowFrom", [])))
         return None  # not configured
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(
+            f"WARN load_channel_config({channel_id}): {type(e).__name__} reading "
+            f"{ACCESS_FILE}: {e}. Treating channel as unconfigured.",
+            flush=True,
+        )
         return None
 
 def load_channel_allowed(channel_id):
@@ -2660,7 +2690,7 @@ async def _handle_discord_message(message, force=False):
         import random, string
         try:
             access = json.loads(ACCESS_FILE.read_text())
-        except Exception:
+        except:
             access = {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
         code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         pending = access.get("pending", {})
@@ -2880,7 +2910,7 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-        except Exception:
+        except:
             pass
 
     # Dedup: skip if we've already processed this Discord message ID.
@@ -3200,7 +3230,7 @@ def save_to_allowlist(sender_id):
     """Add sender to access.json allowFrom."""
     try:
         data = json.loads(ACCESS_FILE.read_text())
-    except Exception:
+    except:
         data = {"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}
 
     if sender_id not in data.get("allowFrom", []):
