@@ -10,20 +10,22 @@ Daily search for used Cirrus SR22 airframes matching the owner's buyer profile. 
 
 ## Sources (v1)
 
-| Site | Access | Notes |
+| Site | Public data | Bot detection (verified 2026-05-13) |
 |---|---|---|
-| Barnstormers | Free | Static-ish HTML, full specs in body |
-| aircraftforsale.com | Free | Free, decent HTML structure |
-| Controller.com | Free preview | Per-listing detail mostly paywalled; can extract price, year, total time, location |
-| Trade-A-Plane | Free preview | Similar to Controller — coarse fields free, detail paywalled |
+| Barnstormers | Full specs in body, free | WebFetch & curl get 403; real Chromium reaches search form but not result listings |
+| aircraftforsale.com | Decent HTML, free | WebFetch & curl get 403; needs Playwright |
+| Controller.com | Coarse fields free, detail paywalled | WebFetch & curl get 403; needs Playwright |
+| Trade-A-Plane | Coarse fields free, detail paywalled | WebFetch & curl get 403; needs Playwright |
 
-Owner can grant cookie-jar credentials to unlock paywalled fields on the latter two — see `state/credentials.example.json` for the format. v1 runs without credentials and accepts reduced detail.
+All 4 sites use Cloudflare or Datadome fingerprint-grade detection (TLS handshake, JS challenges, IP-type filtering — not just UA). `scan-prompt.md` uses a two-tier approach: WebFetch first (in case the detection ever relaxes), Playwright MCP fallback as the real path. See PR #20 for the recipe.
+
+Owner can grant cookie-jar credentials to unlock paywalled fields on Controller / Trade-A-Plane — see `state/credentials.example.json` for the format. v1 runs without credentials and accepts reduced detail.
 
 ## Architecture
 
-The skill follows the same pattern as `amazon-orders` and `subscription-scanner`: a cron-fired prompt asks the agent to do the work. The agent uses WebFetch (or Playwright MCP for JS-rendered pages) to retrieve listings at runtime, applies the criteria filter, evaluates matches with LLM reasoning, and writes results to `state/karts-air-data.json`. The web page reads that file live.
+The skill follows the same pattern as `amazon-orders` and `subscription-scanner`: a cron-fired prompt asks the agent to do the work. The agent first tries WebFetch (cheap, fast), then falls back to Playwright MCP for any source the bot-detection blocked. It applies the criteria filter, evaluates matches with LLM reasoning, and writes results to `state/karts-air-data.json`. The web page reads that file live.
 
-The reason this skill does NOT bake in a deterministic Python scraper (unlike `deal-finder/scan.py`) is that aviation sites are heterogeneous, JS-heavy, and anti-scrape; an agent with browser-grade tool access at runtime adapts to layout changes the way a static parser cannot.
+The reason this skill does NOT bake in a deterministic Python scraper (unlike `deal-finder/scan.py`) is twofold: (a) aviation sites have heterogeneous layouts an agent adapts to; (b) the heavy bot detection makes Python `requests` useless without a residential-Chromium runtime — which Playwright MCP provides for free to the agent at scan time.
 
 ## Files
 
