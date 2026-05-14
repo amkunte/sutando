@@ -7,9 +7,28 @@ You are running a daily Cirrus SR22 acquisition scan on behalf of the owner. The
 1. **`skills/karts-air/state/criteria.md`** — full narrative buyer profile, payload math, 3-branch avionics map, 5 standing questions, formatting expectations. THIS IS THE SOURCE OF TRUTH for evaluation.
 2. **`skills/karts-air/state/criteria.json`** — machine-readable filter shorthand (model, year range, price range, source URL list). Use for coarse pre-filtering before LLM evaluation.
 
-## Source list (v1)
+## Tooling: choose tier per source
 
-Fetch each via WebFetch with a `prompt` argument that asks for **structured listing extraction**, not free-form summary:
+**Tier 1 — WebFetch first.** Cheap, fast, no browser overhead. Try it first on every source. If a source returns content (200 + listing-shaped HTML), proceed with extraction and skip Tier 2 for that source.
+
+**Tier 2 — Playwright MCP fallback.** When `mcp__playwright__*` tools are available (after `claude mcp add playwright -- npx -y @playwright/mcp@latest`), use them for any source that came back 403 / Cloudflare-blocked / Datadome-blocked / empty in Tier 1. Real Chromium with full JS/TLS fingerprint beats the bot-detection that blocks WebFetch + bare curl + headless-via-`browser.mjs`.
+
+**First-run warning (Tier 2):** Playwright downloads ~150 MB of Chromium on first invocation per machine. If `~/Library/Caches/ms-playwright/chromium-*` does not exist, expect the first `browser_navigate` call to take 30-60s. Subsequent calls are fast. Cron-triggered scans should NOT race this download — if the first navigate hangs past 60s, bail with a "Playwright cold-start in progress, scan deferred" note and let the next manual run pick up.
+
+### Tier-2 recipe (per source)
+
+For each source URL needing the Playwright path:
+
+1. `mcp__playwright__browser_navigate` — load the page.
+2. `mcp__playwright__browser_wait_for` — wait for either a listing-shaped element OR a Cloudflare/Datadome challenge marker, whichever lands first (use `text:` parameter to anchor on a phrase you'd expect in real results, e.g. "Cirrus SR22"). Timeout 15s.
+3. `mcp__playwright__browser_snapshot` — accessibility-tree snapshot. This is the cheapest way to get structured page text; prefer it over `browser_take_screenshot` (binary blob → no extraction signal).
+4. If the snapshot shows a Cloudflare/captcha page rather than listings: try `mcp__playwright__browser_console_messages` to confirm, then mark this source `"blocked-even-with-playwright"` and continue to the next source.
+5. If listings are present, run the same structured-extraction prompt as Tier 1 over the snapshot text. If snapshot text is truncated (Playwright snapshots cap at ~10k chars on complex pages), follow up with `mcp__playwright__browser_evaluate` to pull the listings array directly via DOM (`document.querySelectorAll('.listing-card')` or equivalent).
+6. `mcp__playwright__browser_close` when done with a source.
+
+### Structured extraction prompt (same for both tiers)
+
+Pass this `prompt` argument when calling WebFetch, or use it as the extraction instruction when feeding Playwright-snapshot text back to yourself:
 
 ```
 For each Cirrus SR22 (G2 or G3 normally-aspirated only) listed for sale on this
@@ -19,14 +38,20 @@ CAPS expiration if visible, location (city + ICAO if shown), and a URL to the
 full listing detail page. Return as a JSON array. Skip turbo variants (SR22T).
 ```
 
-Source URLs (in order):
+### Source URLs (in order)
 
-1. `https://www.barnstormers.com/` — start at homepage, navigate via WebFetch redirect to the Cirrus SR22 search results.
+1. `https://www.barnstormers.com/` — start at homepage. WebFetch: try first; if it returns the search form rather than listings, navigate to the SR22 results URL. Playwright: navigate directly to the SR22 search page.
 2. `https://www.aircraftforsale.com/` — search for "Cirrus SR22"; follow result-list URL.
 3. `https://www.controller.com/listings/aircraft/for-sale/list?Mdltxt=SR22&Manu=CIRRUS` — preview-only fields without login.
 4. `https://www.trade-a-plane.com/search?make=CIRRUS&model_group=SR-22&category_level1=Single+Engine+Piston&type=aircraft` — preview-only fields without login.
 
-If WebFetch returns 403 / Cloudflare-blocked for one of these, log the source as "blocked this scan" in the output and continue with the others. Do NOT crash the whole scan on one source failure.
+### Per-source status taxonomy (`sources_status` values)
+
+- `ok` — listings retrieved (specify tier in notes if relevant)
+- `ok-preview-only` — Controller / Trade-A-Plane fields shown without login
+- `blocked` — WebFetch blocked AND Playwright unavailable this session
+- `blocked-even-with-playwright` — Both tiers failed; site has stronger detection than residential Chromium
+- `no-results` — Page loaded but zero SR22 G2/G3 NA listings (legit empty state, not a block)
 
 ## Coarse filter (before LLM evaluation)
 
@@ -117,7 +142,9 @@ Always include a `View detail: <funnel-url>/KARTS-AIR` line at the bottom of the
 
 ## When to bail out early (do NOT silently produce empty output)
 
-If `WebFetch` returns 403 / Cloudflare-blocked from all 4 sources, write a one-line notification: `🚧 Cirrus SR22 scan: all 4 sources blocked today. Web page unchanged.` and stop. Do NOT crash the cron — `agent-api` keeps running. Owner will see the blocked-everywhere notification and can intervene.
+If BOTH tiers (WebFetch AND Playwright if available) return blocked / empty from all 4 sources, write a one-line notification: `🚧 Cirrus SR22 scan: all 4 sources blocked today even with Playwright. Web page unchanged.` and stop. Do NOT crash the cron — `agent-api` keeps running.
+
+If Tier 2 (Playwright) is NOT available in this session — i.e. `mcp__playwright__*` tools are missing from the inventory — and all 4 sources blocked in Tier 1, write `🚧 Cirrus SR22 scan: all 4 sources blocked. Playwright MCP not available this session; restart Claude Code to load it.` and update `sources_status` with `blocked` (not `blocked-even-with-playwright`).
 
 If `criteria.md` or `criteria.json` is missing or unparseable, write a one-line notification: `🚧 Cirrus SR22 scan: criteria file unreadable at <path>. Owner to fix.` and stop.
 
