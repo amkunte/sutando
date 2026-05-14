@@ -288,13 +288,26 @@ def load_allowed():
     auto-onboarding: "file missing" → the bridge has never been configured,
     so the first DM should auto-onboard the sender as the owner. "File exists
     but empty allowFrom" → the admin explicitly locked it down; never TOFU.
+
+    Per PR #18: parse/permission errors return a deny-all set() AND log loudly,
+    so a transient OS error or a single corrupt write doesn't silently reject
+    every incoming Telegram message while still passing the process-alive check.
     """
     try:
         data = json.loads(ACCESS_FILE.read_text())
         return set(data.get("allowFrom", []))
     except FileNotFoundError:
+        # Bridge has never been configured — None signals TOFU eligibility.
         return None
-    except Exception:
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        # Real fault — corrupt JSON, permission flip, disk error. Make it
+        # visible in logs/telegram-bridge.log so owner can debug rather than
+        # wondering why messages stopped arriving.
+        print(
+            f"WARN load_allowed: {type(e).__name__} reading {ACCESS_FILE}: {e}. "
+            f"Denying all messages until config is readable.",
+            flush=True,
+        )
         return set()
 
 
