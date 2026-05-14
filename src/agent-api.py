@@ -39,6 +39,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -107,8 +108,38 @@ from util_paths import personal_path  # noqa: E402
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
 RESULT_DIR = WORKSPACE_DIR / "results"
+STATE_DIR = WORKSPACE_DIR / "state"
+OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 TASK_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
+
+
+def write_owner_activity(channel: str, summary: str) -> None:
+    """Record owner activity — mirrors src/telegram-bridge.py:write_owner_activity.
+
+    Updates state/last-owner-activity.json with the most recent owner interaction
+    so the proactive-loop's `active-engagement` skip rule (b) correctly recognises
+    web/mobile/CLI task POSTs, not just Telegram/Discord messages. Without this,
+    a fresh owner task arriving via this API would leave the activity file stale,
+    causing the proactive loop to treat the owner as inactive when they're not.
+
+    See:
+      - skills/proactive-loop/SKILL.md (skip rule b reads this file's `ts` field)
+      - src/telegram-bridge.py (canonical schema: ts, channel, summary)
+    """
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        payload = {
+            "ts": int(time.time()),
+            "channel": channel,
+            "summary": (summary or "")[:80],
+        }
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.rename(OWNER_ACTIVITY_FILE)
+    except Exception:
+        # Activity tracking is a heuristic — don't crash the API over it.
+        pass
 
 # In-memory task history (survives file cleanup, lost on restart)
 # {task_id: {status, text, time, result}}
@@ -823,6 +854,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"task: {task}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+
+        # Record owner activity so the proactive-loop's active-engagement
+        # skip rule (b) recognises web/mobile/CLI task POSTs, not just
+        # Telegram/Discord messages. Without this, web tasks arriving via
+        # this API leave the activity file stale, causing the loop to
+        # treat the owner as inactive when they're not.
+        write_owner_activity(channel=from_agent or "api", summary=task)
 
         # Register webhook callback if provided
         if callback_url:
