@@ -9,7 +9,7 @@
  */
 
 import { createServer } from 'node:http';
-import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, statSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
@@ -3982,6 +3982,28 @@ function renderAmazonOrdersHtml(rawJson: string): string {
 </html>`;
 }
 
+// Mirrors src/agent-api.py:write_owner_activity and
+// src/telegram-bridge.py:write_owner_activity. Web /scan routes that queue
+// owner-tier task files must also bump state/last-owner-activity.json so the
+// proactive-loop's active-engagement skip rule (b) recognises an owner click
+// as a presence signal — same gap as PR #14 fixed in agent-api.py.
+function writeOwnerActivity(channel: string, summary: string): void {
+	try {
+		mkdirSync('state', { recursive: true });
+		const payload = {
+			ts: Math.floor(Date.now() / 1000),
+			channel,
+			summary: (summary || '').slice(0, 80),
+		};
+		const finalPath = 'state/last-owner-activity.json';
+		const tmpPath = finalPath + '.tmp';
+		writeFileSync(tmpPath, JSON.stringify(payload));
+		renameSync(tmpPath, finalPath);
+	} catch {
+		// Best-effort; never fail the route on activity-recording errors.
+	}
+}
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -4331,6 +4353,7 @@ const server = createServer((req, res) => {
 			// from any header-shaped lines inside scan-prompt.md.
 			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Cirrus SR22 deal-hunter scan (out-of-cycle, triggered from /KARTS-AIR UI). Read the full instructions in skills/karts-air/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: karts-air-ui\naccess_tier: owner\n`;
 			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			writeOwnerActivity('web-karts-air', 'Scan now (KARTS-AIR)');
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up. Refresh in ~2-3 min for results.' }));
 		} catch (e: any) {
@@ -4371,6 +4394,7 @@ const server = createServer((req, res) => {
 			// is fragile.
 			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: paidsubscriptions-ui\naccess_tier: owner\n`;
 			writeFileSync(join(TASK_DIR, `${taskId}.txt`), taskContent);
+			writeOwnerActivity('web-paidsubscriptions', 'Scan now (paidsubscriptions)');
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
 		} catch (e: any) {
@@ -4412,6 +4436,7 @@ const server = createServer((req, res) => {
 			const promptBody = existsSync(promptPath) ? readFileSync(promptPath, 'utf-8') : '(scan-prompt.md missing — run Amazon orders scan)';
 			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Amazon orders scan (out-of-cycle, triggered from /amazon UI). Follow the instructions in skills/amazon-orders/scan-prompt.md verbatim:\n\n${promptBody}\nsource: web\nfrom: amazon-orders-ui\n`;
 			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			writeOwnerActivity('web-amazon', 'Scan now (Amazon orders)');
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min).' }));
 		} catch (e: any) {
