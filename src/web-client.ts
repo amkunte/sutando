@@ -3194,6 +3194,176 @@ setInterval(() => {
 	}
 }, 30_000);
 
+// /KARTS-AIR page — Cirrus SR22 deal-hunter dashboard, server-side rendered
+// from skills/karts-air/state/karts-air-data.json. Lean table + per-candidate
+// expansion + "Scan now" button. Diff highlights for new/dropped/price-changed.
+function renderKartsAirHtml(rawJson: string): string {
+	let data: any;
+	try {
+		data = JSON.parse(rawJson);
+	} catch (e: any) {
+		data = { last_scan: null, candidates: [], scan_history: [], sources_status: {}, _parse_error: e?.message };
+	}
+	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
+	const lastDiff = (data.scan_history && data.scan_history.length) ? data.scan_history[data.scan_history.length - 1] : { new_tails: [], dropped_tails: [], price_changes: [] };
+	const newSet = new Set(lastDiff.new_tails || []);
+	const priceChangedMap = new Map((lastDiff.price_changes || []).map((p: any) => [p.tail, p]));
+	const candidates = data.candidates || [];
+	const sourcesStatus = data.sources_status || {};
+	const dataJson = JSON.stringify(data).replace(/</g, '\\u003c');
+
+	const fmtUsd = (n: number) => '$' + (n || 0).toLocaleString('en-US');
+	const escapeHtml = (s: any) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+	const rows = candidates.map((c: any) => {
+		const isNew = newSet.has(c.tail);
+		const priceChange = priceChangedMap.get(c.tail);
+		const branchLabel = c.branch ? `B${c.branch}` : '—';
+		const branchColor = c.branch === 1 ? '#4ecca3' : c.branch === 2 ? '#f0b878' : c.branch === 3 ? '#e08070' : '#707080';
+		const priceCell = priceChange
+			? `<span style="text-decoration: line-through; color: #707080;">${fmtUsd((priceChange as any).from)}</span> <strong style="color: #f0b878;">${fmtUsd(c.price_usd)}</strong>`
+			: `<strong>${fmtUsd(c.price_usd)}</strong>`;
+		return `
+		<tr class="${isNew ? 'row-new' : ''}">
+			<td>${isNew ? '<span class="badge-new">NEW</span> ' : ''}<a href="${escapeHtml(c.list_url)}" target="_blank" rel="noopener">${escapeHtml(c.tail || '—')}</a></td>
+			<td>${escapeHtml(c.year)} ${escapeHtml(c.gen || '')}</td>
+			<td>${priceCell}</td>
+			<td>${c.total_time_hr ?? '—'} TT<br><small>${c.engine_smoh_hr ?? '—'} SMOH</small></td>
+			<td>${escapeHtml(c.location_city || '—')}<br><small>${escapeHtml(c.location_icao || '')}</small></td>
+			<td><span class="branch" style="color: ${branchColor};">${branchLabel}</span></td>
+			<td>${escapeHtml(c.caps_expiry || '—')}</td>
+			<td><small>${escapeHtml(c.source || '—')}</small></td>
+		</tr>
+		<tr class="row-detail"><td colspan="8">
+			<details><summary>Avionics / W&amp;B / Pros &amp; Cons / Q1–Q5</summary>
+			<div class="detail-grid">
+				<div><strong>Branch rationale:</strong> ${escapeHtml(c.branch_rationale || '—')}</div>
+				<div><strong>Upgrade overhead:</strong> ${fmtUsd(c.upgrade_overhead_usd || 0)}</div>
+				<div><strong>Empty / Useful:</strong> ${c.empty_weight_lbs ?? '—'} / ${c.useful_load_lbs ?? '—'} lbs</div>
+				<div><strong>Pros:</strong> ${(c.pros || []).map(escapeHtml).join('; ') || '—'}</div>
+				<div><strong>Cons:</strong> ${(c.cons || []).map(escapeHtml).join('; ') || '—'}</div>
+				<div><strong>Q1 within 500mi PAO:</strong> ${c.q1_within_500mi_of_PAO ? 'Yes' : 'No'}</div>
+				<div><strong>Q2 factory rebuild:</strong> ${escapeHtml(c.q2_factory_rebuild_evidence || '—')}</div>
+				<div><strong>Q3 ventilation (Branch 2 only):</strong> ${escapeHtml(c.q3_branch2_ventilation || '—')}</div>
+				<div><strong>Q4 FlightStream:</strong> ${c.q4_flightstream ? 'Yes' : 'No'}</div>
+				<div><strong>Q5 net after prop+O2:</strong> ${fmtUsd(c.q5_net_after_prop_and_o2 || c.price_usd)}</div>
+			</div>
+			</details>
+		</td></tr>`;
+	}).join('');
+
+	const sourceBadges = Object.entries(sourcesStatus).map(([k, v]) => {
+		const color = String(v).startsWith('ok') ? '#4ecca3' : String(v) === 'blocked' ? '#e08070' : '#707080';
+		return `<span class="src-badge" style="border-color: ${color}; color: ${color};">${escapeHtml(k)}: ${escapeHtml(String(v))}</span>`;
+	}).join(' ');
+
+	return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KARTS-AIR — Cirrus SR22 Hunt — Sutando</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #e8e8ee; padding: 24px; min-height: 100vh; }
+  .wrap { max-width: 1280px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 16px; margin-bottom: 4px; flex-wrap: wrap; }
+  h1 { font-size: 22px; font-weight: 700; }
+  .subtitle { color: #707080; font-size: 13px; }
+  .meta { display: flex; gap: 20px; font-size: 13px; color: #888; margin: 8px 0 16px; flex-wrap: wrap; align-items: center; }
+  .meta strong { color: #c0c0d0; font-weight: 600; }
+  .scan-btn { background: #1e4028; color: #4ecca3; border: 1px solid #2a4a36; padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .scan-btn:hover:not(:disabled) { background: #2a503a; }
+  .scan-btn:disabled { background: #1a1a2a; color: #444; border-color: #2a2a3e; cursor: wait; }
+  .scan-status { font-size: 12px; color: #4ecca3; margin-left: 8px; }
+  .src-badges { display: flex; gap: 6px; margin: 4px 0 20px; flex-wrap: wrap; }
+  .src-badge { font-size: 11px; padding: 3px 8px; border-radius: 6px; border: 1px solid; background: rgba(0,0,0,0.2); }
+  table { width: 100%; border-collapse: collapse; background: #14141e; border: 1px solid #1e1e2a; border-radius: 10px; overflow: hidden; }
+  thead { background: #1a1a26; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #888; padding: 10px 12px; border-bottom: 1px solid #2a2a3e; }
+  td { padding: 11px 12px; border-bottom: 1px solid #1e1e2a; font-size: 13px; vertical-align: top; }
+  td small { color: #707080; font-size: 11px; }
+  td a { color: #6ea3ff; text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  tr.row-new { background: rgba(78, 204, 163, 0.06); }
+  .badge-new { font-size: 9px; padding: 2px 6px; border-radius: 4px; background: #1e4028; color: #4ecca3; font-weight: 700; letter-spacing: 0.5px; }
+  .branch { font-weight: 700; }
+  tr.row-detail td { padding: 0; }
+  tr.row-detail details { padding: 8px 12px 14px 12px; }
+  tr.row-detail summary { font-size: 12px; color: #707080; cursor: pointer; padding: 4px 0; }
+  tr.row-detail summary:hover { color: #c0c0d0; }
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; font-size: 12px; color: #c0c0d0; margin-top: 8px; }
+  .detail-grid strong { color: #e8e8ee; }
+  .empty { text-align: center; padding: 60px 20px; color: #555; }
+  .empty .logo { font-size: 36px; margin-bottom: 12px; }
+  footer { margin-top: 24px; font-size: 11px; color: #555; text-align: center; }
+  footer a { color: #707080; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>✈️ KARTS-AIR</h1>
+  <span class="subtitle">Cirrus SR22 G2/G3 acquisition hunt</span>
+</header>
+<div class="meta">
+  <span>Last scan: <strong>${escapeHtml(lastScan)}</strong></span>
+  <span>Candidates: <strong>${candidates.length}</strong></span>
+  <span>${(lastDiff.new_tails || []).length} new · ${(lastDiff.price_changes || []).length} price-change · ${(lastDiff.dropped_tails || []).length} dropped</span>
+  <button class="scan-btn" id="scanBtn" onclick="triggerScan()">Scan now</button>
+  <span class="scan-status" id="scanStatus"></span>
+</div>
+<div class="src-badges">${sourceBadges || '<span class="src-badge" style="border-color: #444; color: #888;">no sources status yet — waiting on first scan</span>'}</div>
+
+${candidates.length > 0 ? `
+<table>
+<thead>
+<tr><th>Tail</th><th>Year/Gen</th><th>Price</th><th>Times</th><th>Location</th><th>Branch</th><th>CAPS</th><th>Source</th></tr>
+</thead>
+<tbody>
+${rows}
+</tbody>
+</table>
+` : `
+<div class="empty">
+  <div class="logo">✈️</div>
+  <div>No candidates yet. First daily scan runs at 05:00 PT.</div>
+  <div style="font-size:11px; margin-top:8px; color: #444;">Or click "Scan now" above to trigger an out-of-cycle scan.</div>
+</div>
+`}
+
+<footer>
+  Edit acquisition criteria: <a href="https://github.com/amkunte/sutando/blob/main/skills/karts-air/state/criteria.md" target="_blank">skills/karts-air/state/criteria.md</a>
+  · Edit machine filters: <a href="https://github.com/amkunte/sutando/blob/main/skills/karts-air/state/criteria.json" target="_blank">criteria.json</a>
+</footer>
+</div>
+
+<script>
+const DATA = ${dataJson};
+async function triggerScan() {
+  const btn = document.getElementById('scanBtn');
+  const status = document.getElementById('scanStatus');
+  btn.disabled = true;
+  status.textContent = 'queueing scan…';
+  try {
+    const r = await fetch('/KARTS-AIR/scan', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      status.textContent = 'queued · refresh in ~2-3 min for results';
+    } else {
+      status.textContent = 'error: ' + (j.error || 'unknown');
+      btn.disabled = false;
+    }
+  } catch (e) {
+    status.textContent = 'request failed: ' + e.message;
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>`;
+}
+
 // /paidsubscriptions page — full HTML, server-side rendered from
 // skills/subscription-scanner/state/subscriptions.json. Sortable table,
 // diff highlights from last scan, "Scan now" button.
@@ -4089,6 +4259,60 @@ const server = createServer((req, res) => {
 		}
 		return;
 	}
+	if (url.pathname === '/KARTS-AIR') {
+		try {
+			const dataPath = 'skills/karts-air/state/karts-air-data.json';
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
+			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+			res.end(renderKartsAirHtml(raw));
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'text/plain' });
+			res.end('Error reading KARTS-AIR data: ' + (e?.message || String(e)));
+		}
+		return;
+	}
+	if (url.pathname === '/KARTS-AIR/data') {
+		try {
+			const dataPath = 'skills/karts-air/state/karts-air-data.json';
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
+			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+			res.end(raw);
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: e?.message || String(e) }));
+		}
+		return;
+	}
+	if (url.pathname === '/KARTS-AIR/scan' && req.method === 'POST') {
+		// Localhost-only: this endpoint writes an owner-tier task file
+		// processed by the watcher with full agent privileges (same threat
+		// model as /paidsubscriptions/scan — see PR #651 Blocker 1).
+		const remote = req.socket?.remoteAddress || '';
+		const isLocalhost = (
+			remote === '127.0.0.1' ||
+			remote === '::1' ||
+			remote === '::ffff:127.0.0.1'
+		);
+		if (!isLocalhost) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /KARTS-AIR/scan accepts localhost connections only' }));
+			return;
+		}
+		try {
+			const taskId = `task-${Date.now()}`;
+			// Pointer (not inline) — avoids header-injection class issues
+			// from any header-shaped lines inside scan-prompt.md.
+			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Cirrus SR22 deal-hunter scan (out-of-cycle, triggered from /KARTS-AIR UI). Read the full instructions in skills/karts-air/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: karts-air-ui\naccess_tier: owner\n`;
+			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up. Refresh in ~2-3 min for results.' }));
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+		}
+		return;
+	}
+
 	if (url.pathname === '/paidsubscriptions/scan' && req.method === 'POST') {
 		// Localhost-only: this endpoint writes an owner-tier task file that
 		// the watcher processes with full agent privileges. Without this

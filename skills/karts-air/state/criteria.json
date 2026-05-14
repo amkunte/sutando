@@ -1,0 +1,33 @@
+{
+  "_comment": "Machine-readable filter shorthand. For narrative / qualitative criteria (mission profile, 3-branch avionics map, 5 standing questions, etc.) see criteria.md in this directory. Both files are read by the scan-prompt.md flow.",
+  "make": "Cirrus",
+  "model": "SR22",
+  "model_aliases": ["SR-22", "SR 22"],
+  "generations_target": ["G2", "G3"],
+  "generations_exclude": ["G1", "G5", "G6", "G7"],
+  "variants_exclude": ["Turbo", "SR22T", "SR22 Turbo"],
+  "year_min": 2004,
+  "year_max": 2013,
+  "price_min_usd": 200000,
+  "price_max_usd": 350000,
+  "engine_smoh_max_hours": 1500,
+  "engine_smoh_preferred_max_hours": 1000,
+  "min_useful_load_lbs": 1000,
+  "min_payload_with_full_fuel_lbs": 680,
+  "mtow_lbs": 3400,
+  "home_airport_iata": "PAO",
+  "home_zip": "94566",
+  "preferred_radius_miles": 500,
+  "sources_v1": [
+    "https://www.barnstormers.com",
+    "https://www.aircraftforsale.com",
+    "https://www.controller.com",
+    "https://www.trade-a-plane.com"
+  ],
+  "sources_deferred": [
+    "https://www.aso.com",
+    "https://www.avbuyer.com",
+    "https://www.findaircraft.com",
+    "https://www.aerotrader.com"
+  ]
+}
