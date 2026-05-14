@@ -4280,7 +4280,13 @@ const server = createServer((req, res) => {
 		}
 		return;
 	}
-	if (url.pathname === '/KARTS-AIR') {
+	// Case-insensitive route match — owner reported 2026-05-13 19:11 PT that
+	// `/karts-air` (lowercase) showed the default dashboard. HTTP paths are
+	// case-sensitive, so `/karts-air` and `/Karts-Air` were falling through
+	// to the bottom-of-handler default. Normalize once here so any casing
+	// — `/KARTS-AIR`, `/karts-air`, `/Karts-Air` — lands on the same page.
+	const kaPath = url.pathname.toUpperCase();
+	if (kaPath === '/KARTS-AIR') {
 		try {
 			const dataPath = 'skills/karts-air/state/karts-air-data.json';
 			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
@@ -4292,7 +4298,7 @@ const server = createServer((req, res) => {
 		}
 		return;
 	}
-	if (url.pathname === '/KARTS-AIR/data') {
+	if (kaPath === '/KARTS-AIR/DATA') {
 		try {
 			const dataPath = 'skills/karts-air/state/karts-air-data.json';
 			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
@@ -4304,7 +4310,7 @@ const server = createServer((req, res) => {
 		}
 		return;
 	}
-	if (url.pathname === '/KARTS-AIR/scan' && req.method === 'POST') {
+	if (kaPath === '/KARTS-AIR/SCAN' && req.method === 'POST') {
 		// Localhost-only: this endpoint writes an owner-tier task file
 		// processed by the watcher with full agent privileges (same threat
 		// model as /paidsubscriptions/scan — see PR #651 Blocker 1).
