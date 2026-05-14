@@ -441,36 +441,70 @@ def send_file(chat_id, file_path, caption=""):
         print(f"  Send file failed: {e}")
         return {"ok": False}
 
-def send_reply(chat_id, text, task_id: str | None = None):
+def send_reply(chat_id, text, task_id: str | None = None) -> bool:
+    """Send a reply to chat_id. Returns True iff every chunk and file
+    was delivered successfully (every api() call returned {"ok": True}
+    and every send_file() returned {"ok": True}).
+
+    The return value gates result-file archival in the delivery loop:
+    a False return leaves the result file in place so the next poll
+    iteration retries. Without this, a transient 429/502 from Telegram
+    would silently lose the owner's reply — the file got archived
+    regardless of whether sendMessage succeeded. Bug class same shape
+    as PRs #17/#18: bare error-swallowing masking real failure.
+    """
     import re
     # Extract file paths: [file: /path/to/file] or [send: /path/to/file]
     file_pattern = re.compile(r'\[(?:file|send|attach):\s*([^\]]+)\]')
     files = file_pattern.findall(text)
     clean_text = file_pattern.sub('', text).strip()
 
+    all_ok = True
+
     # Send text (if any remains after extracting file refs)
     if clean_text:
         for i in range(0, len(clean_text), 4000):
-            api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
-        try:
-            import outbox_log
-            outbox_log.append(
-                channel_type="telegram",
-                recipient=str(chat_id),
-                body=clean_text,
-                task_id=task_id,
-            )
-        except Exception:
-            pass
+            try:
+                resp = api("sendMessage", chat_id=chat_id, text=clean_text[i:i+4000])
+            except Exception as e:
+                print(f"[Telegram] sendMessage exception for {chat_id}: {e}", flush=True)
+                all_ok = False
+                continue
+            if not (isinstance(resp, dict) and resp.get("ok")):
+                all_ok = False
+        if all_ok and clean_text:
+            try:
+                import outbox_log
+                outbox_log.append(
+                    channel_type="telegram",
+                    recipient=str(chat_id),
+                    body=clean_text,
+                    task_id=task_id,
+                )
+            except Exception:
+                pass
 
     # Send files (allowlist-gated; see _is_path_sendable)
     for fpath in files:
         fpath = fpath.strip()
         if _is_path_sendable(fpath):
-            send_file(chat_id, fpath)
-            print(f"  Sent file: {fpath}")
+            try:
+                resp = send_file(chat_id, fpath)
+            except Exception as e:
+                print(f"[Telegram] send_file exception for {fpath}: {e}", flush=True)
+                all_ok = False
+                continue
+            if not (isinstance(resp, dict) and resp.get("ok")):
+                all_ok = False
+            else:
+                print(f"  Sent file: {fpath}")
         elif os.path.isfile(fpath):
-            api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+            try:
+                resp = api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+                if not (isinstance(resp, dict) and resp.get("ok")):
+                    all_ok = False
+            except Exception:
+                all_ok = False
             print(f"  BLOCKED file: {fpath}")
         else:
             # Prose-quoted `[file:/path]` substrings extract as markers
@@ -478,6 +512,8 @@ def send_reply(chat_id, text, task_id: str | None = None):
             # the user; log for operator visibility on real typos. Same
             # rationale as discord-bridge:poll_results.
             print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
+
+    return all_ok
 
 def main():
     print(f"Telegram bridge started. Polling for messages...", flush=True)
@@ -489,6 +525,16 @@ def main():
     pending_replies = _load_pending_replies()
     if pending_replies:
         print(f"  Rehydrated {len(pending_replies)} pending replies from {PENDING_REPLIES_FILE.name}", flush=True)
+
+    # In-memory delivery attempt counter per task_id. Used by the result-
+    # delivery loop to cap retries when Telegram returns persistent failure
+    # (chat blocked, auth gone, etc). On bridge restart this resets — the
+    # pending_replies rehydration brings back the task_id mappings but
+    # the attempt count starts fresh. That's intentional: a restart is a
+    # natural retry boundary, and bounding poison-pill loops is the only
+    # job of this counter.
+    delivery_attempts = {}
+    MAX_DELIVERY_ATTEMPTS = 10  # ~10 poll iterations of 1s each
 
     heartbeat_file = REPO / "state" / "telegram-bridge.heartbeat"
     last_heartbeat = 0
@@ -658,34 +704,77 @@ def main():
         except Exception as e:
             print(f"  [proactive] poll error: {e}")
 
-        # Check for results to send back
+        # Check for results to send back.
+        # Delivery contract (per PR fix for silent-loss-on-transient-failure):
+        #   - Peek chat_id from pending_replies (no pop until success).
+        #   - Skip [no-send]/[REPLIED] sentinels — archive immediately, pop.
+        #   - Otherwise: increment attempt counter, call send_reply.
+        #     - send_reply returns True → pop, archive, clear counter.
+        #     - send_reply returns False AND attempts >= cap → log loudly,
+        #       mark result with [DELIVERY-FAILED:N] tail, pop, archive.
+        #     - send_reply returns False AND under cap → leave files in
+        #       place; next iteration retries.
         for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"
-            if result_file.exists():
-                reply_text = result_file.read_text().strip()
-                chat_id = pending_replies.pop(task_id)
+            if not result_file.exists():
+                continue
+            reply_text = result_file.read_text().strip()
+            chat_id = pending_replies[task_id]  # peek, don't pop yet
+
+            # Parse markers via the unified module (#873). Telegram
+            # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
+            # and strips file markers from the text it sends. It
+            # ignores [channel:] redirects (no concept in Telegram —
+            # the marker is silently dropped from body, not leaked).
+            parsed = parse_markers(reply_text)
+            if any(a.kind == "skip" for a in parsed.actions):
+                print(f"  Skipped (marker): {task_id}", flush=True)
+                pending_replies.pop(task_id, None)
                 _save_pending_replies(pending_replies)
-                # Parse markers via the unified module (#873). Telegram
-                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip
-                # and strips file markers from the text it sends. It
-                # ignores [channel:] redirects (no concept in Telegram —
-                # the marker is silently dropped from body, not leaked).
-                parsed = parse_markers(reply_text)
-                if any(a.kind == "skip" for a in parsed.actions):
-                    print(f"  Skipped (marker): {task_id}", flush=True)
-                    archive_file(result_file, "results", task_id)
-                    task_file = TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    continue
-                try:
-                    send_reply(chat_id, reply_text, task_id=task_id)
-                    print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
-                except Exception as e:
-                    print(f"[Telegram] Reply error: {e}", flush=True)
-                # Archive (not delete) so we can mine patterns later.
+                delivery_attempts.pop(task_id, None)
                 archive_file(result_file, "results", task_id)
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
+                continue
+
+            delivery_attempts[task_id] = delivery_attempts.get(task_id, 0) + 1
+            try:
+                ok = send_reply(chat_id, reply_text, task_id=task_id)
+            except Exception as e:
+                print(f"[Telegram] Reply error for {task_id}: {e}", flush=True)
+                ok = False
+
+            if ok:
+                print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
+                pending_replies.pop(task_id, None)
+                _save_pending_replies(pending_replies)
+                delivery_attempts.pop(task_id, None)
+                archive_file(result_file, "results", task_id)
+                task_file = TASKS_DIR / f"{task_id}.txt"
+                archive_file(task_file, "tasks", task_id)
+            elif delivery_attempts[task_id] >= MAX_DELIVERY_ATTEMPTS:
+                # Give up. Mark the archived result so post-mortem grep
+                # finds it. Without this, persistent failures (chat blocked,
+                # auth revoked) would loop forever.
+                n = delivery_attempts[task_id]
+                print(
+                    f"[Telegram] GIVE UP delivering {task_id} to {chat_id} after "
+                    f"{n} attempts. Archiving with [DELIVERY-FAILED] marker.",
+                    flush=True,
+                )
+                try:
+                    result_file.write_text(
+                        reply_text + f"\n\n[DELIVERY-FAILED: {n} attempts]\n"
+                    )
+                except Exception:
+                    pass
+                pending_replies.pop(task_id, None)
+                _save_pending_replies(pending_replies)
+                delivery_attempts.pop(task_id, None)
+                archive_file(result_file, "results", task_id)
+                task_file = TASKS_DIR / f"{task_id}.txt"
+                archive_file(task_file, "tasks", task_id)
+            # else: under cap, leave files in place — retry next iteration.
 
         time.sleep(1)
 
