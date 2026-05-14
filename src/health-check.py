@@ -797,17 +797,36 @@ def run_all_checks() -> list[dict]:
                         continue
                 except OSError:
                     continue
+        # Distinguish pgrep "no matches" (rc 1) from transient probe failure
+        # (any other code or exception) — same fix shape as sutando-app
+        # below. Without it, a flaky probe fires a "bridge not running" warn
+        # task that's actually a false alarm.
+        probe_ok = False
+        pids: list[str] = []
         try:
             # Anchor on the .py suffix so we don't match unrelated processes
             # whose command line happens to contain "discord-bridge" (shell
             # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
             # name produces false-positive "multiple processes" warnings
             # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
-        except:
-            pids = []
+            result = subprocess.run(
+                ["pgrep", "-f", f"{proc_name}\\.py$"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode in (0, 1):
+                probe_ok = True
+                pids = [p for p in result.stdout.strip().split("\n") if p]
+        except (subprocess.SubprocessError, OSError):
+            probe_ok = False
+
+        if not probe_ok:
+            # Flaky probe — don't downgrade to "not running". Surface as ok-
+            # with-note so the dashboard sees it but emit_task_for_failures
+            # skips it (only failures, not ok, fire tasks).
+            checks.append({"name": name, "status": "ok", "detail": "probe failed transiently — assuming alive"})
+            continue
 
         if not pids:
             checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
@@ -915,12 +934,37 @@ def run_all_checks() -> list[dict]:
     # Sutando menu bar app (optional — only check if binary exists)
     sutando_bin = REPO_DIR / "src" / "Sutando" / "Sutando"
     if sutando_bin.exists():
+        # Distinguish "no matches" (pgrep returncode 1) from "probe failed"
+        # (any other code or exception). The bare-except previously here
+        # collapsed both into "not running" and self-fired a warn task at
+        # 20:21 PT on 2026-05-13 when Sutando.app had been alive 8.5h —
+        # pgrep itself failed transiently. Treat probe-error as "unknown"
+        # (skipped by emit_task_for_failures) rather than asserting down.
+        probe_ok = False
+        pids: list[str] = []
         try:
-            result = subprocess.run(["pgrep", "-f", "Sutando/Sutando"], capture_output=True, text=True)
-            pids = [p for p in result.stdout.strip().split("\n") if p]
-        except:
-            pids = []
-        if pids:
+            result = subprocess.run(
+                ["pgrep", "-f", "Sutando/Sutando"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode in (0, 1):
+                probe_ok = True
+                pids = [p for p in result.stdout.strip().split("\n") if p]
+        except (subprocess.SubprocessError, OSError):
+            probe_ok = False
+
+        if not probe_ok:
+            # Don't fire a warn-task on a flaky probe. Surface as ok-with-note
+            # so the dashboard still shows something but emit_task_for_failures
+            # skips it.
+            checks.append({
+                "name": "sutando-app",
+                "status": "ok",
+                "detail": "probe failed transiently — assuming alive",
+            })
+        elif pids:
             check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
             mark_stale_if_outdated(
                 check,
