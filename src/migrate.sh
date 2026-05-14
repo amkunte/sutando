@@ -41,13 +41,27 @@ if [ -d "$REPO/notes" ]; then
   echo "  ✓ notes ($(find "$REPO/notes" -name '*.md' | wc -l | tr -d ' ') files)"
 fi
 
-# 3. Claude Code settings
+# 3. Claude Code settings. Previously a single unconditional "✓ claude
+# config" echo fired even if all three cp calls failed silently. Now we
+# track which pieces actually copied — checked via target existence
+# rather than cp's exit code, because `cp -r` returns non-zero on
+# broken symlinks (e.g. ~/.claude/skills/whatsapp here) even when most
+# files copied successfully.
 if [ -d "$HOME/.claude" ]; then
   mkdir -p "$BUNDLE/claude-config"
+  CC_PARTS=()
   cp "$HOME/.claude/settings.json" "$BUNDLE/claude-config/" 2>/dev/null
+  [ -f "$BUNDLE/claude-config/settings.json" ] && CC_PARTS+=("settings")
   cp -r "$HOME/.claude/channels" "$BUNDLE/claude-config/channels" 2>/dev/null
+  [ -d "$BUNDLE/claude-config/channels" ] && CC_PARTS+=("channels")
   cp -r "$HOME/.claude/skills" "$BUNDLE/claude-config/skills" 2>/dev/null
-  echo "  ✓ claude config (settings, channels, skills)"
+  [ -d "$BUNDLE/claude-config/skills" ] && CC_PARTS+=("skills")
+  if [ ${#CC_PARTS[@]} -gt 0 ]; then
+    IFS=, eval 'CC_LIST="${CC_PARTS[*]}"'
+    echo "  ✓ claude config ($CC_LIST)"
+  else
+    echo "  ⚠ claude config — none of settings/channels/skills copied. Bundle will boot with empty config."
+  fi
 fi
 
 # 3b. Root ~/.claude.json (MCP server registrations — macos-use, playwright, etc.)
@@ -140,9 +154,22 @@ grep -q 'brew shellenv' ~/.zshrc 2>/dev/null || echo 'eval "$(/opt/homebrew/bin/
 which brew >/dev/null 2>&1 && echo "  ✓ Homebrew" || echo "  ✗ Homebrew failed"
 
 # ── 2. System packages ──
+# Previously: brew install ... 2>/dev/null; echo "  ✓ ..." — the echo
+# fired even if brew failed (no network, sudo prompt, conflicting deps).
+# The destination then proceeded to Step 3+ with a half-installed system.
+# Now: capture exit code, only claim success on rc=0; otherwise warn so
+# the user sees what to retry manually.
 echo "Step 2/7: System packages..."
-brew install fswatch ffmpeg python3 2>/dev/null
-echo "  ✓ fswatch, ffmpeg, python3"
+if brew install fswatch ffmpeg python3 2>&1 | tail -3; then
+  brew_rc=${PIPESTATUS[0]}
+else
+  brew_rc=$?
+fi
+if [ "$brew_rc" -eq 0 ]; then
+  echo "  ✓ fswatch, ffmpeg, python3"
+else
+  echo "  ⚠ brew install returned $brew_rc — retry manually: brew install fswatch ffmpeg python3"
+fi
 
 # ── 3. Node.js via nvm ──
 echo "Step 3/7: Node.js..."
