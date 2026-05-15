@@ -9,7 +9,7 @@
  */
 
 import { createServer } from 'node:http';
-import { writeFileSync, readFileSync, existsSync, statSync, mkdirSync, renameSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
 
@@ -548,6 +548,11 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<!-- DOMPurify — agent results come from external task channels (Discord,
+     Telegram, voice, SMS) and aren't trusted input. marked@12 ships no
+     sanitizer by default, so unwrapped innerHTML on transcript replies would
+     execute embedded <script> / inline handlers. Sandbox before insertion. -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 </head>
 <body>
 
@@ -2156,12 +2161,17 @@ function sendText() {
                 clearInterval(poll);
                 const re = document.createElement('div');
                 re.className = 't-entry t-assistant';
-                // Render markdown if marked.js loaded; fall back to escaped text.
-                // Before this, headings/lists in long replies (e.g. skill suggestions)
-                // came through as raw "###" / "*" characters.
-                if (window.marked) {
+                // Render markdown if marked.js + DOMPurify both loaded; fall
+                // back to escaped textContent otherwise. Both required — marked
+                // alone would be unsafe innerHTML on agent results that
+                // originate from external task channels.
+                // Before this, headings/lists in long replies (e.g. skill
+                // suggestions) came through as raw "###" / "*" characters.
+                if (window.marked && window.DOMPurify) {
                   try {
-                    re.innerHTML = window.marked.parse(r.result, { breaks: true, gfm: true });
+                    re.innerHTML = window.DOMPurify.sanitize(
+                      window.marked.parse(r.result, { breaks: true, gfm: true })
+                    );
                   } catch (e) {
                     re.textContent = r.result;
                   }
@@ -2829,176 +2839,6 @@ setInterval(() => {
 	}
 }, 30_000);
 
-// /KARTS-AIR page — Cirrus SR22 deal-hunter dashboard, server-side rendered
-// from skills/karts-air/state/karts-air-data.json. Lean table + per-candidate
-// expansion + "Scan now" button. Diff highlights for new/dropped/price-changed.
-function renderKartsAirHtml(rawJson: string): string {
-	let data: any;
-	try {
-		data = JSON.parse(rawJson);
-	} catch (e: any) {
-		data = { last_scan: null, candidates: [], scan_history: [], sources_status: {}, _parse_error: e?.message };
-	}
-	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
-	const lastDiff = (data.scan_history && data.scan_history.length) ? data.scan_history[data.scan_history.length - 1] : { new_tails: [], dropped_tails: [], price_changes: [] };
-	const newSet = new Set(lastDiff.new_tails || []);
-	const priceChangedMap = new Map((lastDiff.price_changes || []).map((p: any) => [p.tail, p]));
-	const candidates = data.candidates || [];
-	const sourcesStatus = data.sources_status || {};
-	const dataJson = JSON.stringify(data).replace(/</g, '\\u003c');
-
-	const fmtUsd = (n: number) => '$' + (n || 0).toLocaleString('en-US');
-	const escapeHtml = (s: any) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
-	const rows = candidates.map((c: any) => {
-		const isNew = newSet.has(c.tail);
-		const priceChange = priceChangedMap.get(c.tail);
-		const branchLabel = c.branch ? `B${c.branch}` : '—';
-		const branchColor = c.branch === 1 ? '#4ecca3' : c.branch === 2 ? '#f0b878' : c.branch === 3 ? '#e08070' : '#707080';
-		const priceCell = priceChange
-			? `<span style="text-decoration: line-through; color: #707080;">${fmtUsd((priceChange as any).from)}</span> <strong style="color: #f0b878;">${fmtUsd(c.price_usd)}</strong>`
-			: `<strong>${fmtUsd(c.price_usd)}</strong>`;
-		return `
-		<tr class="${isNew ? 'row-new' : ''}">
-			<td>${isNew ? '<span class="badge-new">NEW</span> ' : ''}<a href="${escapeHtml(c.list_url)}" target="_blank" rel="noopener">${escapeHtml(c.tail || '—')}</a></td>
-			<td>${escapeHtml(c.year)} ${escapeHtml(c.gen || '')}</td>
-			<td>${priceCell}</td>
-			<td>${c.total_time_hr ?? '—'} TT<br><small>${c.engine_smoh_hr ?? '—'} SMOH</small></td>
-			<td>${escapeHtml(c.location_city || '—')}<br><small>${escapeHtml(c.location_icao || '')}</small></td>
-			<td><span class="branch" style="color: ${branchColor};">${branchLabel}</span></td>
-			<td>${escapeHtml(c.caps_expiry || '—')}</td>
-			<td><small>${escapeHtml(c.source || '—')}</small></td>
-		</tr>
-		<tr class="row-detail"><td colspan="8">
-			<details><summary>Avionics / W&amp;B / Pros &amp; Cons / Q1–Q5</summary>
-			<div class="detail-grid">
-				<div><strong>Branch rationale:</strong> ${escapeHtml(c.branch_rationale || '—')}</div>
-				<div><strong>Upgrade overhead:</strong> ${fmtUsd(c.upgrade_overhead_usd || 0)}</div>
-				<div><strong>Empty / Useful:</strong> ${c.empty_weight_lbs ?? '—'} / ${c.useful_load_lbs ?? '—'} lbs</div>
-				<div><strong>Pros:</strong> ${(c.pros || []).map(escapeHtml).join('; ') || '—'}</div>
-				<div><strong>Cons:</strong> ${(c.cons || []).map(escapeHtml).join('; ') || '—'}</div>
-				<div><strong>Q1 within 500mi PAO:</strong> ${c.q1_within_500mi_of_PAO ? 'Yes' : 'No'}</div>
-				<div><strong>Q2 factory rebuild:</strong> ${escapeHtml(c.q2_factory_rebuild_evidence || '—')}</div>
-				<div><strong>Q3 ventilation (Branch 2 only):</strong> ${escapeHtml(c.q3_branch2_ventilation || '—')}</div>
-				<div><strong>Q4 FlightStream:</strong> ${c.q4_flightstream ? 'Yes' : 'No'}</div>
-				<div><strong>Q5 net after prop+O2:</strong> ${fmtUsd(c.q5_net_after_prop_and_o2 || c.price_usd)}</div>
-			</div>
-			</details>
-		</td></tr>`;
-	}).join('');
-
-	const sourceBadges = Object.entries(sourcesStatus).map(([k, v]) => {
-		const color = String(v).startsWith('ok') ? '#4ecca3' : String(v) === 'blocked' ? '#e08070' : '#707080';
-		return `<span class="src-badge" style="border-color: ${color}; color: ${color};">${escapeHtml(k)}: ${escapeHtml(String(v))}</span>`;
-	}).join(' ');
-
-	return /* html */ `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>KARTS-AIR — Cirrus SR22 Hunt — Sutando</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #e8e8ee; padding: 24px; min-height: 100vh; }
-  .wrap { max-width: 1280px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; gap: 16px; margin-bottom: 4px; flex-wrap: wrap; }
-  h1 { font-size: 22px; font-weight: 700; }
-  .subtitle { color: #707080; font-size: 13px; }
-  .meta { display: flex; gap: 20px; font-size: 13px; color: #888; margin: 8px 0 16px; flex-wrap: wrap; align-items: center; }
-  .meta strong { color: #c0c0d0; font-weight: 600; }
-  .scan-btn { background: #1e4028; color: #4ecca3; border: 1px solid #2a4a36; padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
-  .scan-btn:hover:not(:disabled) { background: #2a503a; }
-  .scan-btn:disabled { background: #1a1a2a; color: #444; border-color: #2a2a3e; cursor: wait; }
-  .scan-status { font-size: 12px; color: #4ecca3; margin-left: 8px; }
-  .src-badges { display: flex; gap: 6px; margin: 4px 0 20px; flex-wrap: wrap; }
-  .src-badge { font-size: 11px; padding: 3px 8px; border-radius: 6px; border: 1px solid; background: rgba(0,0,0,0.2); }
-  table { width: 100%; border-collapse: collapse; background: #14141e; border: 1px solid #1e1e2a; border-radius: 10px; overflow: hidden; }
-  thead { background: #1a1a26; }
-  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #888; padding: 10px 12px; border-bottom: 1px solid #2a2a3e; }
-  td { padding: 11px 12px; border-bottom: 1px solid #1e1e2a; font-size: 13px; vertical-align: top; }
-  td small { color: #707080; font-size: 11px; }
-  td a { color: #6ea3ff; text-decoration: none; }
-  td a:hover { text-decoration: underline; }
-  tr.row-new { background: rgba(78, 204, 163, 0.06); }
-  .badge-new { font-size: 9px; padding: 2px 6px; border-radius: 4px; background: #1e4028; color: #4ecca3; font-weight: 700; letter-spacing: 0.5px; }
-  .branch { font-weight: 700; }
-  tr.row-detail td { padding: 0; }
-  tr.row-detail details { padding: 8px 12px 14px 12px; }
-  tr.row-detail summary { font-size: 12px; color: #707080; cursor: pointer; padding: 4px 0; }
-  tr.row-detail summary:hover { color: #c0c0d0; }
-  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; font-size: 12px; color: #c0c0d0; margin-top: 8px; }
-  .detail-grid strong { color: #e8e8ee; }
-  .empty { text-align: center; padding: 60px 20px; color: #555; }
-  .empty .logo { font-size: 36px; margin-bottom: 12px; }
-  footer { margin-top: 24px; font-size: 11px; color: #555; text-align: center; }
-  footer a { color: #707080; }
-</style>
-</head>
-<body>
-<div class="wrap">
-<header>
-  <h1>✈️ KARTS-AIR</h1>
-  <span class="subtitle">Cirrus SR22 G2/G3 acquisition hunt</span>
-</header>
-<div class="meta">
-  <span>Last scan: <strong>${escapeHtml(lastScan)}</strong></span>
-  <span>Candidates: <strong>${candidates.length}</strong></span>
-  <span>${(lastDiff.new_tails || []).length} new · ${(lastDiff.price_changes || []).length} price-change · ${(lastDiff.dropped_tails || []).length} dropped</span>
-  <button class="scan-btn" id="scanBtn" onclick="triggerScan()">Scan now</button>
-  <span class="scan-status" id="scanStatus"></span>
-</div>
-<div class="src-badges">${sourceBadges || '<span class="src-badge" style="border-color: #444; color: #888;">no sources status yet — waiting on first scan</span>'}</div>
-
-${candidates.length > 0 ? `
-<table>
-<thead>
-<tr><th>Tail</th><th>Year/Gen</th><th>Price</th><th>Times</th><th>Location</th><th>Branch</th><th>CAPS</th><th>Source</th></tr>
-</thead>
-<tbody>
-${rows}
-</tbody>
-</table>
-` : `
-<div class="empty">
-  <div class="logo">✈️</div>
-  <div>No candidates yet. First daily scan runs at 05:00 PT.</div>
-  <div style="font-size:11px; margin-top:8px; color: #444;">Or click "Scan now" above to trigger an out-of-cycle scan.</div>
-</div>
-`}
-
-<footer>
-  Edit acquisition criteria: <a href="https://github.com/amkunte/sutando/blob/main/skills/karts-air/state/criteria.md" target="_blank">skills/karts-air/state/criteria.md</a>
-  · Edit machine filters: <a href="https://github.com/amkunte/sutando/blob/main/skills/karts-air/state/criteria.json" target="_blank">criteria.json</a>
-</footer>
-</div>
-
-<script>
-const DATA = ${dataJson};
-async function triggerScan() {
-  const btn = document.getElementById('scanBtn');
-  const status = document.getElementById('scanStatus');
-  btn.disabled = true;
-  status.textContent = 'queueing scan…';
-  try {
-    const r = await fetch('/KARTS-AIR/scan', { method: 'POST' });
-    const j = await r.json();
-    if (j.ok) {
-      status.textContent = 'queued · refresh in ~2-3 min for results';
-    } else {
-      status.textContent = 'error: ' + (j.error || 'unknown');
-      btn.disabled = false;
-    }
-  } catch (e) {
-    status.textContent = 'request failed: ' + e.message;
-    btn.disabled = false;
-  }
-}
-</script>
-</body>
-</html>`;
-}
-
 // /paidsubscriptions page — full HTML, server-side rendered from
 // skills/subscription-scanner/state/subscriptions.json. Sortable table,
 // diff highlights from last scan, "Scan now" button.
@@ -3291,352 +3131,6 @@ function escapeHtml(s: string): string {
 	return String(s).replace(/[<>&"']/g, c => (({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'} as Record<string, string>)[c] || c));
 }
 
-// /amazon page — renders skills/amazon-orders/state/orders.json as a sortable
-// table grouped by status (in-progress at top, delivered below).
-function renderAmazonOrdersHtml(rawJson: string): string {
-	let data: any;
-	try { data = JSON.parse(rawJson); } catch (e: any) { data = { last_scan: null, orders: [], scan_history: [], _parse_error: e?.message }; }
-	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
-	const dataJson = JSON.stringify(data).replace(/</g, '\\u003c');
-
-	return /* html */ `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Amazon Orders — Sutando</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #e8e8ee; padding: 24px; min-height: 100vh; }
-  .wrap { max-width: 1200px; margin: 0 auto; }
-  header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
-  h1 { font-size: 22px; font-weight: 700; }
-  h2 { font-size: 14px; font-weight: 600; color: #a0a0b0; margin: 24px 0 10px; text-transform: uppercase; letter-spacing: 0.6px; }
-  .subtitle { color: #707080; font-size: 13px; }
-  .meta { display: flex; gap: 20px; font-size: 13px; color: #888; margin: 12px 0 20px; flex-wrap: wrap; align-items: center; }
-  .meta strong { color: #c0c0d0; font-weight: 600; }
-  .scan-btn { background: #1e4028; color: #4ecca3; border: 1px solid #2a4a36; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
-  .scan-btn:hover:not(:disabled) { background: #2a503a; }
-  .scan-btn:disabled { background: #1a1a2a; color: #444; border-color: #2a2a3e; cursor: wait; }
-  .scan-status { font-size: 12px; color: #4ecca3; margin-left: 8px; }
-  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .stat { background: #14141e; border: 1px solid #1e1e2a; border-radius: 10px; padding: 14px 16px; }
-  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #707080; margin-bottom: 6px; }
-  .stat .value { font-size: 24px; font-weight: 700; color: #e8e8ee; }
-  .stat .sub { font-size: 11px; color: #888; margin-top: 4px; }
-  .stat.in-progress .value { color: #f0ad4e; }
-  .stat.delivered .value { color: #4ecca3; }
-
-  table { width: 100%; border-collapse: collapse; background: #14141e; border-radius: 10px; overflow: hidden; }
-  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #1e1e2a; font-size: 13px; }
-  th { background: #1a1a26; color: #a0a0b0; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; cursor: pointer; user-select: none; }
-  th:hover { color: #e8e8ee; }
-  th.sort-asc::after { content: ' ▲'; color: #4ecca3; }
-  th.sort-desc::after { content: ' ▼'; color: #4ecca3; }
-  tbody tr:hover { background: #181826; }
-
-  .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-  .status.delivered { background: #1e4028; color: #4ecca3; }
-  .status.shipped { background: #1e3a5f; color: #60a5fa; }
-  .status.out_for_delivery { background: #2a3a18; color: #a3e055; }
-  .status.ordered { background: #2a2418; color: #f0ad4e; }
-
-  .item { color: #e8e8ee; font-weight: 500; max-width: 360px; word-wrap: break-word; }
-  .channel { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 3px; }
-  .channel.amazon { color: #ff9900; }
-  .channel.whole-foods { color: #74c365; }
-  .channel.amazon-fresh { color: #2bbf64; }
-  .notes { color: #707080; font-size: 11px; font-style: italic; max-width: 240px; }
-  .date-cell { color: #a0a0b0; font-variant-numeric: tabular-nums; font-size: 12px; }
-  .date-cell.muted { color: #555; }
-  .date-cell.return-started { color: #f0ad4e; }
-  .date-cell.refund-issued { color: #4ecca3; font-weight: 500; }
-  .stat.returned .value { color: #b48cff; }
-
-  .empty { text-align: center; padding: 40px; color: #555; }
-  footer { margin-top: 32px; color: #555; font-size: 11px; text-align: center; }
-  footer a { color: #888; text-decoration: none; }
-  footer a:hover { color: #4ecca3; }
-
-  details { margin-top: 24px; }
-  details summary { cursor: pointer; color: #707080; font-size: 12px; padding: 8px 0; }
-  details summary:hover { color: #a0a0b0; }
-  pre { background: #0a0a12; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 11px; color: #a0a0b0; margin-top: 8px; max-height: 300px; }
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <header>
-      <h1>📦 Amazon Orders</h1>
-      <div class="subtitle">since 2026-01-01 · scanned from Gmail</div>
-      <div style="margin-left:auto"><a href="/" style="color:#707080;font-size:12px;text-decoration:none;border:1px solid #2a2a3e;padding:5px 12px;border-radius:6px;">← Dashboard</a></div>
-    </header>
-
-    <div class="meta">
-      <span><strong>Last scan:</strong> ${escapeHtml(lastScan)}</span>
-      <button class="scan-btn" id="scanBtn" onclick="triggerScan()">⟳ Scan now</button>
-      <span class="scan-status" id="scanStatus"></span>
-    </div>
-
-    <div id="summary" class="summary"></div>
-
-    <div id="diff-banner"></div>
-
-    <h2 id="section-active-title">In progress</h2>
-    <table id="active-table">
-      <thead>
-        <tr>
-          <th data-key="item" data-table="active">Item</th>
-          <th data-key="total_spent" data-table="active" class="amount">Price</th>
-          <th data-key="status" data-table="active">Status</th>
-          <th data-key="ordered_date" data-table="active">Ordered</th>
-          <th data-key="shipped_date" data-table="active">Shipped</th>
-          <th data-key="delivered_date" data-table="active">Delivered</th>
-          <th data-key="returns_started_date" data-table="active">Return started</th>
-          <th data-key="refund_issued_date" data-table="active">Refund issued</th>
-          <th>Notes</th>
-        </tr>
-      </thead>
-      <tbody id="active-tbody"></tbody>
-    </table>
-
-    <h2 id="section-delivered-title">Delivered</h2>
-    <table id="delivered-table">
-      <thead>
-        <tr>
-          <th data-key="item" data-table="delivered">Item</th>
-          <th data-key="total_spent" data-table="delivered" class="amount">Price</th>
-          <th data-key="status" data-table="delivered">Status</th>
-          <th data-key="ordered_date" data-table="delivered">Ordered</th>
-          <th data-key="shipped_date" data-table="delivered">Shipped</th>
-          <th data-key="delivered_date" data-table="delivered">Delivered</th>
-          <th data-key="returns_started_date" data-table="delivered">Return started</th>
-          <th data-key="refund_issued_date" data-table="delivered">Refund issued</th>
-          <th>Notes</th>
-        </tr>
-      </thead>
-      <tbody id="delivered-tbody"></tbody>
-    </table>
-
-    <details>
-      <summary>Raw JSON</summary>
-      <pre id="raw-json"></pre>
-    </details>
-
-    <footer>
-      Order data lives at <code>skills/amazon-orders/state/orders.json</code> (gitignored).<br>
-      Auto-scan every 6 hours via the <code>amazon-orders-scan</code> cron. Source: Gmail receipts via Claude MCP.
-    </footer>
-  </div>
-
-<script>
-  const data = ${dataJson};
-  const activeTbody = document.getElementById('active-tbody');
-  const deliveredTbody = document.getElementById('delivered-tbody');
-  const summary = document.getElementById('summary');
-  const diffBanner = document.getElementById('diff-banner');
-  const rawJson = document.getElementById('raw-json');
-  const lastDiff = (data.scan_history && data.scan_history.length) ? data.scan_history[data.scan_history.length - 1] : { added: [], delivered_since_last: [] };
-
-  let activeSortKey = 'ordered_date';
-  let activeSortDir = 'desc';
-  let deliveredSortKey = 'delivered_date';
-  let deliveredSortDir = 'desc';
-
-  function escHtml(s) {
-    if (s === null || s === undefined) return '';
-    return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-  function fmtDate(d) {
-    if (!d) return '<span class="date-cell muted">—</span>';
-    return '<span class="date-cell">' + escHtml(d) + '</span>';
-  }
-
-  function renderSummary() {
-    const orders = data.orders || [];
-    const inProgress = orders.filter(o => o.status !== 'delivered');
-    const delivered = orders.filter(o => o.status === 'delivered');
-    let totalSpent = 0;
-    let pricedCount = 0;
-    let returnedCount = 0;
-    let refundedCount = 0;
-    for (const o of orders) {
-      if (typeof o.total_spent === 'number') {
-        totalSpent += o.total_spent;
-        pricedCount++;
-      }
-      if (o.returns_started_date) returnedCount++;
-      if (o.refund_issued_date) refundedCount++;
-    }
-    const unpriced = orders.length - pricedCount;
-    const returnedSub = returnedCount > 0 ? \`\${refundedCount}/\${returnedCount} refunded\` : 'no returns';
-    summary.innerHTML = \`
-      <div class="stat"><div class="label">Total</div><div class="value">\${orders.length}</div><div class="sub">since \${escHtml(data.since || '2026-01-01')}</div></div>
-      <div class="stat in-progress"><div class="label">In progress</div><div class="value">\${inProgress.length}</div><div class="sub">ordered + shipped</div></div>
-      <div class="stat delivered"><div class="label">Delivered</div><div class="value">\${delivered.length}</div><div class="sub">in this window</div></div>
-      <div class="stat"><div class="label">Total spent</div><div class="value">$\${totalSpent.toFixed(2)}</div><div class="sub">\${pricedCount}/\${orders.length} priced\${unpriced > 0 ? ' • ' + unpriced + ' grocery' : ''}</div></div>
-      <div class="stat returned"><div class="label">Returns</div><div class="value">\${returnedCount}</div><div class="sub">\${escHtml(returnedSub)}</div></div>
-    \`;
-  }
-
-  function renderDiffBanner() {
-    const a = lastDiff.added || [];
-    const d = lastDiff.delivered_since_last || [];
-    if (a.length === 0 && d.length === 0) {
-      diffBanner.innerHTML = '<div style="font-size:12px;color:#555;margin-bottom:14px;">No changes since previous scan.</div>';
-      return;
-    }
-    const parts = [];
-    if (a.length) parts.push('<span style="color:#f0ad4e">+' + a.length + ' newly ordered: ' + a.map(escHtml).join(', ') + '</span>');
-    if (d.length) parts.push('<span style="color:#4ecca3">' + d.length + ' delivered since last scan: ' + d.map(escHtml).join(', ') + '</span>');
-    diffBanner.innerHTML = '<div style="font-size:13px;margin-bottom:14px;padding:10px 14px;background:#181826;border-radius:8px;border-left:3px solid #4ecca3;">Since last scan: ' + parts.join(' • ') + '</div>';
-  }
-
-  function fmtPrice(o) {
-    if (typeof o.total_spent !== 'number') return '<span class="date-cell muted">—</span>';
-    if (o.total_spent === 0) return '<span class="date-cell muted">$0 <span style="font-size:10px;opacity:0.7">(gift card)</span></span>';
-    return '<span class="date-cell" style="color:#e8e8ee;font-weight:500">$' + o.total_spent.toFixed(2) + '</span>';
-  }
-
-  function sortAndRender(orders, tbody, sortKey, sortDir) {
-    orders.sort((a, b) => {
-      let av = a[sortKey], bv = b[sortKey];
-      // Numeric sort for price
-      if (sortKey === 'total_spent') {
-        av = typeof av === 'number' ? av : -1;
-        bv = typeof bv === 'number' ? bv : -1;
-      } else {
-        if (av === null || av === undefined) av = '';
-        if (bv === null || bv === undefined) bv = '';
-        if (typeof av === 'string') av = av.toLowerCase();
-        if (typeof bv === 'string') bv = bv.toLowerCase();
-      }
-      if (av < bv) return sortDir === 'asc' ? -1 : 1;
-      if (av > bv) return sortDir === 'asc' ? 1 : -1;
-      return 0;
-    });
-    tbody.innerHTML = '';
-    if (orders.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">No orders.</td></tr>';
-      return;
-    }
-    for (const o of orders) {
-      const tr = document.createElement('tr');
-      const channelClass = (o.channel || 'amazon').replace(/[^a-z-]/g, '');
-      tr.innerHTML = \`
-        <td><div class="item">\${escHtml(o.item)}</div><div class="channel \${channelClass}">\${escHtml((o.channel || 'amazon').replace('-', ' '))}\${o.split_shipment ? ' · split' : ''}</div></td>
-        <td class="amount" style="text-align:right;font-variant-numeric:tabular-nums">\${fmtPrice(o)}</td>
-        <td><span class="status \${escHtml(o.status || 'ordered')}">\${escHtml((o.status || 'ordered').replace(/_/g, ' '))}</span></td>
-        <td>\${fmtDate(o.ordered_date)}</td>
-        <td>\${fmtDate(o.shipped_date)}</td>
-        <td>\${fmtDate(o.delivered_date)}</td>
-        <td>\${o.returns_started_date ? '<span class="date-cell return-started">' + escHtml(o.returns_started_date) + '</span>' : '<span class="date-cell muted">—</span>'}</td>
-        <td>\${o.refund_issued_date ? '<span class="date-cell refund-issued">' + escHtml(o.refund_issued_date) + '</span>' : '<span class="date-cell muted">—</span>'}</td>
-        <td><span class="notes">\${escHtml(o.notes || '')}</span></td>
-      \`;
-      tbody.appendChild(tr);
-    }
-  }
-
-  function renderTables() {
-    const orders = (data.orders || []).slice();
-    const inProgress = orders.filter(o => o.status !== 'delivered');
-    const delivered = orders.filter(o => o.status === 'delivered');
-
-    document.getElementById('section-active-title').textContent = \`In progress (\${inProgress.length})\`;
-    document.getElementById('section-delivered-title').textContent = \`Delivered (\${delivered.length})\`;
-
-    sortAndRender(inProgress, activeTbody, activeSortKey, activeSortDir);
-    sortAndRender(delivered, deliveredTbody, deliveredSortKey, deliveredSortDir);
-
-    document.querySelectorAll('th[data-key]').forEach(th => {
-      th.classList.remove('sort-asc', 'sort-desc');
-      const tableType = th.dataset.table;
-      const key = tableType === 'active' ? activeSortKey : deliveredSortKey;
-      const dir = tableType === 'active' ? activeSortDir : deliveredSortDir;
-      if (th.dataset.key === key) th.classList.add(dir === 'asc' ? 'sort-asc' : 'sort-desc');
-    });
-  }
-
-  document.querySelectorAll('th[data-key]').forEach(th => {
-    th.addEventListener('click', () => {
-      const k = th.dataset.key;
-      const tableType = th.dataset.table;
-      // String columns default ascending; date/price columns default descending (most recent / largest first)
-      const defaultDescKeys = new Set(['ordered_date', 'shipped_date', 'delivered_date', 'total_spent', 'returns_started_date', 'refund_issued_date']);
-      if (tableType === 'active') {
-        if (k === activeSortKey) activeSortDir = (activeSortDir === 'asc' ? 'desc' : 'asc');
-        else { activeSortKey = k; activeSortDir = defaultDescKeys.has(k) ? 'desc' : 'asc'; }
-      } else {
-        if (k === deliveredSortKey) deliveredSortDir = (deliveredSortDir === 'asc' ? 'desc' : 'asc');
-        else { deliveredSortKey = k; deliveredSortDir = defaultDescKeys.has(k) ? 'desc' : 'asc'; }
-      }
-      renderTables();
-    });
-  });
-
-  async function triggerScan() {
-    const btn = document.getElementById('scanBtn');
-    const status = document.getElementById('scanStatus');
-    btn.disabled = true;
-    status.textContent = '⏳ queueing...';
-    try {
-      const r = await fetch('/amazon/scan', { method: 'POST' });
-      const j = await r.json();
-      if (j.ok) {
-        status.textContent = '✓ ' + j.message;
-        let elapsed = 0;
-        const poll = setInterval(async () => {
-          elapsed += 5;
-          if (elapsed > 240) { clearInterval(poll); btn.disabled = false; status.textContent = '⚠ scan still running — refresh in a moment'; return; }
-          const fresh = await fetch('/amazon/data').then(r => r.json()).catch(() => null);
-          if (fresh && fresh.last_scan && fresh.last_scan !== data.last_scan) {
-            clearInterval(poll);
-            status.textContent = '✓ scan complete — refreshing...';
-            setTimeout(() => location.reload(), 800);
-          }
-        }, 5000);
-      } else {
-        status.textContent = '✗ ' + (j.error || 'failed');
-        btn.disabled = false;
-      }
-    } catch (e) {
-      status.textContent = '✗ ' + (e.message || 'network error');
-      btn.disabled = false;
-    }
-  }
-
-  rawJson.textContent = JSON.stringify(data, null, 2);
-  renderSummary();
-  renderDiffBanner();
-  renderTables();
-</script>
-</body>
-</html>`;
-}
-
-// Mirrors src/agent-api.py:write_owner_activity and
-// src/telegram-bridge.py:write_owner_activity. Web /scan routes that queue
-// owner-tier task files must also bump state/last-owner-activity.json so the
-// proactive-loop's active-engagement skip rule (b) recognises an owner click
-// as a presence signal — same gap as PR #14 fixed in agent-api.py.
-function writeOwnerActivity(channel: string, summary: string): void {
-	try {
-		mkdirSync('state', { recursive: true });
-		const payload = {
-			ts: Math.floor(Date.now() / 1000),
-			channel,
-			summary: (summary || '').slice(0, 80),
-		};
-		const finalPath = 'state/last-owner-activity.json';
-		const tmpPath = finalPath + '.tmp';
-		writeFileSync(tmpPath, JSON.stringify(payload));
-		renameSync(tmpPath, finalPath);
-	} catch {
-		// Best-effort; never fail the route on activity-recording errors.
-	}
-}
-
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -3876,40 +3370,15 @@ const server = createServer((req, res) => {
 		}
 		return;
 	}
-	// Case-insensitive route match — owner reported 2026-05-13 19:11 PT that
-	// `/karts-air` (lowercase) showed the default dashboard. HTTP paths are
-	// case-sensitive, so `/karts-air` and `/Karts-Air` were falling through
-	// to the bottom-of-handler default. Normalize once here so any casing
-	// — `/KARTS-AIR`, `/karts-air`, `/Karts-Air` — lands on the same page.
-	const kaPath = url.pathname.toUpperCase();
-	if (kaPath === '/KARTS-AIR') {
-		try {
-			const dataPath = 'skills/karts-air/state/karts-air-data.json';
-			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
-			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-			res.end(renderKartsAirHtml(raw));
-		} catch (e: any) {
-			res.writeHead(500, { 'Content-Type': 'text/plain' });
-			res.end('Error reading KARTS-AIR data: ' + (e?.message || String(e)));
-		}
-		return;
-	}
-	if (kaPath === '/KARTS-AIR/DATA') {
-		try {
-			const dataPath = 'skills/karts-air/state/karts-air-data.json';
-			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
-			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
-			res.end(raw);
-		} catch (e: any) {
-			res.writeHead(500, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ error: e?.message || String(e) }));
-		}
-		return;
-	}
-	if (kaPath === '/KARTS-AIR/SCAN' && req.method === 'POST') {
-		// Localhost-only: this endpoint writes an owner-tier task file
-		// processed by the watcher with full agent privileges (same threat
-		// model as /paidsubscriptions/scan — see PR #651 Blocker 1).
+	if (url.pathname === '/paidsubscriptions/scan' && req.method === 'POST') {
+		// Localhost-only: this endpoint writes an owner-tier task file that
+		// the watcher processes with full agent privileges. Without this
+		// guard, anyone on the same LAN or a tailscale-funnel'd public URL
+		// could `curl -X POST http://<host>:8080/paidsubscriptions/scan`
+		// and silently enqueue arbitrary work. Per PR #651 Blocker 1.
+		// Reads req.socket.remoteAddress directly rather than a header
+		// (X-Forwarded-For et al. are spoofable). IPv4-mapped IPv6
+		// (::ffff:127.0.0.1) and IPv6 loopback (::1) are both localhost.
 		const remote = req.socket?.remoteAddress || '';
 		const isLocalhost = (
 			remote === '127.0.0.1' ||
@@ -3918,77 +3387,22 @@ const server = createServer((req, res) => {
 		);
 		if (!isLocalhost) {
 			res.writeHead(403, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: false, error: 'forbidden: /KARTS-AIR/scan accepts localhost connections only' }));
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /paidsubscriptions/scan accepts localhost connections only' }));
 			return;
 		}
 		try {
 			const taskId = `task-${Date.now()}`;
-			// Pointer (not inline) — avoids header-injection class issues
-			// from any header-shaped lines inside scan-prompt.md.
-			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Cirrus SR22 deal-hunter scan (out-of-cycle, triggered from /KARTS-AIR UI). Read the full instructions in skills/karts-air/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: karts-air-ui\naccess_tier: owner\n`;
+			// Pointer (not inline) — prevents prompt-injection via
+			// header-shaped lines in scan-prompt.md (`source:`,
+			// `access_tier:`, etc.) being parsed as real task headers.
+			// Per PR #651 Blocker 2. The agent reads the file when it
+			// processes the task. `access_tier: owner` is explicit per
+			// Chi's review — relying on the absence-of-field default
+			// is fragile.
+			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Read the full instructions in skills/subscription-scanner/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: paidsubscriptions-ui\naccess_tier: owner\n`;
 			writeFileSync(`tasks/${taskId}.txt`, taskContent);
-			writeOwnerActivity('web-karts-air', 'Scan now (KARTS-AIR)');
-			res.writeHead(200, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up. Refresh in ~2-3 min for results.' }));
-		} catch (e: any) {
-			res.writeHead(500, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
-		}
-		return;
-	}
-
-	if (url.pathname === '/paidsubscriptions/scan' && req.method === 'POST') {
-		try {
-			const taskId = `task-${Date.now()}`;
-			const promptPath = 'skills/subscription-scanner/scan-prompt.md';
-			const promptBody = existsSync(promptPath) ? readFileSync(promptPath, 'utf-8') : '(scan-prompt.md missing — run subscription scan)';
-			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run subscription scan (out-of-cycle, triggered from /paidsubscriptions UI). Follow the instructions in skills/subscription-scanner/scan-prompt.md verbatim:\n\n${promptBody}\nsource: web\nfrom: paidsubscriptions-ui\n`;
-			writeFileSync(`tasks/${taskId}.txt`, taskContent);
-			writeOwnerActivity('web-paidsubscriptions', 'Scan now (paidsubscriptions)');
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min). Refresh to see results.' }));
-		} catch (e: any) {
-			res.writeHead(500, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
-		}
-		return;
-	}
-
-	// Amazon orders dashboard. Reads skills/amazon-orders/state/orders.json.
-	if (url.pathname === '/amazon') {
-		try {
-			const dataPath = 'skills/amazon-orders/state/orders.json';
-			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"since":"2026-01-01","orders":[],"scan_history":[]}';
-			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-			res.end(renderAmazonOrdersHtml(raw));
-		} catch (e: any) {
-			res.writeHead(500, { 'Content-Type': 'text/plain' });
-			res.end('Error reading orders: ' + (e?.message || String(e)));
-		}
-		return;
-	}
-	if (url.pathname === '/amazon/data') {
-		try {
-			const dataPath = 'skills/amazon-orders/state/orders.json';
-			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"since":"2026-01-01","orders":[],"scan_history":[]}';
-			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
-			res.end(raw);
-		} catch (e: any) {
-			res.writeHead(500, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ error: e?.message || String(e) }));
-		}
-		return;
-	}
-	if (url.pathname === '/amazon/scan' && req.method === 'POST') {
-		try {
-			const taskId = `task-${Date.now()}`;
-			const promptPath = 'skills/amazon-orders/scan-prompt.md';
-			const promptBody = existsSync(promptPath) ? readFileSync(promptPath, 'utf-8') : '(scan-prompt.md missing — run Amazon orders scan)';
-			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Amazon orders scan (out-of-cycle, triggered from /amazon UI). Follow the instructions in skills/amazon-orders/scan-prompt.md verbatim:\n\n${promptBody}\nsource: web\nfrom: amazon-orders-ui\n`;
-			writeFileSync(`tasks/${taskId}.txt`, taskContent);
-			writeOwnerActivity('web-amazon', 'Scan now (Amazon orders)');
-			res.writeHead(200, { 'Content-Type': 'application/json' });
-			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min).' }));
 		} catch (e: any) {
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));

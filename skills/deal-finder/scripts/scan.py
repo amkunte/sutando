@@ -134,13 +134,22 @@ TB_HINT = re.compile(r"(\d+(?:\.\d+)?)\s*tb\b", re.IGNORECASE)
 # Reject obvious accessory / replacement-parts listings — even if the title says
 # "mac mini", we don't want power cords, remotes, cables, adapters, hubs, replacement
 # parts (covers, fans, antennas, screws, logic boards alone).
+#
+# Bare nouns like `ram`, `keyboard`, `mouse`, `trackpad`, `cord`, `cable` were
+# previously over-matching every bundle listing ("Mac Mini M2 16GB RAM 512GB
+# SSD", "Mac mini bundle with keyboard and mouse", "Mac mini + USB-C cable"
+# all false-rejected — exactly the listings the skill is trying to find).
+# Chi caught this on PR #657 cold-review; explained the 36h streak of 0
+# matches. Refactored per his suggestion: bare nouns require an
+# "accessory-y" qualifier word adjacent.
 ACCESSORY_RE = re.compile(
-    r"\b(power\s*cord|cord|cable|adapter|adaptor|dongle|hub|stand|case|cover|housing|"
+    r"\b(power\s*cord|adapter|adaptor|dongle|hub|stand|case|cover|housing|"
     r"oem\b|replacement|antenna|cooling\s*fan|fan\b|speaker\b|screws?\b|logic\s*board|"
     r"power\s*supply|psu\b|"
-    r"remote\s*control|remote\b|keyboard|mouse|trackpad|magic\s*(?:mouse|trackpad|keyboard)|"
-    r"display\s*port|hdmi|usb-c|thunderbolt\s*cable|"
-    r"ram\b|memory\s*stick|ddr[2-5]?\b|ssd\s*only|hard\s*drive\s*only|sata)\b",
+    r"magic\s*(?:mouse|trackpad|keyboard)|"
+    r"display\s*port|hdmi\s*cable|usb-c\s*cable|thunderbolt\s*cable|"
+    r"(?:ram|memory\s*stick|ddr[2-5]?)\s*(?:stick|module|for\s*sale|only)|"
+    r"ssd\s*only|hard\s*drive\s*only|sata)\b",
     re.IGNORECASE,
 )
 # Mac minis on the M2+ have Apple Silicon — Intel-era listings (2010–2018) won't qualify.
@@ -245,12 +254,21 @@ def passes(criteria: dict, listing: dict) -> tuple[bool, str]:
     return True, ("soft match (specs missing — review manually)" if soft else "match")
 
 
-def fetch_listing_body(url: str) -> str:
-    """Best-effort fetch of the listing description text."""
+def fetch_listing_body(url: str) -> str | None:
+    """Best-effort fetch of the listing description text.
+
+    Returns:
+        - The body text (possibly empty) on a successful fetch.
+        - None on fetch failure — caller should skip the listing rather
+          than fall through to a body-less soft-match. Per Chi PR #657
+          note 3: an empty body combined with
+          `soft_match_when_specs_missing: True` would notify the owner on
+          a network blip, masquerading as a real match.
+    """
     try:
         page = http_get(url, timeout=15)
     except Exception:
-        return ""
+        return None
     # The post body is in <section id="postingbody">…</section>.
     m = re.search(r'<section id="postingbody"[^>]*>(.*?)</section>', page, re.DOTALL)
     if not m:
@@ -350,6 +368,18 @@ def main():
         sys.exit(1)
 
     listings = parse_search_page(page)
+    # Parser-staleness warning: Craigslist's HTML changes occasionally and
+    # the LISTING_RE pattern is the single point of failure. A page that
+    # returned bytes but yielded zero listings is the canonical signature
+    # of a layout change — surface it early rather than letting the skill
+    # silently report 0 matches indefinitely. Per Chi #657 note 1.
+    if len(listings) == 0 and len(page) > 1000:
+        print(
+            f"WARN: 0 listings parsed from {len(page)}-byte page — "
+            f"LISTING_RE may be stale (Craigslist layout change?). "
+            f"URL: {url}",
+            file=sys.stderr,
+        )
     if args.verbose:
         print(f"Found {len(listings)} listings on page")
 
@@ -370,6 +400,14 @@ def main():
         # match-cluster doesn't burst N requests at Craigslist in <1s.
         time.sleep(1)
         body = fetch_listing_body(li["url"])
+        if body is None:
+            # Fetch failed — skip rather than fall through to soft-match
+            # on an empty body, which would notify owner on a network blip
+            # (Chi #657 note 3). The listing stays "unseen" so the next
+            # scan can re-attempt.
+            if args.verbose:
+                print(f"  skip (body fetch failed): {li['title']}")
+            continue
         li["body"] = body
         ok, reason = passes(criteria, li)
         if not ok:

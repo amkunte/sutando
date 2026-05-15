@@ -82,12 +82,29 @@ else
 fi
 
 echo "Checking permissions..."
-if ! screencapture -x /tmp/sutando-permcheck.png 2>/dev/null; then
-  echo "  ⚠ Screen Recording not granted"
+# macOS 15+ silently writes a tiny PNG when Screen Recording is denied (exit 0).
+# Discriminator: real captures are hundreds-of-KB to MB; denied artifacts <2KB.
+# An all-black 5120x2880 PNG compresses to ~43KB (PNG handles flat colors well),
+# so 5KB is the safe floor — well above any denied output, well below any real
+# capture even on a locked / dark / blank desktop.
+PERM_OK=1
+screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || PERM_OK=0
+if [ "$PERM_OK" -eq 1 ]; then
+  # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
+  permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
+  if [ "${permcheck_size:-0}" -lt 5000 ]; then PERM_OK=0; fi
+fi
+rm -f /tmp/sutando-permcheck.png
+if [ "$PERM_OK" -eq 0 ]; then
+  echo "  ⚠ Screen Recording not granted (or stale)"
   echo "    → System Settings → Privacy & Security → Screen & System Audio Recording"
-  echo "    → Add 'claude' and 'node'"
+  echo "    → Add the app running this terminal (Terminal.app / iTerm2 / Warp / VS Code / Cursor / etc.)"
+  echo "    → Fully Quit the terminal app, then re-open. macOS caches the perm until process restart."
+  if lsof -i :7845 > /dev/null 2>&1; then
+    echo "    → A screen-capture server is already running on :7845 with the old (denied) perm."
+    echo "      Kill it before re-running: lsof -ti:7845 | xargs kill"
+  fi
 else
-  rm -f /tmp/sutando-permcheck.png
   echo "  ✓ Screen Recording"
 fi
 
@@ -167,10 +184,17 @@ else
 fi
 
 # 5. Screen capture server (port 7845)
+# Skip when Screen Recording perm is missing — otherwise we'd start a server
+# that returns black-PNG denials, which is exactly the stale-7845 state the
+# permcheck above warns about.
 if ! lsof -i :7845 > /dev/null 2>&1; then
-  echo "  Starting screen capture (port 7845)..."
-  python3 src/screen-capture-server.py > logs/screen-capture.log 2>&1 &
-  echo "  ✓ screen capture"
+  if [ "$PERM_OK" -eq 1 ]; then
+    echo "  Starting screen capture (port 7845)..."
+    python3 src/screen-capture-server.py > logs/screen-capture.log 2>&1 &
+    echo "  ✓ screen capture"
+  else
+    echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
+  fi
 else
   echo "  ✓ screen capture (already running)"
 fi
