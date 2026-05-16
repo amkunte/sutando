@@ -84,3 +84,6 @@ skills/tv-price-watcher/
 # last-seen unanswered-question set across cron invocations. Pure runtime
 # state, no commit value.
 .last-pq-set
+
+# Single-instance lock written by src/voice-agent.ts (acquirePidLock).
+.voice-agent.pid

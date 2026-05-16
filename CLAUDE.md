@@ -48,6 +48,38 @@ Signal your work status to `core-status.json` so the web UI can display it:
 - When done: `echo '{"status":"idle","ts":<epoch>}' > core-status.json`
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
+## Chat-path task tracking (issue #585)
+
+When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
+
+**When to write a task file from chat:**
+- The user asks you to do something concrete (close a PR, send an email, research a topic, fix a bug)
+- NOT for: quick questions, greetings, simple lookups, clarifications
+
+**How:**
+```bash
+local _ts="$(date +%s)"
+cat > "tasks/task-chat-${_ts}.txt" << EOF
+id: task-chat-${_ts}
+timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+task: <concise description of what you're doing>
+source: chat
+channel_id: local-chat
+user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
+access_tier: owner
+EOF
+```
+
+**When done:**
+Write a result file using the same task ID:
+```bash
+cat > "results/task-chat-${_ts}.txt" << EOF
+<result summary>
+EOF
+```
+
+This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
+
 ## Memory
 
 Full memory index: $SUTANDO_MEMORY_DIR (default: ~/.claude/projects/.../memory)/MEMORY.md
@@ -231,6 +263,8 @@ Prefer this for any "open X and do Y" task in a native app (Zoom join, Mail comp
 **Browser automation** — navigate, read, fill forms, screenshot web pages:
 
 Preferred (interactive): Use **Playwright MCP tools** (`mcp__playwright__*`) or **Chrome plugin** (`mcp__claude-in-chrome__*`). These provide real browser control with live DOM access, screenshots, and form interaction.
+
+**Default: navigate within the active tab when the next URL has the same origin (scheme + host + port) as the current tab.** Only spawn a new tab for cross-origin navigation, when an existing tab is the only context that holds the relevant state (a logged-in session, a long-running app), or when the user explicitly asks for a new tab. `localhost:7844` and `localhost:8080` are DIFFERENT origins — same hostname, but different ports → different services → don't share a tab. This keeps the browser tab count bounded during multi-step flows — without it, every `mcp__claude-in-chrome__navigate` opens a fresh tab and the user ends up with dozens of half-used tabs after a research session.
 
 Fallback (non-interactive / headless): `src/browser.mjs` for scripted or background use:
 ```bash

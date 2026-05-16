@@ -5,13 +5,12 @@
 # Reads the transcript, extracts key signals, and writes to session-state.md.
 # The incoming session reads this in CLAUDE.md or as part of the proactive loop.
 
-# Auto-detect repo: prefer $SUTANDO_REPO env, fall back to the directory
-# containing this script. The hardcoded $HOME/Desktop/sutando previously
-# here only worked on the dev box where this was first written — silently
-# failed on every other machine. session-state.md hadn't been refreshed
-# since April 14 because of it; the file was timestamped that day across
-# >150 sessions. Pattern matches src/init.sh:13.
-REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Auto-detect repo: prefer $SUTANDO_WORKSPACE / $SUTANDO_REPO env, fall back
+# to the directory containing this script. The hardcoded $HOME/Desktop/sutando
+# previously here only worked on the dev box where this was first written —
+# silently failed on every other machine. session-state.md hadn't been
+# refreshed since April 14 because of it. Pattern matches src/init.sh:13.
+REPO="${SUTANDO_WORKSPACE:-${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}}"
 export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
 STATE_FILE="$REPO/session-state.md"
 TRANSCRIPT="$1"  # Passed by PreCompact hook as $TRANSCRIPT_PATH

@@ -17,6 +17,10 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 import { describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
+// Vision: one-shot frame + start/stop live screen-to-Gemini video.
+export { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+import { sendVisionFrameTool, startVisionTool, stopVisionTool } from './vision-tools.js';
+
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
 export const openFileTool: ToolDefinition = {
@@ -722,6 +726,31 @@ return frontApp`;
 	},
 };
 
+// --- Chat task creation (future hook) ------------------------------------------
+// Definition kept here for when /chat gets a tool-calling surface (SSE wiring +
+// UI handler). Currently NOT registered in inlineTools / ownerOnlyTools because
+// no caller in the architecture can reach it — /chat connects to agent-api, not
+// voice-agent. The active chat-path tracking is the shell snippet in CLAUDE.md.
+// See round-5 discussion on PR #695 for the architectural analysis.
+export const createChatTaskTool: ToolDefinition = {
+	name: 'create_chat_task',
+	description:
+		'Create a tracked task entry for the /chat web UI route. ' +
+		'Future hook: no current caller in the chat path (/chat connects to agent-api, not voice-agent). ' +
+		'The core agent (Claude Code) uses the CLAUDE.md shell-snippet path instead. ' +
+		'Voice tasks have their own tracking (source: voice).',
+	parameters: z.object({
+		task: z.string().describe('Description of the task being tracked'),
+	}),
+	execution: 'inline',
+	async execute(args) {
+		const { task } = args as { task: string };
+		const { writeChatTask } = await import('./task-bridge.js');
+		const taskId = writeChatTask(task);
+		return { status: 'created', taskId, message: `Chat task created: ${taskId}` };
+	},
+};
+
 /** All inline tools — import and spread into your tools list */
 // ─── Notes tools ─────────────────────────────────────────
 // Resolve at module-init: $SUTANDO_PRIVATE_DIR/notes (canonical) when set,
@@ -1024,6 +1053,7 @@ export const inlineTools = assertUniqueToolNames([
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, slideControlTool, fullscreenTool,
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	...personalAllTools ]);
 
 /** Tools available to any caller (including unverified) */
@@ -1043,6 +1073,7 @@ export const ownerOnlyTools = [
 	showViewTool, readNoteTool, saveNoteTool, deleteNoteTool,
 	recentContextTool,
 	describeScreenTool, clickTool, scrollAndDescribeTool, screenRecordTool, openFileTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool,
+	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	...personalTools.owner,
 ];
 
