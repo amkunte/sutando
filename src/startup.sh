@@ -14,6 +14,18 @@ cd "$REPO"
 # $SUTANDO_ROOT.
 export SUTANDO_ROOT="$REPO"
 
+# Logs belong to per-user mutable state — they live under the workspace
+# (per CLAUDE.md workspace contract), not the repo. Without this, bare
+# `logs/<svc>.log` redirects below land in the repo dir, which (a) shows
+# up in `git status` on hosts that never gitignore them and (b) makes
+# `health-check.py`'s log-path resolver permanently warn "voice-agent.log
+# not found" because it looks under <workspace>/logs or the launchd path.
+# Diagnosed 2026-05-19: voice-watchers + voice-transport warns persisted
+# across sessions despite voice-agent running fine.
+WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
+LOGS_DIR="$WORKSPACE/logs"
+mkdir -p "$LOGS_DIR"
+
 # Git committer attribution from stand-identity.json (opt-in, no env var).
 # The repo-local `user.email` (set to the GitHub privacy noreply) is the
 # AUTHOR — CLA-Assistant resolves it to the owner's GitHub account, gating
@@ -182,7 +194,7 @@ fi
 # 1. Voice agent (Gemini Live on port 9900)
 if ! lsof -i :9900 > /dev/null 2>&1; then
   echo "  Starting voice agent (port 9900)..."
-  npx tsx src/voice-agent.ts > logs/voice-agent.log 2>&1 &
+  npx tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
   echo "  ✓ voice agent"
 else
   echo "  ✓ voice agent (already running)"
@@ -191,7 +203,7 @@ fi
 # 2. Web client (port 8080)
 if ! lsof -i :8080 > /dev/null 2>&1; then
   echo "  Starting web client (port 8080)..."
-  npx tsx src/web-client.ts > logs/web-client.log 2>&1 &
+  npx tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running)"
@@ -200,7 +212,7 @@ fi
 # 3. Dashboard (port 7844)
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  python3 src/dashboard.py > logs/dashboard.log 2>&1 &
+  python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
   echo "  ✓ dashboard"
 else
   echo "  ✓ dashboard (already running)"
@@ -209,7 +221,7 @@ fi
 # 4. Agent API (port 7843)
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  python3 src/agent-api.py > logs/agent-api.log 2>&1 &
+  python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
   echo "  ✓ agent API"
 else
   echo "  ✓ agent API (already running)"
@@ -222,7 +234,7 @@ fi
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    python3 src/screen-capture-server.py > logs/screen-capture.log 2>&1 &
+    python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
     echo "  ✓ screen capture"
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
@@ -292,7 +304,7 @@ if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
 elif [ -f "$HOME/.claude/channels/telegram/.env" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$HOME/.claude/channels/telegram/.env" 2>/dev/null; then
   if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
-    python3 src/telegram-bridge.py > logs/telegram-bridge.log 2>&1 &
+    python3 src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
     echo "  ✓ telegram bridge"
   else
     echo "  ✓ telegram bridge (already running)"
@@ -321,7 +333,7 @@ if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" 
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
-    "$PYTHON_WITH_DISCORD" src/discord-bridge.py > logs/discord-bridge.log 2>&1 &
+    "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
     echo "  ✓ discord bridge"
   else
     echo "  ✓ discord bridge (already running)"
@@ -347,7 +359,7 @@ if [ -f "$HOME/.claude/channels/slack/.env" ] && grep -q "SLACK_BOT_TOKEN=" "$HO
     echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
     # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
     set -a; . "$HOME/.claude/channels/slack/.env"; set +a
-    "$PYTHON_WITH_SLACK" src/slack-bridge.py > logs/slack-bridge.log 2>&1 &
+    "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
     echo "  ✓ slack bridge"
   else
     echo "  ✓ slack bridge (already running)"
