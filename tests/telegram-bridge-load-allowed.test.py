@@ -35,16 +35,20 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 
-def load_allowed(path: Path) -> set:
-    """Mirror of src/telegram-bridge.py:load_allowed (line 213).
+def load_allowed(path: Path):
+    """Mirror of src/telegram-bridge.py:load_allowed (line 226).
 
     Kept in sync manually. If you change one, change the other.
+
+    Returns: set of allowed sender IDs, OR None if access.json doesn't exist.
+    The None vs empty-set distinction matters for TOFU auto-onboarding (see
+    docstring on the real function).
     """
     try:
         data = json.loads(path.read_text())
         return set(data.get("allowFrom", []))
     except FileNotFoundError:
-        return set()
+        return None
     except (json.JSONDecodeError, OSError, ValueError) as e:
         print(
             f"WARN load_allowed: {type(e).__name__} reading {path}: {e}. "
@@ -73,14 +77,29 @@ class LoadAllowedTests(unittest.TestCase):
         p = self._write(json.dumps({"allowFrom": ["111", "222"]}))
         self.assertEqual(load_allowed(p), {"111", "222"})
 
-    def test_missing_file_is_silent_empty(self):
-        # No warn line should appear — missing file is the legitimate
-        # uninitialized state pre-pairing.
+    def test_missing_file_returns_None_for_tofu(self):
+        # File missing → return None, NOT empty set. The None vs empty-set
+        # distinction is the trust-on-first-use signal: the bridge auto-onboards
+        # the first DM sender as owner when access.json doesn't exist. Empty
+        # set (file present, allowFrom: []) means "admin locked down, never
+        # TOFU". Conflating the two — as the original test asserted before
+        # the 2026-05-19 rebase merge — silently breaks first-time setup.
+        # No warn line either: missing file is a legitimate uninitialized state.
         buf = io.StringIO()
         with redirect_stdout(buf):
             result = load_allowed(Path(self.tmpdir) / "nonexistent.json")
-        self.assertEqual(result, set())
+        self.assertIsNone(result)
         self.assertNotIn("WARN", buf.getvalue())
+
+    def test_explicit_empty_allowfrom_returns_empty_set(self):
+        # Distinct from missing-file: file IS present with empty allowFrom.
+        # That's the "locked down, never TOFU" admin choice. Must return
+        # set(), not None — otherwise the bridge would auto-onboard the
+        # next sender despite the admin's explicit lockdown.
+        p = self._write(json.dumps({"allowFrom": []}))
+        result = load_allowed(p)
+        self.assertEqual(result, set())
+        self.assertIsNotNone(result)
 
     def test_corrupt_json_is_loud_empty(self):
         # Real fault — must warn loudly so owner sees it in bridge logs.
