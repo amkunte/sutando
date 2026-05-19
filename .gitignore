@@ -84,3 +84,6 @@ skills/tv-price-watcher/
 # last-seen unanswered-question set across cron invocations. Pure runtime
 # state, no commit value.
 .last-pq-set
+
+# Playwright MCP cache (created by mcp__playwright tools)
+.playwright-mcp/
