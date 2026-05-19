@@ -565,8 +565,24 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						} catch (e) {
 							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
 						}
+						continue;
 					}
-					// Other non-voice unsent results stay queued (their bridges deliver them)
+					// Non-voice task or answer-Q file while voice is offline. Originating
+					// bridges (web-client/agent-api, Discord, Telegram) own their own
+					// delivery paths and have already received the result by now via
+					// their own polls. Without this archive step the file lingers in
+					// results/ + tasks/ indefinitely — health-check fires task-queue
+					// warns ("8 tasks queued, oldest 3108s") and the web UI's task list
+					// fills with stale "done" rows. Same 10s delay used by the
+					// connected-client path below to give pollers a final fetch window.
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 10_000);
 					continue;
 				}
 				if (result) {
