@@ -37,7 +37,16 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+# Runtime artifacts (tasks/, results/, state/, heartbeat) live in the workspace.
+# .env stays repo-rooted (code-adjacent config). The historic Path(__file__).
+# resolve().parents[1] anti-pattern is what workspace_default.py docstring
+# explicitly calls out — sms-bridge was polling repo dirs and missing every
+# real twilio_sms task the phone-server (correctly) writes to the workspace.
+REPO_DIR = Path(__file__).resolve().parents[1]
+WORKSPACE = resolve_workspace()
 TASKS_DIR = WORKSPACE / "tasks"
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
@@ -53,7 +62,7 @@ MAX_BODY = 1500
 
 def load_env() -> None:
     global TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, POLL_SECS, MAX_BODY
-    env_path = WORKSPACE / ".env"
+    env_path = REPO_DIR / ".env"
     if not env_path.exists():
         return
     for line in env_path.read_text().splitlines():
