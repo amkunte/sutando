@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 #
-# Upstream sync — pull new commits from sonichi/sutando into amkunte/sutando main.
-# See SKILL.md for full behavior. Exits 0 on no-op or success, 1 on failure
-# (working tree dirty, conflicts, git error). On any failure or on a successful
-# pull, writes results/proactive-{ts}.txt for Telegram notification.
+# Upstream sync — pull new commits from sonichi/sutando into amkunte/main.
 #
-# Designed to be run from the repo root (cron sets CWD).
+# Rebase-model architecture (as of 2026-05-19, PR #28):
+#   amkunte/main       ← mirrors upstream/main EXACTLY (clean, contributable)
+#   amkunte/local-main ← deployment branch; rebased on main when owner is ready
+#
+# This script handles the EASY half: fast-forward `main` from `upstream/main`
+# and push. Since `main` has no local commits, ff is guaranteed conflict-free.
+#
+# It does NOT auto-rebase `local-main` onto `main` — that's a deliberate manual
+# step the owner takes when they want to bring upstream changes into deployment
+# (and handle per-commit conflicts surgically rather than 10 files at once).
+#
+# Exits 0 on no-op or success, 1 on failure. Notifies via results/proactive-*
+# on success (with summary) or failure. Stays silent on no-op.
 
 set -euo pipefail
 
@@ -14,24 +23,14 @@ cd "$REPO_DIR"
 
 ts=$(date +%s)
 notify() {
-  # $1 = message (markdown OK)
   local msg="$1"
   printf '%s\n' "$msg" > "results/proactive-upstream-sync-${ts}.txt"
 }
 
-# Guard: must be on main
-current_branch=$(git rev-parse --abbrev-ref HEAD)
-if [ "$current_branch" != "main" ]; then
-  echo "[upstream-sync] not on main (currently $current_branch); skipping"
-  notify "⚠️ Upstream sync skipped — repo is on branch \`$current_branch\`, not \`main\`. Switch to main and run \`bash skills/upstream-sync/scripts/sync.sh\` manually."
-  exit 1
-fi
+# Remember where we started so we can switch back at the end.
+start_branch=$(git rev-parse --abbrev-ref HEAD)
 
-# Guard: working tree clean (no uncommitted changes to tracked files).
-# If dirty, skip silently — the repo accumulates long-running uncommitted
-# state (telegram-bridge.py, watch-tasks.sh, etc.) that owner is aware of
-# and is fine with. Notifying every day would be noise. Cron stderr still
-# captures the skip for forensics if needed.
+# Working tree must be clean — switching branches mid-edit would corrupt state.
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "[upstream-sync] working tree dirty; skipping silently"
   exit 0
@@ -43,61 +42,59 @@ if ! git fetch upstream main 2>&1; then
   exit 1
 fi
 
-# How many commits behind upstream/main?
+# How many commits behind upstream/main is main?
 behind=$(git rev-list --count main..upstream/main 2>/dev/null || echo 0)
-ahead=$(git rev-list --count upstream/main..main 2>/dev/null || echo 0)
 
 if [ "$behind" = "0" ]; then
-  echo "[upstream-sync] up to date (ahead=$ahead, behind=0)"
+  echo "[upstream-sync] main already up to date with upstream/main"
   exit 0
 fi
 
-# Try the merge. Use --ff-only first so a clean ff lands without a merge commit.
-# If non-ff (we have local commits not yet upstreamed), fall back to a merge.
-if git merge --ff-only upstream/main 2>/dev/null; then
-  echo "[upstream-sync] fast-forwarded $behind commit(s)"
-else
-  msg="Merge upstream/main ($behind commit$([ "$behind" = "1" ] || echo s))"
-  if ! git merge --no-ff -m "$msg" upstream/main 2>&1; then
-    # Conflict — abort and notify
-    git merge --abort 2>/dev/null || true
-    summary=$(git log --oneline main..upstream/main | head -10)
-    notify "🚨 Upstream sync — **conflict** merging \`upstream/main\` into local \`main\`. Auto-merge aborted; \`main\` is unchanged.
+# Defensive check: main must have no commits that aren't on upstream/main.
+# If it does, the rebase model was violated (someone committed directly to main).
+ahead=$(git rev-list --count upstream/main..main 2>/dev/null || echo 0)
+if [ "$ahead" != "0" ]; then
+  notify "🚨 Upstream sync blocked — \`main\` has **$ahead local commit(s)** that aren't on \`upstream/main\`. The rebase model expects \`main\` to mirror \`upstream/main\` exactly. Move those commits to \`local-main\` and reset \`main\`."
+  exit 1
+fi
 
-Behind by **$behind commit(s)**, ahead by **$ahead**. Resolve manually:
-\`\`\`bash
-cd ~/sutando
-git fetch upstream
-git merge upstream/main         # then resolve conflicts
-git push origin main
-\`\`\`
+# Switch to main if we're not there
+if [ "$start_branch" != "main" ]; then
+  git checkout main 2>&1 | tail -1
+fi
 
-Top of upstream changes:
-\`\`\`
-$summary
-\`\`\`"
-    exit 1
-  fi
+# Fast-forward main to upstream/main (guaranteed clean — no local commits on main)
+if ! git merge --ff-only upstream/main 2>&1; then
+  notify "❌ Upstream sync failed: \`git merge --ff-only upstream/main\` rejected. State unexpected — investigate manually."
+  # Try to restore start branch
+  [ "$start_branch" != "main" ] && git checkout "$start_branch" 2>/dev/null || true
+  exit 1
 fi
 
 # Push to fork
 if ! git push origin main 2>&1; then
-  notify "⚠️ Upstream sync — merged $behind commit(s) into local \`main\`, but \`git push origin main\` failed. Run manually to retry."
+  notify "⚠️ Upstream sync — fast-forwarded $behind commit(s) into local \`main\`, but \`git push origin main\` failed. Run manually to retry."
+  [ "$start_branch" != "main" ] && git checkout "$start_branch" 2>/dev/null || true
   exit 1
 fi
 
-# Success — summarize what came in
-summary=$(git log --oneline HEAD@{1}..HEAD | head -10)
-total_subjects=$(git log --oneline HEAD@{1}..HEAD | wc -l | tr -d ' ')
+# Summarize what came in
+summary=$(git log --oneline HEAD@{1}..HEAD 2>/dev/null | head -10)
+total=$(git log --oneline HEAD@{1}..HEAD 2>/dev/null | wc -l | tr -d ' ')
 
-notify "🔄 Upstream sync — pulled **$behind commit(s)** from \`sonichi/sutando\` into your fork's \`main\` and pushed.
+# Switch back to where we started
+if [ "$start_branch" != "main" ]; then
+  git checkout "$start_branch" 2>&1 | tail -1
+fi
+
+notify "🔄 Upstream sync — fast-forwarded **$behind commit(s)** from \`sonichi/sutando\` onto \`amkunte/main\`.
 
 Top changes:
 \`\`\`
 $summary
 \`\`\`
 
-Total subjects: $total_subjects. \`/\`, \`/chat\`, \`/paidsubscriptions\` not affected — restart any service you'd like to re-load fresh code (or just leave them; tsx hot-reloads on next request)."
+Total subjects: $total. **Not yet on \`local-main\`** — deployment continues from old code until you run \`git rebase main\` on local-main and resolve per-commit conflicts deliberately."
 
-echo "[upstream-sync] success: pulled $behind commit(s)"
+echo "[upstream-sync] success: fast-forwarded main by $behind commit(s); local-main untouched"
 exit 0
