@@ -605,10 +605,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
-            f"task: Incoming phone call from {caller}\n"
             f"source: twilio_voice\n"
             f"from: {caller}\n"
             f"call_sid: {call_sid}\n"
+            f"task: Incoming phone call from {caller}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -634,9 +634,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         task_content = (
             f"id: {task_id}\n"
             f"timestamp: {datetime.now().isoformat()}\n"
-            f"task: SMS from {sender}: {body}\n"
             f"source: twilio_sms\n"
             f"from: {sender}\n"
+            f"task: SMS from {sender}: {body}\n"
         )
         (TASK_DIR / f"{task_id}.txt").write_text(task_content)
 
@@ -657,9 +657,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {datetime.now().isoformat()}\n"
-                f"task: Voicemail from {caller}: {text}\n"
                 f"source: twilio_voicemail\n"
                 f"from: {caller}\n"
+                f"task: Voicemail from {caller}: {text}\n"
             )
             (TASK_DIR / f"{task_id}.txt").write_text(task_content)
         self.send_json(200, {"ok": True})
