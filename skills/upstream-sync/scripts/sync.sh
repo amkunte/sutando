@@ -13,18 +13,20 @@
 # step the owner takes when they want to bring upstream changes into deployment
 # (and handle per-commit conflicts surgically rather than 10 files at once).
 #
-# Exits 0 on no-op or success, 1 on failure. Notifies via results/proactive-*
+# Exits 0 on no-op or success, 1 on failure. Notifies via $WORKSPACE/results/proactive-*
 # on success (with summary) or failure. Stays silent on no-op.
 
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+WORKSPACE="${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}"
+WORKSPACE="${WORKSPACE/#\~/$HOME}"
 cd "$REPO_DIR"
 
 ts=$(date +%s)
 notify() {
   local msg="$1"
-  printf '%s\n' "$msg" > "results/proactive-upstream-sync-${ts}.txt"
+  printf '%s\n' "$msg" > "${WORKSPACE}/results/proactive-upstream-sync-${ts}.txt"
 }
 
 # Remember where we started so we can switch back at the end.
