@@ -67,8 +67,10 @@ export const summonTool: ToolDefinition = {
 				// actually opened on Studio.
 				console.log(`${ts()} [Summon] Joining via zoommtg:// deeplink`);
 				let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-				if (pwd) zoomUrl += `&pwd=${pwd}`;
-				execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
+				// encodeURIComponent: pwd is caller-supplied (Gemini arg or env var).
+				// execFileSync: URL is a single argv entry, never shell-spliced.
+				if (pwd) zoomUrl += `&pwd=${encodeURIComponent(pwd)}`;
+				execFileSync('open', [zoomUrl], { timeout: 10_000 });
 
 				// Wait briefly for Zoom to register the deeplink, then enter the
 				// combined Join-and-wait-for-meeting loop below. Per Mini's PR #546
@@ -376,11 +378,12 @@ export const joinZoomTool: ToolDefinition = {
 			if (!alreadyIn) {
 				const zoomRunning = (() => { try { execSync('pgrep -f "zoom.us"', { timeout: 2_000 }); return true; } catch { return false; } })();
 				if (zoomRunning) {
-					execSync(`open "https://zoom.us/j/${cleanId}${pwd ? '?pwd=' + pwd : ''}"`, { timeout: 10_000 });
+					const webUrl = `https://zoom.us/j/${cleanId}${pwd ? `?pwd=${encodeURIComponent(pwd)}` : ''}`;
+					execFileSync('open', [webUrl], { timeout: 10_000 });
 				} else {
 					let zoomUrl = `zoommtg://zoom.us/join?confno=${cleanId}`;
-					if (pwd) zoomUrl += `&pwd=${pwd}`;
-					execSync(`open "${zoomUrl}"`, { timeout: 10_000 });
+					if (pwd) zoomUrl += `&pwd=${encodeURIComponent(pwd)}`;
+					execFileSync('open', [zoomUrl], { timeout: 10_000 });
 				}
 
 				// Click Join button if preview window appears

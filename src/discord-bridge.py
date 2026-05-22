@@ -400,6 +400,30 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR.mkdir(exist_ok=True)
 
+
+def _safe_attachment_basename(filename: str) -> str:
+    """Sanitize a Discord attachment filename for safe filesystem + shell use.
+
+    Discord allows arbitrary filenames (spaces, quotes, semicolons, backticks,
+    `$`, `..`). Pre-fix, the bridge saved them verbatim and downstream sites
+    embedded the path in shell commands — a filename like `x"; touch /tmp/pwn;
+    #.jpg` would break out of the quoted argument and execute attacker commands.
+
+    Keeps alphanumerics + `._-`; replaces everything else with `_`. Strips
+    path-traversal (`..`) and caps length to 80+8 chars.
+    """
+    name = filename or "file"
+    dot = name.rfind(".")
+    if dot > 0 and dot >= len(name) - 9:
+        base, ext = name[:dot], name[dot + 1:]
+    else:
+        base, ext = name, ""
+    safe_base = re.sub(r"[^a-zA-Z0-9_\-.]", "_", base).strip("._") or "file"
+    safe_ext = re.sub(r"[^a-zA-Z0-9]", "", ext)[:8]
+    safe_base = safe_base[:80]
+    return f"{safe_base}.{safe_ext}" if safe_ext else safe_base
+
+
 # Presenter mode: when scripts/presenter-mode.sh is active, the bridge
 # must not send proactive DMs to the owner. The sentinel contains an
 # ISO-8601 expiry; see scripts/presenter-mode.sh for the contract.
@@ -2331,7 +2355,7 @@ async def _handle_discord_message(message, force=False):
                 if embed.description: parts.append(embed.description)
             # Download snapshot attachments (forwarded images/files)
             for att in getattr(snap_msg, 'attachments', []):
-                local_path = INBOX_DIR / f"{int(time.time()*1000)}_{att.filename}"
+                local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
                 try:
                     await att.save(local_path)
                     parts.append(f"[File attached: {local_path}]")
@@ -2384,7 +2408,7 @@ async def _handle_discord_message(message, force=False):
     # Handle attachments
     attachment_note = ""
     for att in message.attachments:
-        local_path = INBOX_DIR / f"{int(time.time()*1000)}_{att.filename}"
+        local_path = INBOX_DIR / f"{int(time.time()*1000)}_{_safe_attachment_basename(att.filename)}"
         try:
             await att.save(local_path)
             attachment_note += f"\n[File attached: {local_path}]"
