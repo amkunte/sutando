@@ -1601,6 +1601,53 @@ def main():
                                      stdout=open("/tmp/conversation-server.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                elif c["name"] == "voice-agent":
+                    if c["status"] == "stale":
+                        try:
+                            old_pids = subprocess.run(
+                                ["/usr/bin/pgrep", "-f", "voice-agent.ts"],
+                                capture_output=True, text=True
+                            ).stdout.strip().split("\n")
+                            for pid in old_pids:
+                                if pid:
+                                    subprocess.run(["/bin/kill", pid], check=False)
+                            import time as _t; _t.sleep(1)
+                        except Exception:
+                            pass
+                    subprocess.Popen(["npx", "tsx", "src/voice-agent.ts"],
+                                     cwd=str(REPO_DIR),
+                                     stdout=open("/tmp/voice-agent.log", "a"),
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                elif c["name"] == "web-client":
+                    if c["status"] == "stale":
+                        try:
+                            # lsof -t -i :8080 may return a child PID; use LISTEN
+                            # filter to find the actual listening process.
+                            lsof_out = subprocess.run(
+                                ["/usr/sbin/lsof", "-i", ":8080"],
+                                capture_output=True, text=True
+                            ).stdout
+                            listen_pids = [
+                                line.split()[1]
+                                for line in lsof_out.splitlines()
+                                if "LISTEN" in line
+                            ]
+                            pgrep_pids = subprocess.run(
+                                ["/usr/bin/pgrep", "-f", "web-client.ts"],
+                                capture_output=True, text=True
+                            ).stdout.strip().split("\n")
+                            all_pids = set(listen_pids + pgrep_pids) - {""}
+                            for pid in all_pids:
+                                subprocess.run(["/bin/kill", pid], check=False)
+                            import time as _t; _t.sleep(1)
+                        except Exception:
+                            pass
+                    subprocess.Popen(["npx", "tsx", "src/web-client.ts"],
+                                     cwd=str(REPO_DIR),
+                                     stdout=open("/tmp/web-client.log", "a"),
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
 
     # Emit task on the RESIDUAL failure set when --fix ran (per PR #640 v2
     # review). The no-fix path emits earlier, before --quiet / --json early
