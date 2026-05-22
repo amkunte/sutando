@@ -143,7 +143,15 @@ export function _isVoiceTask(taskId: string): boolean {
 		if (!existsSync(p)) continue;
 		try {
 			const body = readFileSync(p, 'utf-8');
-			return body.split('\n').some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
+			// Stop at the first `task:` line — the task body follows it and
+			// must not be scanned. A body containing `channel_id: local-voice`
+			// would otherwise forge a voice-task classification (PR #982 gap).
+			const headerLines: string[] = [];
+			for (const l of body.split('\n')) {
+				if (l.startsWith('task:')) break;
+				headerLines.push(l);
+			}
+			return headerLines.some(l => l.startsWith('channel_id: local-voice') || l.startsWith('source: voice'));
 		} catch {}
 	}
 	return false;
@@ -261,12 +269,12 @@ export const workTool: ToolDefinition = {
 		const content =
 			`id: ${taskId}\n` +
 			`timestamp: ${timestamp}\n` +
-			`task: ${task}\n` +
 			`source: voice\n` +
 			`channel_id: local-voice\n` +
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +
-			`priority: urgent\n`;
+			`priority: urgent\n` +
+			`task: ${task}\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -417,12 +425,12 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 						join(TASK_DIR, `${taskId}.txt`),
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
-						`task: User dropped context via hotkey. Process this:\n${content}\n` +
 						`source: context-drop\n` +
 						`channel_id: local-hotkey\n` +
 						`user_id: ${ownerId}\n` +
 						`access_tier: owner\n` +
-						`priority: normal\n`,
+						`priority: normal\n` +
+						`task: User dropped context via hotkey. Process this:\n${content}\n`,
 					);
 					unlinkSync(CONTEXT_DROP_FILE);
 					// Also inject into Gemini if available

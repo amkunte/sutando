@@ -56,9 +56,9 @@ def parse_priority_from_text(content: str) -> str:
             if value in _VALID:
                 return value
             return _DEFAULT  # malformed -> fail-open to normal
-        if line.startswith("---") or line == "":
-            # End of header block (heuristic) — stop scanning so we don't
-            # match the word "priority" appearing in the task body.
+        if line.startswith("task:") or line.startswith("---") or line == "":
+            # Stop at `task:` (the user-supplied body follows — may contain
+            # the word "priority"), `---`, or blank line.
             break
     return _DEFAULT
 
