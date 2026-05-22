@@ -2679,7 +2679,6 @@ async def _handle_discord_message(message, force=False):
     task_file.write_text(
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-        f"task: {user_task_text}\n"
         f"source: discord\n"
         f"channel_id: {message.channel.id}\n"
         f"source_message_id: {message.id}\n"
@@ -2687,6 +2686,7 @@ async def _handle_discord_message(message, force=False):
         f"access_tier: {access_tier}\n"
         f"priority: {priority}\n"
         f"{tier_instructions.get(access_tier, tier_instructions['other'])}"
+        f"task: {user_task_text}\n"
     )
     pending_replies[task_id] = message.channel
     # Track source-message-id so the result-sender can auto-attach reply_to
