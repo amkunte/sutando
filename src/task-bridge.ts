@@ -753,6 +753,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						} catch (e) {
 							console.error(`${ts()} [TaskBridge] Failed to forward ${taskId} to Discord:`, e);
 						}
+					continue;
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
 					// so results/task-chat-*.txt files don't accumulate forever.
@@ -766,10 +767,12 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							const taskFile = join(TASK_DIR, `${taskId}.txt`);
 							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
 						}, 10_000);
+						continue;
 					}
 					// Context-drop tasks: Sutando.app writes `source: context-drop` (no bridge
-					// handles delivery). Archive them directly so they don't pile up indefinitely.
-					// Companion fix: Sutando.app main.swift writeTask() must include this field.
+					// handles delivery). Archive them directly with a short 10s delay since
+					// nothing is waiting to deliver. Companion fix: Sutando.app main.swift
+					// writeTask() must include this field.
 					// Issue: https://github.com/sonichi/sutando/issues/969
 					if (taskId.startsWith('task-')) {
 						const ctxTaskFile = join(TASK_DIR, `${taskId}.txt`);
@@ -790,7 +793,21 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							} catch {}
 						}
 					}
-					// Other non-voice unsent results stay queued (their bridges deliver them)
+					// Non-voice, non-chat task (telegram/discord/api/web) while voice is
+					// offline. The originating bridge owns delivery via its own poll loop
+					// and has already received the result by now. Without archival the
+					// files accumulate in results/ + tasks/, firing health-check task-queue
+					// warnings and filling the web UI with stale "done" rows.
+					// 30s delay gives the bridge two full poll cycles to deliver before we
+					// clean up (telegram/discord bridges poll every 2s).
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 30_000);
 					continue;
 				}
 				// Belt-suspenders guard (issue #1035, follow-up to PR #1033):
