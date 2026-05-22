@@ -1510,11 +1510,21 @@ const server = createServer(async (req, res) => {
 
 		} else if (path === '/twilio/sms' && req.method === 'POST') {
 			const form = new URLSearchParams(await readBody(req));
-			const sender = form.get('From') ?? 'unknown';
-			const body = form.get('Body') ?? '';
+			// Sanitize: collapse newlines so user-controlled fields can't forge
+			// header lines below task: in the task file (same invariant as PR #982).
+			const sender = (form.get('From') ?? 'unknown').replace(/[\r\n]+/g, ' ');
+			const body = (form.get('Body') ?? '').replace(/[\r\n]+/g, ' ');
 			console.log(`${ts()} [SMS] from=${sender} body=${body.slice(0, 80)}`);
 			const taskId = `task-${Date.now()}`;
-			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: SMS from ${sender}: ${body}\nsource: twilio_sms\nfrom: ${sender}\n`;
+			// Field order: task: LAST so user-supplied body can't forge headers.
+			const taskContent =
+				`id: ${taskId}\n` +
+				`timestamp: ${new Date().toISOString()}\n` +
+				`source: twilio_sms\n` +
+				`from: ${sender}\n` +
+				`access_tier: owner\n` +
+				`priority: normal\n` +
+				`task: SMS from ${sender}: ${body}\n`;
 			writeFileSync(join(WORKSPACE_DIR, 'tasks', `${taskId}.txt`), taskContent);
 			twimlResponse(res, `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Message>Got it. Sutando is on it.</Message></Response>`);
 
