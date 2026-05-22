@@ -78,12 +78,12 @@ export function writeChatTask(taskDescription: string): string {
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
-		`task: ${taskDescription}`,
 		`source: chat`,
 		`channel_id: local-chat`,
 		`user_id: ${process.env.SUTANDO_DM_OWNER_ID || 'chat-local'}`,
 		`access_tier: owner`,
 		`priority: normal`,
+		`task: ${taskDescription}`,
 		'',
 	].join('\n');
 	writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
