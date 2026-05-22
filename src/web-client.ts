@@ -225,6 +225,24 @@ const HTML = /* html */ `<!DOCTYPE html>
   .header .meta { font-size: 16px; color: #888; display: flex; gap: 14px; align-items: center; margin-top: 4px; }
   .header .meta a { color: #999; text-decoration: none; border-bottom: 1px dotted #555; }
   .header .meta a:hover { color: #bbb; }
+  .skills-nav { position: relative; }
+  .skills-nav summary {
+    color: #999; font-size: 16px; list-style: none; cursor: pointer;
+    border-bottom: 1px dotted #555; padding-bottom: 1px;
+  }
+  .skills-nav summary::-webkit-details-marker { display: none; }
+  .skills-nav summary:hover { color: #bbb; }
+  .skills-nav[open] summary { color: #bbb; }
+  .skills-nav .skills-menu {
+    position: absolute; top: calc(100% + 6px); left: 0; z-index: 100;
+    background: #12121e; border: 1px solid #2a2a42; border-radius: 8px;
+    padding: 6px 0; min-width: 180px; box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+  }
+  .skills-menu a {
+    display: block; padding: 7px 16px; color: #aaa !important;
+    border-bottom: none !important; font-size: 13px; white-space: nowrap;
+  }
+  .skills-menu a:hover { background: #1a1a2e; color: #fff !important; }
   .status-pill {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 4px 12px; border-radius: 12px; font-size: 16px; font-weight: 500;
@@ -639,6 +657,14 @@ const HTML = /* html */ `<!DOCTYPE html>
     <div class="meta">
       <span class="status-pill voice-off" id="voice-status"><span class="dot" id="dot"></span> <span id="status">Text only</span></span>
       <a href="http://localhost:7844" target="_blank">Dashboard</a>
+      <details class="skills-nav" id="skills-nav">
+        <summary>Skills ▾</summary>
+        <div class="skills-menu">
+          <a href="/karts-air">✈ KARTS-AIR (Cirrus SR22)</a>
+          <a href="/amazon">📦 Amazon Orders</a>
+          <a href="/paidsubscriptions">💳 Paid Subscriptions</a>
+        </div>
+      </details>
       <span class="stats" id="stats"></span>
     </div>
   </div>
@@ -1159,6 +1185,11 @@ function toggleAllTasks() {
   persistExpanded();
   renderTasks();
 }
+// Close skills dropdown when clicking outside of it
+document.addEventListener('click', function(e) {
+  const nav = document.getElementById('skills-nav');
+  if (nav && nav.open && !nav.contains(e.target)) nav.removeAttribute('open');
+});
 document.addEventListener('click', function(e) {
   // Don't toggle if clicking inside the result text (allow text selection)
   if (e.target.closest && e.target.closest('[id^="result-"]')) return;
