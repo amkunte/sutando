@@ -150,7 +150,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         task_text = format_event(event_type, payload)
         if task_text:
             task_id = f"task-gh-{int(time.time() * 1000)}"
-            task_content = f"id: {task_id}\ntimestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\ntask: {task_text}\nsource: github\n"
+            task_content = f"id: {task_id}\ntimestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\nsource: github\ntask: {task_text}\n"
             TASKS_DIR.mkdir(exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
             print(f"[{time.strftime('%H:%M:%S')}] {event_type}/{payload.get('action', '')} → {task_id}")
