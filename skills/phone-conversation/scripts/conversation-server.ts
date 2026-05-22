@@ -47,6 +47,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1246,6 +1247,50 @@ async function readBody(req: IncomingMessage): Promise<string> {
 	return Buffer.concat(chunks).toString('utf-8');
 }
 
+/**
+ * Validate Twilio's X-Hub-Signature using HMAC-SHA1.
+ *
+ * Twilio signs every webhook with HMAC-SHA1 of (fullUrl + sorted POST params)
+ * using the account AuthToken as the key. Without this check anyone who knows
+ * the webhook URL (public via ngrok) can send forged requests.
+ *
+ * Algorithm: https://www.twilio.com/docs/usage/webhooks/webhooks-security
+ *
+ * - fullUrl: the URL Twilio actually called, including query string.
+ *   We reconstruct it from the Host header (reliable behind ngrok) rather
+ *   than WEBHOOK_BASE_URL (may be unset when the first inbound SMS arrives).
+ * - rawBody: the raw form-encoded POST body (params sorted and appended).
+ * - Returns true if valid, false on any mismatch or missing config.
+ */
+function validateTwilioSignature(req: IncomingMessage, rawBody: string): boolean {
+	if (!TWILIO_AUTH_TOKEN) return false;
+	const sigHeader = req.headers['x-twilio-signature'];
+	if (!sigHeader || typeof sigHeader !== 'string') return false;
+
+	// Reconstruct the full public URL from Host header.
+	// ngrok sets Host to the tunnel hostname (e.g. abc123.ngrok.io) so this
+	// matches what Twilio called, regardless of WEBHOOK_BASE_URL readiness.
+	const host = req.headers['host'] ?? '';
+	const scheme = host.includes('ngrok') || host.includes('tailscale') ? 'https' : 'http';
+	const fullUrl = `${scheme}://${host}${req.url ?? ''}`;
+
+	// Sort POST params and concatenate key+value (no separator — Twilio spec).
+	const params = new URLSearchParams(rawBody);
+	const paramStr = [...params.entries()]
+		.sort((a, b) => a[0].localeCompare(b[0]))
+		.map(([k, v]) => k + v)
+		.join('');
+
+	const expected = createHmac('sha1', TWILIO_AUTH_TOKEN)
+		.update(fullUrl + paramStr)
+		.digest('base64');
+	try {
+		return timingSafeEqual(Buffer.from(sigHeader), Buffer.from(expected));
+	} catch {
+		return false;  // timingSafeEqual throws on length mismatch → not equal
+	}
+}
+
 function json(res: ServerResponse, status: number, data: unknown): void {
 	res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
 	res.end(JSON.stringify(data));
@@ -1351,6 +1396,23 @@ const server = createServer(async (req, res) => {
 		json(res, 403, { error: 'control endpoints are loopback-only' });
 		return;
 	}
+
+	// For /twilio/* POST requests: buffer the body once here so we can
+	// (a) validate the Twilio signature before routing and (b) pass the
+	// pre-read body string to handlers (Node streams can only be consumed once).
+	// Non-POST paths (GET /health) and non-Twilio paths skip this block.
+	let _twilioBody: string | undefined;
+	if (path.startsWith('/twilio/') && req.method === 'POST') {
+		_twilioBody = await readBody(req);
+		if (!validateTwilioSignature(req, _twilioBody)) {
+			console.log(`${ts()} [PhoneServer] REJECTED ${path}: invalid Twilio signature`);
+			json(res, 403, { error: 'invalid twilio signature' });
+			return;
+		}
+	}
+
+	// Helper: return the pre-buffered Twilio body or read fresh (for non-Twilio POST paths).
+	const getTwilioBody = () => _twilioBody!;
 
 	try {
 		if (path === '/health' && req.method === 'GET') {
@@ -1624,7 +1686,7 @@ const server = createServer(async (req, res) => {
 			twimlResponse(res, twiml);
 
 		} else if (path === '/twilio/connect' && req.method === 'POST') {
-			const body = await readBody(req);
+			const body = getTwilioBody();  // pre-validated + buffered at top level
 			const form = new URLSearchParams(body);
 			const purpose = url.searchParams.get('purpose') ?? '';
 			const isMeeting = url.searchParams.get('meeting') === 'true';
@@ -1657,17 +1719,27 @@ const server = createServer(async (req, res) => {
 </Response>`);
 
 		} else if (path === '/twilio/sms' && req.method === 'POST') {
-			const form = new URLSearchParams(await readBody(req));
-			const sender = form.get('From') ?? 'unknown';
-			const body = form.get('Body') ?? '';
+			const form = new URLSearchParams(getTwilioBody());  // pre-validated + buffered
+			// Sanitize: collapse newlines so user-controlled fields can't forge
+			// header lines below task: in the task file (same invariant as PR #982).
+			const sender = (form.get('From') ?? 'unknown').replace(/[\r\n]+/g, ' ');
+			const body = (form.get('Body') ?? '').replace(/[\r\n]+/g, ' ');
 			console.log(`${ts()} [SMS] from=${sender} body=${body.slice(0, 80)}`);
 			const taskId = `task-${Date.now()}`;
-			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: SMS from ${sender}: ${body}\nsource: twilio_sms\nfrom: ${sender}\n`;
+			// Field order: task: LAST so user-supplied body can't forge headers.
+			const taskContent =
+				`id: ${taskId}\n` +
+				`timestamp: ${new Date().toISOString()}\n` +
+				`source: twilio_sms\n` +
+				`from: ${sender}\n` +
+				`access_tier: owner\n` +
+				`priority: normal\n` +
+				`task: SMS from ${sender}: ${body}\n`;
 			writeFileSync(join(WORKSPACE_DIR, 'tasks', `${taskId}.txt`), taskContent);
 			twimlResponse(res, `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Message>Got it. Sutando is on it.</Message></Response>`);
 
 		} else if (path === '/twilio/status' && req.method === 'POST') {
-			const form = new URLSearchParams(await readBody(req));
+			const form = new URLSearchParams(getTwilioBody());  // pre-validated + buffered
 			const sid = form.get('CallSid') ?? '';
 			const status = form.get('CallStatus') ?? '';
 			console.log(`${ts()} [Status] ${sid} → ${status}`);
