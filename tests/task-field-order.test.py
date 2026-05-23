@@ -147,7 +147,7 @@ def test_task_bridge_write_chat_task_field_last():
     src = _src("src/task-bridge.ts")
     block_start = src.find("export function writeChatTask")
     assert block_start > 0, "task-bridge: could not find writeChatTask"
-    block = src[block_start: block_start + 600]
+    block = src[block_start: block_start + 900]
     _assert_task_last(
         block,
         ["source: chat", "channel_id: local-chat", "access_tier: owner", "priority: normal"],
