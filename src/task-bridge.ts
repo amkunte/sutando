@@ -76,10 +76,10 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 export function writeChatTask(taskDescription: string): string {
 	const taskId = `task-chat-${Date.now()}`;
 	const timestamp = new Date().toISOString();
-	// Field order: `task:` LAST so the user-supplied multi-line body
+	// Field order: the body field is LAST so the user-supplied multi-line content
 	// can't forge header fields below it. Same shape as agent-api.py's
 	// /task endpoint after PR #982; consumers (`_isVoiceTask`,
-	// `parse_priority_from_text`) stop scanning at the first `task:`.
+	// `parse_priority_from_text`) stop scanning at the first body marker.
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
