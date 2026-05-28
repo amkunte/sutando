@@ -524,62 +524,24 @@ function buildAgent(s: DiscordVoiceSession): MainAgent {
 				return { status: 'left_discord_voice' };
 			},
 		});
-		// Skill-local share_screen — full sub-2s path. The voice-server
-		// directly spawns share-screen-modal.py (--full mode) which does ALL
-		// 5 CGEvent clicks (Discord Share button + Entire Screen tab +
-		// thumbnail + Share button) in ~0.7s. No MCP, no task-bridge, no
-		// proactive-loop hop. Coords hard-coded in the python script —
-		// re-derive via macos-use refresh_traversal on the MCP-Chrome main
-		// PID if Discord/Chrome UI moves.
-		const SHARE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'share-screen-modal.py');
-		const spawnShareScreen = (source: string, mode: 'full' | 'stop') => {
-			const flag = mode === 'stop' ? '--stop' : '--full';
-			const child = spawn('python3', [SHARE_SCRIPT, flag], { stdio: 'ignore', detached: true });
-			child.on('error', (err) => console.log(`${ts()} [ShareScreen ${source}] spawn error:`, err));
-			child.unref();
-			console.log(`${ts()} [ShareScreen ${source} ${flag}] spawned PID ${child.pid}`);
-			return { status: mode === 'stop' ? 'stop_share_clicked' : 'share_screen_clicked',
-			         message: mode === 'stop' ? 'Stop-share click fired.' : 'Picker drive fired (sub-1s).' };
-		};
+		// Upstream sutando does NOT ship a screen-share implementation — it lives
+		// in the operator's private repo. Without an explicit `share_screen` tool
+		// that always returns unavailable, Gemini may silently route a "share my
+		// screen" utterance to a sibling tool (switch_tab / core summon → Zoom.app)
+		// — wrong behavior, no signal to the user. This stub guarantees a clean
+		// unavailability reply.
 		tools.push({
 			name: 'share_screen',
 			description:
-				'STRONG MATCH for any "share screen" / "share my screen" / "screen share" / "show my screen" / "屏幕共享" / "分享屏幕" / "把屏幕分享" utterance — in a Discord voice channel this is ALWAYS this tool. ' +
-				'Shares the owner\'s screen (Entire Screen mode, picker handled automatically by the proactive loop). ' +
-				'Call again to re-share even if already shared (user wants a fresh share). ' +
-				'DO NOT route share-screen utterances to switch_tab (that\'s for Chrome tab navigation) OR to summon / join_zoom (those open the Zoom desktop app — wrong app, user is in Discord). ' +
-				'To stop, use stop_share_screen tool (NOT dismiss — dismiss leaves the whole voice session).',
+				'Reply that screen share is NOT available in this build of sutando. ' +
+				'Match for any "share screen" / "share my screen" / "screen share" / "屏幕共享" / "分享屏幕" utterance. ' +
+				'In this (upstream) build the share-screen implementation is not installed; the tool always returns unavailable so the user gets an explicit message instead of a silent no-op.',
 			parameters: z.object({}),
 			execution: 'inline',
-			pendingMessage: 'Setting up screen share.',
-			async execute() { return spawnShareScreen('share_screen', 'full'); },
-		});
-		// Skill-local override: the core `summon` tool opens Zoom.app — wrong
-		// behavior when the user is in a Discord voice channel saying "summon"
-		// or "share my screen". Redirect those utterances to share_screen.
-		tools.push({
-			name: 'summon',
-			description:
-				'In a Discord voice channel context, "summon" / "share my screen" / "start zoom" / "let me see your screen" / "show me your screen" all mean: share the Discord screen via share_screen. ' +
-				'Call share_screen directly instead of this tool whenever possible. ' +
-				'This override exists only because the core summon tool would otherwise open Zoom.app — wrong app when the user is in Discord.',
-			parameters: z.object({}),
-			execution: 'inline',
-			async execute() { return spawnShareScreen('summon→share_screen', 'full'); },
-		});
-		// Skill-local stop_share_screen — same fast path. Single CGEvent
-		// click on the Discord voice-strip button at (338, 809) which
-		// morphs to "Stop Streaming" when a share is active.
-		tools.push({
-			name: 'stop_share_screen',
-			description:
-				'STRONG MATCH for any "stop share" / "stop sharing" / "stop screen share" / "unshare" / "停止分享" / "停止共享" / "别分享了" utterance. ' +
-				'Stops the active Discord screen share by clicking the Stop Streaming button. Voice channel stays connected. ' +
-				'No-op if not currently sharing.',
-			parameters: z.object({}),
-			execution: 'inline',
-			pendingMessage: 'Stopping screen share.',
-			async execute() { return spawnShareScreen('stop_share_screen', 'stop'); },
+			async execute() {
+				return { status: 'unavailable',
+				         message: 'Screen share is not available in this build of sutando — the share-screen implementation lives in the operator\'s private repo and is not installed. Tell the user briefly that screen share is unavailable in this version.' };
+			},
 		});
 		const seen = new Set(tools.map(t => t.name));
 		for (const t of inlineTools) {
