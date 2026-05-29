@@ -30,9 +30,11 @@ bash src/startup.sh
 5. **Environment** — macOS version, Node.js version, Claude Code version
 
 **Bonus (highly valued):**
-- A POC script under `scripts/test-*.sh` that reproduces the bug programmatically
-- Before/after commit hashes if you can identify when it regressed
+- A validation script under `scripts/test-*.sh` that reproduces the bug programmatically
+- A commit hash for the suspected origin (helpful for both regressions and bugs that have been there since the code was written)
 - The specific tool call or function that failed (check voice-agent.log for `[Tool]` entries)
+
+See [issue #1339](https://github.com/sonichi/sutando/issues/1339) for a recent worked example combining all three.
 
 ### Add a skill
 Skills are modular capabilities in `skills/`. Each skill has:
@@ -51,11 +53,15 @@ See existing skills for examples. Install with `bash skills/install.sh`.
 
 ## Before opening any PR or issue
 
-Six checks save a lot of churn for both sides:
+Five checks save a lot of churn for both sides:
 
 ### 1. Search for existing PRs / issues first
 
 The same fix has been opened in 10+ different PRs before (e.g. the bare-except narrow in `skills/quota-tracker/scripts/read-quota.py` had 10 attempts across multiple contributors before one landed). Before you open:
+
+**If you're running Sutando** — easiest path: just ask your Sutando agent ("are there existing PRs or issues for X?" / "has anyone already proposed a fix for the foo bug?"). Sutando will run the `gh` searches below across open + recently-closed state, dedup by topic, and summarize what's already in flight or shipped. Saves the cognitive load of crafting the right search query yourself.
+
+**If you prefer the raw commands**:
 
 ```bash
 # Open + recently closed PRs that closed/referenced the same issue
@@ -108,25 +114,16 @@ git show upstream/main:path/to/file.py | grep -n "the buggy line"
 
 If the bug is already fixed upstream, the PR is unnecessary. Save yourself + reviewer time.
 
-### 5. Respect the V1-workspace hold list
+### 5. If your bot is contributing on your behalf, supervise it
 
-The V1 workspace contract migration (3-space Code / Workspace / Memory model) is in design. PRs that touch the following are currently held — please don't open new ones in these areas until the contract is finalized:
+A Sutando bot (or any LLM agent) can crank out PRs much faster than a maintainer can review them. Easy way to flood the queue with 50–100+ PRs in a day — most either duplicate each other, address bugs already fixed upstream, or fix something tiny that should have been bundled. Even when individually correct, the volume burns the review channel and pushes real-user issues out of the queue.
 
-- `src/workspace_default.py` / `src/workspace_default.ts` resolution logic
-- `scripts/sync-memory.sh` path probing (`SUTANDO_MEMORY_DIR` / `SUTANDO_PRIVATE_DIR`)
-- new `claude_home_path()` helpers or similar path-derivation utilities
-- migration scaffolding in `skills/agent-registry/` paths
+Concrete norms:
 
-If unsure, ask in #design before opening.
-
-### 6. After `update-branch`, CLA-Assistant may not auto-rerun
-
-If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branch`), the new HEAD commit may show `license/cla` PENDING and never resolve. Known issue. In most cases `.github/workflows/cla-recheck-on-push.yml` will auto-fire the recheck comment for you on every push, but if the workflow is disabled or fails, the manual workarounds are (in order):
-
-1. Wait — sometimes the bot catches up in ~10 minutes
-2. Comment `@cla-assistant check` on the PR
-3. Close and reopen the PR (forces a `pull_request.reopened` webhook)
-4. Ask a maintainer to admin-merge if you've verified the underlying CLA is signed
+- **Cap your in-flight PRs.** Land or close existing ones before opening more — don't let the queue balloon faster than maintainers can review.
+- **Always read the bot's diff before pushing.** "I trust the agent" is not enough — agents miss conventions, hallucinate referenced files (see item 1), and sometimes regenerate unrelated areas.
+- **No "drive-by" repo-wide refactors.** If the agent suggests one, open ONE small PR with the proposal first, get sign-off, then expand.
+- **Take responsibility for what your bot ships.** PRs authored by a bot you operate are *your* PRs — your CLA, your review feedback to address, your closes-link to file.
 
 ## Pull requests
 
@@ -137,28 +134,12 @@ If your PR was BEHIND main and you click "Update branch" (or `gh pr update-branc
 - Check for lazy imports if your code reads from `.env` — static ESM imports resolve before module-level code runs
 
 ### Review process
-PRs are reviewed by one of the Sutando bot instances (MacBook or Mac Mini). Reviews check for:
+PRs are reviewed by a maintainer (or a maintainer's bot). Reviews check for:
 - Correctness and test coverage
 - Import strategy (lazy vs static — avoid breaking env var reads)
 - Default-value changes that could affect existing behavior
 - Security: no hardcoded credentials, sandbox compliance for non-owner paths
 - No unnecessary code — don't add features beyond what was asked
-
-## Architecture
-
-```
-Voice (Gemini Live) <-> File Bridge (tasks/results) <-> Claude Code (brain)
-                                                         |
-                                              8 channels: voice, phone,
-                                              Discord, Telegram, context
-                                              drop, iMessage, WhatsApp, email
-```
-
-Two machines coordinate via Discord:
-- **MacBook** — travels with the owner
-- **Mac Mini** — always-on at home
-
-See README.md for the full architecture diagram.
 
 ## Community
 
