@@ -388,7 +388,7 @@ def main():
     if args.verbose:
         print(f"Found {len(listings)} listings on page")
 
-    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     matches = 0
     new_urls = []
     for li in listings:
