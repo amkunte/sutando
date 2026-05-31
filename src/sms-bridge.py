@@ -27,6 +27,11 @@ Optional:
     SMS_BRIDGE_POLL_SECS  (default 2)
     SMS_BRIDGE_MAX_BODY   (default 1500 — Twilio splits >1600)
 """
+# `dict | None` (PEP 604) below is evaluated at def time, which raises
+# TypeError on Python 3.9 (the system python3 here). Defer annotation
+# evaluation so the module loads cleanly on 3.9+.
+from __future__ import annotations
+
 import base64
 import json
 import os
