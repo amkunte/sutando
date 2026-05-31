@@ -12,6 +12,11 @@ Notifies on the first sight of any listing matching criteria.json:
 - SMS via Twilio REST (TWILIO_* + OWNER_NUMBER from .env)
 - Telegram via results/proactive-{ts}.txt (telegram-bridge picks it up)
 """
+# The `int | None` / `str | None` (PEP 604) return annotations below are
+# evaluated at def time, which raises TypeError on Python 3.9. Defer all
+# annotation evaluation so the module loads cleanly on 3.9+.
+from __future__ import annotations
+
 import argparse
 import collections
 import datetime as dt
