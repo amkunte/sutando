@@ -24,10 +24,28 @@ WORKSPACE="${WORKSPACE/#\~/$HOME}"
 cd "$REPO_DIR"
 
 ts=$(date +%s)
+_notified=0
 notify() {
   local msg="$1"
   printf '%s\n' "$msg" > "${WORKSPACE}/results/proactive-upstream-sync-${ts}.txt"
+  _notified=1
 }
+
+# Safety net: under `set -e` the script can exit non-zero from a command that
+# isn't wrapped in its own `notify` call (e.g. a failed `git checkout main`),
+# leaving the owner with no notification — a silent failure (observed
+# 2026-05-31: a diverged-`main` run produced exit 1 and no DM). This EXIT trap
+# guarantees that ANY non-zero exit which didn't already notify still writes a
+# fallback notification. The `_notified` guard prevents double-delivery when a
+# path already called notify(); it no-ops on the clean (exit 0) paths.
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$_notified" -eq 0 ]; then
+    printf '%s\n' "❌ Upstream sync exited with code ${rc} and no specific message — likely a failed git operation (checkout/fetch) or a diverged \`main\`. Run \`bash skills/upstream-sync/scripts/sync.sh\` manually to see the error." \
+      > "${WORKSPACE}/results/proactive-upstream-sync-${ts}.txt"
+  fi
+}
+trap on_exit EXIT
 
 # Remember where we started so we can switch back at the end.
 start_branch=$(git rev-parse --abbrev-ref HEAD)
