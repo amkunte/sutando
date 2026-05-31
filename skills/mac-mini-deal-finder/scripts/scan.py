@@ -9,6 +9,11 @@ Notifies on the first sight of any listing matching criteria.json:
 - SMS via Twilio REST (TWILIO_* + OWNER_NUMBER from .env)
 - Telegram via results/proactive-{ts}.txt (telegram-bridge picks it up)
 """
+# `int | None` / `str | None` (PEP 604) below are evaluated at def time, which
+# raises TypeError on Python 3.9 (the system python3 here). Defer annotation
+# evaluation so the module loads cleanly on 3.9+.
+from __future__ import annotations
+
 import argparse
 import datetime as dt
 import html
