@@ -16,9 +16,11 @@ ARGUMENTS: $ARGUMENTS
 
 Collect from each source (skip any that aren't configured):
 
-1. **Email** — Run `gws gmail +triage` to get unread inbox. Summarize top 5 by priority. Flag anything urgent.
+1. **Email** — Use the Gmail MCP tool `mcp__claude_ai_Gmail__search_threads` with query `is:unread in:inbox` to get the unread inbox. Summarize top 5 by priority. Flag anything urgent.
 
-2. **Calendar** — Run `gws calendar +agenda --today` (table output). If you need JSON for parsing, use `gws calendar +agenda --today --format json`. List meetings with times. For each: who's attending, what it's about. Flag any travel (flights, OOO).
+2. **Calendar** — Use the Google Calendar MCP tool `mcp__claude_ai_Google_Calendar__list_events` with `startTime`/`endTime` spanning today in `America/Los_Angeles`. Enumerate non-primary calendars first via `mcp__claude_ai_Google_Calendar__list_calendars` (Family, group rides, etc.) and query each. List meetings with times. For each: who's attending, what it's about. Flag any travel (flights, OOO).
+
+> **Data source note:** Email + Calendar use the built-in Google MCP connectors, not the retired `gws` CLI (uninstalled 2026-05; no install source on this host). The MCP path requires the claude.ai Google connectors to be authenticated in the running session — present in this interactive session, but may be absent in a headless/cron-spawned one. If a connector tool is unavailable, skip that source gracefully and note it in the briefing rather than failing the whole run.
 
 3. **Discord** — Read recent messages from `logs/discord-bridge.log` (tail ~100 lines). Summarize anything actionable from overnight. Reference channel ID mapping at `$SUTANDO_MEMORY_DIR/reference_discord_channels.md`. Only surface messages NOT already replied to by the bridge.
 
