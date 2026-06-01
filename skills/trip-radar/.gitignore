@@ -2,3 +2,5 @@
 state/*.json
 !state/*.example.json
 state/history/
+state/corpus/*
+!state/corpus/.gitkeep

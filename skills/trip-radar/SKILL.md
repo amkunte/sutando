@@ -58,3 +58,11 @@ The procedure is fully prescribed in **`scan-prompt.md`** — the agent follows 
 ## Privacy
 
 All email parsing is local (Gmail MCP on the user's own account); the preference model and itineraries live only in the workspace. No third-party trip aggregator is involved.
+
+## Per-trip chat & document corpus (web)
+
+The `/trips` page gives each trip a chat box + 📎 attach control:
+- **Chat** — ask anything about that trip ("must-visit in Nubra?", "authentic parathas in Delhi?"). The page POSTs to `/trips/chat`; the core agent answers async using that trip's record + its corpus + web research, writing to `results/tripchat-<id>.txt` (the page polls `/trips/chat-result`). Not delivered via any bridge.
+- **Attach** — upload a PDF/image/doc; it's saved to `state/corpus/<trip_id>/` (base64 JSON, no multipart) and an ingest task extracts its facts (Read handles PDF+images) into `state/corpus/<trip_id>/_corpus.md` and, when it carries booking/itinerary detail, into the trip's record. This is how PDF-only e-tickets (which the Gmail tools can't read) get into the trip.
+
+When you (core) pick up a `from: trip-chat` or `from: trip-ingest` task, follow its self-describing body verbatim and write the result to the `results/tripchat-<id>.txt` path it names.
