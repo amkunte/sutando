@@ -26,9 +26,11 @@ Collect from each source (skip any that aren't configured):
 
 5. **System status** — Run `python3 src/health-check.py`. Report any issues.
 
-6. **Daily insight** — Run `python3 src/daily-insight.py`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
+6. **Daily insight** — Run `python3 src/daily-insight.py --stdout-only`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
 
-7. **Friction check** — Run `python3 src/friction-detector.py`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
+7. **Friction check** — Run `python3 src/friction-detector.py --stdout-only`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
+
+> **Why `--stdout-only`:** these scripts default to writing `results/insight-*.txt` / `results/friction-*.txt`, which the Telegram/Discord bridge polls and delivers as SEPARATE DMs — fragmenting the briefing into 3 messages. `--stdout-only` prints the content (for you to fold inline here) without writing a deliverable file, so the owner gets ONE consolidated briefing. Do NOT remove the flag.
 
 ## How to deliver
 
