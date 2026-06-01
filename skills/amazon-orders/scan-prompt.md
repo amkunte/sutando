@@ -53,6 +53,8 @@ Group by `(item-title, channel, ordered_date)`. For each group:
 
 Whole Foods / Amazon Fresh orders don't have item names in the subject — use the date as the disambiguator (one order per day per channel); their `id` is e.g. `whole-foods-<ordered_date>`.
 
+**Preserve manual marks.** Load the existing `orders.json` first. If an order there has `delivery_source: "manual"`, keep its `delivered` status + `delivered_date` + `delivery_source` even when no "Delivered:" email exists — the user set it on the web UI. A scan must never revert a manually-delivered order back to "shipped".
+
 ## Diff vs previous scan
 
 Snapshot the prior `orders.json` to `state/history/<previous-scan-date>.json` (skip if a snapshot from that date already exists). In the new `scan_history` entry, compute:
