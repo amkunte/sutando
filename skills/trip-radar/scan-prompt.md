@@ -17,12 +17,19 @@ If prefs exist, do a light refresh: fold in any new lodging/dining signal since 
 
 ## Phase A — sync itinerary
 
-Gmail queries (paginate; default window: `newer_than:400d` so you catch trips booked far ahead):
+**Scan scope — search ALL mail, not just the inbox.** Travel confirmations are routinely archived or filed into labels (e.g. `2026_Travel`, `Travel_Imp`, `NYC`), and a far-ahead booking's confirmation is *old* — so an inbox-only or tight-recency scan misses real upcoming trips (observed 2026-06-01: a SFO→Delhi booking filed in `2026_Travel` from 4 months prior was missed). Two rules:
+1. **Cover labels + archived mail.** Append ` in:anywhere` to the queries below (includes archived + all labels; excludes only Spam/Trash). ALSO run `list_labels` and, for any label whose name matches `travel|trip|vacay|vacation|<year>` (e.g. `2026_Travel`, `Travel_Imp`), run a `label:"<name>"` sweep over the same senders/subjects.
+2. **Don't gate on email recency.** Use a wide window (`newer_than:1y`) or none, and decide "upcoming" by the **travel dates inside the email**, not by when the email arrived. A confirmation booked months ago for a future trip MUST surface.
+
+Gmail queries (paginate; add ` in:anywhere`; also sweep travel labels per rule 1):
 ```
-from:(noreply@united.com OR delta.com OR aa.com OR alaskaair.com OR southwest.com OR jetblue.com OR flyfrontier.com OR ana.co.jp OR qatarairways.com OR emirates.com OR airindia.com) subject:(confirmation OR itinerary OR "e-ticket" OR "your trip" OR "boarding")
-from:(marriott.com OR hilton.com OR hyatt.com OR ihg.com OR booking.com OR hotels.com OR airbnb.com) subject:(confirmation OR reservation OR "your stay" OR receipt)
-from:(hertz.com OR avis.com OR enterprise.com OR turo.com OR amtrak.com OR trainline.com) subject:(confirmation OR reservation OR itinerary)
+from:(noreply@united.com OR delta.com OR aa.com OR alaskaair.com OR southwest.com OR jetblue.com OR ana.co.jp OR qatarairways.com OR emirates.com OR airindia.com OR aircanada.ca OR amadeus.com OR amexgbt.com OR mytrips.amexgbt.com) subject:(confirmation OR itinerary OR "e-ticket" OR "your trip" OR booking OR ticket OR boarding) in:anywhere newer_than:1y
+from:(marriott.com OR hilton.com OR hyatt.com OR ihg.com OR booking.com OR hotels.com OR airbnb.com OR fourseasons.com OR tajhotels.com OR oberoihotels.com OR xanterra.com) subject:(confirmation OR reservation OR "your stay" OR receipt) in:anywhere newer_than:1y
+from:(hertz.com OR avis.com OR enterprise.com OR turo.com OR amtrak.com OR trainline.com) subject:(confirmation OR reservation OR itinerary) in:anywhere newer_than:1y
+label:"2026_Travel" OR label:"Travel_Imp"   (+ any travel/trip/vacay label from list_labels)
 ```
+Also catch travel-agent/aggregator bookings (Amex GBT/TripIt/Aeroplan) and forwarded confirmations (subject `Fwd:`), which often live only in a label, never the inbox.
+
 For each confirmation, extract: type (flight/hotel/car/train/lodging), confirmation #, provider, start/end datetimes + timezone, origin/destination (airport codes + city), and price if shown. Read the body via `get_thread` when the subject is truncated.
 
 **Group segments into trips.** A trip = a contiguous away-from-home window. Cluster segments whose dates overlap/adjoin and whose location is the same metro. Derive `trip.destination` (primary city), `trip.start`/`trip.end`, and attach segments. Use `scripts/build_trip_state.py` to validate + merge the extracted JSON into `state/trips.json` (it preserves `trip_id`, dedups by confirmation #, and snapshots the prior file to `state/history/<date>.json`).
