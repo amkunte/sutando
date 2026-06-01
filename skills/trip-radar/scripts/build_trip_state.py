@@ -23,6 +23,7 @@ py39-safe: `from __future__ import annotations`, timezone.utc (not datetime.UTC)
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,18 +43,46 @@ def _load(path: Path) -> dict:
         return {"trips": [], "last_scan": None}
 
 
+def _leg_route(seg: dict) -> str:
+    """A route/flight signature that distinguishes the legs of one booking.
+    Prefers explicit origin/destination; falls back to a flight code parsed
+    from the provider/name (e.g. 'Air India AI2479 (First)' → 'AI2479') so the
+    two domestic legs of a round-trip that share a confirmation# and carry NO
+    from/to fields don't collapse to the same key.
+    """
+    o = seg.get("from") or seg.get("origin") or ""
+    d = seg.get("to") or seg.get("destination") or ""
+    if o or d:
+        return f"{o}>{d}"
+    m = re.search(r"[A-Z]{2}\s?\d{2,4}", seg.get("provider") or seg.get("name") or "")
+    return m.group(0).replace(" ", "") if m else ""
+
+
 def _seg_key(seg: dict) -> str:
-    """Stable identity of a *leg*. Includes the route, not the date, so:
+    """Stable identity of a *leg*. Includes the route/flight signature, not the
+    date, so:
     - the two legs of a round-trip (same confirmation#, different route) stay
       DISTINCT (keying on conf# alone collided them into one),
     - a reschedule (same conf# + route, new date) keeps the same key → reads as
       a status/time change, not a drop + add.
+    When conf# is present but no route/flight signature can be derived, the start
+    date is the last-resort differentiator (rare; only when both are missing).
     """
     conf = (seg.get("confirmation") or "").strip().upper()
-    route = f"{seg.get('from') or ''}>{seg.get('to') or ''}"
-    if conf:
+    route = _leg_route(seg)
+    if conf and route:
         return f"conf:{conf}|{seg.get('type')}|{route}"
+    if conf:
+        return f"conf:{conf}|{seg.get('type')}|{(seg.get('start') or '')[:10]}"
     return f"{seg.get('type')}|{(seg.get('start') or '')[:10]}|{route}"
+
+
+def _seg_uid(trip_id: str, seg: dict) -> str:
+    """Deterministic, stable per-segment id used as the Google Calendar dedup
+    marker. Same segment → same uid across runs, so the calendar sync can match
+    an existing event structurally (by `[trip-radar:<uid>]` in its description)
+    instead of relying on fuzzy time/route matching."""
+    return "tr-" + _slug(trip_id) + "-" + _slug(_seg_key(seg))
 
 
 def _slug(s: str) -> str:
@@ -143,6 +172,13 @@ def merge(extracted: list[dict], prior: dict) -> tuple[dict, list, list]:
     for i, p in enumerate(priors):
         if i not in used and (p.get("end") or p.get("start") or "")[:10] >= today:
             merged.append(p)
+
+    # Stamp deterministic per-segment uids (the calendar-sync dedup key) on
+    # every trip — matched, new, and carried-forward alike.
+    for t in merged:
+        tid = t.get("trip_id") or _trip_id(t)
+        for s in t.get("segments", []):
+            s["uid"] = _seg_uid(tid, s)
 
     out = {"last_scan": datetime.now(timezone.utc).isoformat(),
            "trips": sorted(merged, key=lambda t: t.get("start", ""))}
