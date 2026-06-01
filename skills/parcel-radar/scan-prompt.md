@@ -37,7 +37,9 @@ subject:("your order has shipped" OR "has shipped" OR "on its way" OR "order is 
 from:(shopifyemail.com OR bestbuy.com OR target.com OR walmart.com OR apple.com OR nike.com OR etsy.com OR ebay.com OR chewy.com OR rei.com OR newegg.com OR bhphotovideo.com OR uniqlo.com OR wayfair.com) subject:(shipped OR shipment OR "on its way" OR tracking OR "out for delivery" OR delivered) in:anywhere newer_than:90d
 ```
 
-From each store email extract: **merchant** (brand from sender domain or email branding — e.g. `bestbuy.com` → "Best Buy"; Shopify shops use the shop's name in the From display), **item** (product name from subject/body — truncate to a readable phrase), and any **carrier + tracking number** present. Ignore marketing/promo mail (no order/tracking content). Skip Amazon.
+From each store email extract: **merchant** (brand from sender domain or email branding — e.g. `bestbuy.com` → "Best Buy"; Shopify shops use the shop's name in the From display), **item** (product name from subject/body — truncate to a readable phrase), and any **carrier + tracking number** present. Skip Amazon.
+
+**Reject promo/false-positive mail.** Subject keywords like "shipped" appear in marketing too. Only create a parcel from a store email if it contains a concrete shipment signal — a **tracking number**, OR an explicit per-order "your order #… has shipped / is on its way / out for delivery" with an order id. Discard "sale ends", "free shipping", "ships free", newsletters, and pre-shipment order *confirmations* (no tracking, status still "ordered") — those are not in-transit parcels.
 
 ## Merge the two sources
 
@@ -46,6 +48,7 @@ From each store email extract: **merchant** (brand from sender domain or email b
 - A carrier email with no matching store email → a parcel with status known but `merchant`/`item` unknown (set `merchant: "(unknown)"`, best-effort `item`).
 - **Dedup id**: stable hash of the tracking number; when there's no tracking #, hash `merchant|item|shipped_date`.
 - **Status precedence** when multiple emails exist for one parcel: `delivered > out_for_delivery > in_transit > shipped > ordered`; `exception` overrides unless a later `delivered` exists.
+- **Carrier emails are authoritative for status/ETA.** When a carrier and a store email disagree, take status, `est_delivery`, and `last_update` from the carrier (it reflects the live network state); take `merchant` + `item` from the store. Never downgrade a carrier "out_for_delivery"/"delivered" to a store's older "shipped".
 
 ## Diff vs previous scan
 
