@@ -1,0 +1,3 @@
+# Personal runtime state — never commit (parcel/merchant/tracking data)
+state/parcels.json
+state/history/
