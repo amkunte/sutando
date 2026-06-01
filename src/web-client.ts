@@ -3884,6 +3884,12 @@ function renderTripRadarHtml(rawJson: string): string {
 			${renderTour(t.tour)}
 			${renderRoadItin(t.road_itinerary)}
 			${renderSuggestions(t.suggestions)}
+			${upcoming ? `<div class="tripcal" data-trip="${escapeHtml(t.trip_id || '')}">
+				<div class="sug-h">🗓 Google Calendar</div>
+				<div class="cal-note">Cross-checks every flight & hotel against your calendar, then adds any missing ones and corrects wrong times — timezone-correct (the auto-add from Gmail often isn't).</div>
+				<div class="tc-row"><button class="tc-ask" onclick="calSync(this)">Check &amp; sync to Calendar</button></div>
+				<div class="cal-log"></div>
+			</div>` : ''}
 			<div class="tripchat" data-trip="${escapeHtml(t.trip_id || '')}">
 				<div class="sug-h">💬 Chat about this trip · 📎 attach docs to its memory</div>
 				<div class="tc-log"></div>
@@ -3937,6 +3943,9 @@ function renderTripRadarHtml(rawJson: string): string {
   .tour .tk { color: #8899a6; min-width: 92px; } .tour .tv { color: #d8d8e2; }
   ol.roaditin { margin: 4px 0 0 18px; padding: 0; } ol.roaditin li { font-size: 12.5px; color: #d8d8e2; padding: 3px 0; }
   .roaditin .rid { color: #8899a6; font-variant-numeric: tabular-nums; } .roaditin .ris { color: #4ecca3; font-weight: 600; } .roaditin .rid2 { color: #b9b9c6; }
+  .tripcal { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #262630; }
+  .cal-note { font-size: 12px; color: #8a8a98; margin: 4px 0 8px; }
+  .cal-log { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; } .cal-log:empty { display: none; }
   .tripchat { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #262630; }
   .tc-log { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; max-height: 280px; overflow-y: auto; }
   .tc-log:empty { display: none; }
@@ -3970,6 +3979,8 @@ function tcPoll(task,id,tries){tries=tries||0;if(tries>150){var e=document.getEl
  fetch('/trips/chat-result?task='+encodeURIComponent(task)).then(function(r){return r.json();}).then(function(j){var e=document.getElementById(id);if(j.ready&&e){e.lastChild.textContent=j.answer;}else{setTimeout(function(){tcPoll(task,id,tries+1);},2000);}}).catch(function(){setTimeout(function(){tcPoll(task,id,tries+1);},2000);});}
 function tripChat(el){var box=el.closest('.tripchat');var trip=box.getAttribute('data-trip');var inp=box.querySelector('.tc-in');var log=box.querySelector('.tc-log');var q=(inp.value||'').trim();if(!q)return;inp.value='';tcAppend(log,'you',q);var id=tcAppend(log,'bot','…');
  fetch('/trips/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,message:q})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');document.getElementById(id).lastChild.textContent=j.answer;}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});}
+function calSync(el){var box=el.closest('.tripcal');var trip=box.getAttribute('data-trip');var log=box.querySelector('.cal-log');var ob=el.textContent;el.disabled=true;el.textContent='…syncing';var id=tcAppend(log,'bot','Checking your calendar + adding missing / fixing times (timezone-correct)…');
+ fetch('/trips/calendar-sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');tcPoll(j.task,id);el.disabled=false;el.textContent='Re-sync';}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;el.disabled=false;el.textContent=ob;});}
 function tripAttach(input){var box=input.closest('.tripchat');var trip=box.getAttribute('data-trip');var log=box.querySelector('.tc-log');var f=input.files[0];if(!f)return;var id=tcAppend(log,'bot','📎 ingesting '+f.name+' …');var rd=new FileReader();rd.onload=function(){var b64=String(rd.result).split(',')[1];fetch('/trips/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,filename:f.name,contentB64:b64})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');tcPoll(j.task,id);}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});};rd.readAsDataURL(f);input.value='';}
 </script>
 </div></body></html>`;
@@ -4864,6 +4875,27 @@ const server = createServer((req, res) => {
 				writeOwnerActivity('web-tripingest', `Attach ${fname} → ${tripId}`);
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true, task: String(ts), filename: fname }));
+			} catch (e: any) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e?.message || 'bad request' })); }
+		});
+		return;
+	}
+	// Calendar cross-check + sync (TZ-correct) — runs through the core agent
+	// (the Google Calendar MCP lives in the agent session, not here). The page
+	// polls /trips/chat-result for the summary.
+	if (url.pathname === '/trips/calendar-sync' && req.method === 'POST') {
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const b = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+				const tripId = tripSafe(b.trip_id);
+				if (!tripId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'trip_id required' })); return; }
+				const ts = Date.now();
+				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-calsync\naccess_tier: owner\ntask: Sync trip "${tripId}" to Google Calendar with CORRECT timezones.\n\n1. Read that trip's segments from skills/trip-radar/state/trips.json.\n2. For each flight/hotel/car/train segment, use the Google Calendar MCP (mcp__claude_ai_Google_Calendar__list_events) to find a matching event near its date on the owner's primary calendar.\n3. For a MISSING segment: create it (mcp__claude_ai_Google_Calendar__create_event) as a timezone-correct event — use the segment's local start/end and set the event timeZone to match the segment's offset region (e.g. +05:30 → Asia/Kolkata, -07:00 → America/Los_Angeles). Flights = timed event (dep→arr, title like "AI2479 DEL→LEH"); hotels = check-in→check-out.\n4. For a MISMATCH (event exists but the time/date is wrong vs the segment): correct it with mcp__claude_ai_Google_Calendar__update_event to the segment's real local time + correct timeZone.\n5. Do NOT duplicate events that are already correct. Be conservative; never delete unrelated events.\n6. Write a concise per-segment summary (added / fixed / already-ok, with the corrected times) to results/tripchat-${ts}.txt — page polls it; do not deliver via any bridge.\n`;
+				writeFileSync(`tasks/task-${ts}.txt`, taskBody);
+				writeOwnerActivity('web-tripcalsync', `Calendar sync (${tripId})`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true, task: String(ts) }));
 			} catch (e: any) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e?.message || 'bad request' })); }
 		});
 		return;
