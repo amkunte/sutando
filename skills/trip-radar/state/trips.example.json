@@ -10,13 +10,84 @@
       "first_seen": "2026-06-01",
       "last_seen": "2026-06-01",
       "segments": [
-        {"type": "flight", "provider": "United", "confirmation": "ABC123",
-         "start": "2026-06-12T08:30:00-07:00", "end": "2026-06-12T17:05:00-04:00",
-         "from": "SFO", "to": "JFK", "price": 612.0, "status": "confirmed"},
-        {"type": "flight", "provider": "United", "confirmation": "ABC123",
-         "start": "2026-06-15T18:00:00-04:00", "end": "2026-06-15T21:20:00-07:00",
-         "from": "JFK", "to": "SFO", "price": null, "status": "confirmed"}
-      ]
+        {
+          "type": "flight",
+          "provider": "United",
+          "confirmation": "ABC123",
+          "start": "2026-06-12T08:30:00-07:00",
+          "end": "2026-06-12T17:05:00-04:00",
+          "from": "SFO",
+          "to": "JFK",
+          "price": 612.0,
+          "status": "confirmed"
+        },
+        {
+          "type": "flight",
+          "provider": "United",
+          "confirmation": "ABC123",
+          "start": "2026-06-15T18:00:00-04:00",
+          "end": "2026-06-15T21:20:00-07:00",
+          "from": "JFK",
+          "to": "SFO",
+          "price": null,
+          "status": "confirmed"
+        }
+      ],
+      "suggestions": {
+        "hotels": [
+          {
+            "name": "Park Hyatt New York",
+            "url": "https://www.hyatt.com/park-hyatt/nycph",
+            "area": "Midtown (57th St)",
+            "price": "$$$$",
+            "why": "your Hyatt-Globalist chain; walkable to Midtown offices"
+          },
+          {
+            "name": "The Greenwich Hotel",
+            "url": "https://www.thegreenwichhotel.com",
+            "area": "TriBeCa",
+            "price": "$$$$",
+            "why": "quiet, design-forward, near downtown dinners"
+          },
+          {
+            "name": "Hyatt Times Square",
+            "url": "https://www.hyatt.com",
+            "area": "Times Square",
+            "price": "$$$",
+            "why": "points-friendly fallback in your loyalty program"
+          }
+        ],
+        "restaurants": [
+          {
+            "name": "Sushi Noz",
+            "url": "https://www.sushinoz.com",
+            "area": "Upper East Side",
+            "cuisine": "Edomae sushi",
+            "why": "matches your sushi lean; haven't been"
+          },
+          {
+            "name": "Rezdôra",
+            "url": "https://www.rezdora.nyc",
+            "area": "Flatiron",
+            "cuisine": "Emilia-Romagna pasta",
+            "why": "regional Italian, chef-driven"
+          },
+          {
+            "name": "Semma",
+            "url": "https://www.semma.nyc",
+            "area": "West Village",
+            "cuisine": "South Indian",
+            "why": "modern Indian, Michelin"
+          }
+        ],
+        "activities": [
+          {
+            "name": "ICP photography exhibitions",
+            "url": "https://www.icp.org",
+            "why": "fits your photography interest; 1 marquee thing"
+          }
+        ]
+      }
     }
   ]
 }
