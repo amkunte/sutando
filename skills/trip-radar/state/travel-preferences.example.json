@@ -1,0 +1,27 @@
+{
+  "last_pref_refresh": "2026-06-01",
+  "lodging": {
+    "preferred_chains": ["Four Seasons", "Park Hyatt", "Hyatt"],
+    "loyalty": [{"program": "World of Hyatt", "tier": "Globalist", "confidence": "high"}],
+    "area_pattern": "central/walkable, near client offices or waterfront",
+    "price_tier": "luxury",
+    "must_have": ["gym", "lounge access"],
+    "confidence": "high"
+  },
+  "dining": {
+    "cuisines": ["Japanese/sushi", "regional Italian", "modern Indian"],
+    "price_level": "$$$-$$$$",
+    "vibe": "chef-driven, reservations; occasional great hole-in-the-wall",
+    "dietary": [],
+    "confidence": "medium"
+  },
+  "activities": {
+    "profile": ["photography/landscape", "aviation", "fine dining", "occasional museums"],
+    "pace": "relaxed-with-1-marquee-thing-per-day"
+  },
+  "logistics": {
+    "airlines": ["United (1K)", "ANA"],
+    "seat": "aisle, exit row or business",
+    "rental_car": ["Hertz"]
+  }
+}
