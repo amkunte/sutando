@@ -49,8 +49,9 @@ Group by `(item-title, channel, ordered_date)`. For each group:
 - `shipped_date`: from the latest "Shipped:" email; null if not yet shipped
 - `delivered_date`: from the "Delivered:" email; null if not yet delivered
 - `status`: highest reached state — `delivered > out_for_delivery > shipped > ordered`
+- `id`: REQUIRED, non-empty — a stable slug of the first few item-title words + `ordered_date` (e.g. `blossom-grid-silicone-2026-05-15`). The web UI keys off `id` (the manual "delivered?" mark looks orders up by it), so an order with no `id` cannot be acted on. Keep the same `id` for an order across scans so its state is stable.
 
-Whole Foods / Amazon Fresh orders don't have item names in the subject — use the date as the disambiguator (one order per day per channel).
+Whole Foods / Amazon Fresh orders don't have item names in the subject — use the date as the disambiguator (one order per day per channel); their `id` is e.g. `whole-foods-<ordered_date>`.
 
 ## Diff vs previous scan
 
