@@ -3847,6 +3847,20 @@ function renderTripRadarHtml(rawJson: string): string {
 		return block('🏨 Hotels', sug.hotels) + block('🍽 Restaurants', sug.restaurants) + block('🎟 Activities', sug.activities);
 	};
 
+	const renderTour = (tr: any) => {
+		if (!tr || typeof tr !== 'object') return '';
+		const rows = [
+			['Operator', tr.operator], ['Route', tr.route], ['Max altitude', tr.max_altitude],
+			['Distance', tr.distance], ['Bike', tr.bike], ['Lodging', tr.lodging],
+		].filter(r => r[1]).map(r => `<div class="trow"><span class="tk">${escapeHtml(r[0])}</span><span class="tv">${escapeHtml(String(r[1]))}</span></div>`).join('');
+		const docLink = tr.doc ? ` · <a href="${escapeHtml(tr.doc)}" target="_blank" rel="noopener">full itinerary doc ↗</a>` : '';
+		return `<div class="tour"><div class="sug-h">🏍 ${escapeHtml(tr.name || 'Tour')}${tr.dates ? ' — ' + escapeHtml(tr.dates) : ''}${docLink}</div>${rows}</div>`;
+	};
+	const renderRoadItin = (items: any[]) => {
+		if (!Array.isArray(items) || !items.length) return '';
+		const lis = items.map((it: any) => `<li><span class="rid">${escapeHtml((it.date || '').slice(5))}</span> <span class="ris">${escapeHtml(it.stop || '')}</span> — <span class="rid2">${escapeHtml(it.detail || '')}</span></li>`).join('');
+		return `<div class="sug"><div class="sug-h">🗺 Day-by-day</div><ol class="roaditin">${lis}</ol></div>`;
+	};
 	const renderTrip = (t: any, upcoming: boolean) => {
 		const segs = (Array.isArray(t.segments) ? t.segments : []).map((s: any) =>
 			`<tr><td>${segIcon(s.type)} ${escapeHtml(s.type || '')}</td><td>${escapeHtml(s.from || '')}${s.to ? ' → ' + escapeHtml(s.to) : ''}</td><td>${escapeHtml(s.provider || '')}</td><td class="date-cell">${fmtDate(s.start)}</td><td class="date-cell">${fmtDate(s.end)}</td><td>${escapeHtml(s.confirmation || '—')}</td><td><span class="status ${escapeHtml(s.status || '')}">${escapeHtml(s.status || '—')}</span></td></tr>`
@@ -3855,6 +3869,8 @@ function renderTripRadarHtml(rawJson: string): string {
 		return `<div class="trip ${upcoming ? 'up' : 'past'}">
 			<div class="trip-h"><span class="dest">${escapeHtml(t.destination || 'Trip')}</span> ${purpose}<span class="trip-dates">${dateRange(t)}</span></div>
 			<table class="segs"><thead><tr><th>Type</th><th>Route</th><th>Provider</th><th>Start</th><th>End</th><th>Conf #</th><th>Status</th></tr></thead><tbody>${segs || '<tr><td colspan="7" class="empty">no segments</td></tr>'}</tbody></table>
+			${renderTour(t.tour)}
+			${renderRoadItin(t.road_itinerary)}
 			${renderSuggestions(t.suggestions)}
 		</div>`;
 	};
@@ -3895,6 +3911,11 @@ function renderTripRadarHtml(rawJson: string): string {
   .sug ul { list-style: none; padding-left: 4px; } .sug li { font-size: 13px; color: #d8d8e2; padding: 3px 0; }
   .sug a { color: #7c83ff; text-decoration: none; } .sug a:hover { text-decoration: underline; }
   .sug .smeta { color: #8899a6; font-size: 11px; } .sug .why { color: #8a8a98; font-size: 12px; font-style: italic; }
+  .tour { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #262630; }
+  .tour .trow { display: flex; gap: 10px; font-size: 12px; padding: 2px 4px; }
+  .tour .tk { color: #8899a6; min-width: 92px; } .tour .tv { color: #d8d8e2; }
+  ol.roaditin { margin: 4px 0 0 18px; padding: 0; } ol.roaditin li { font-size: 12.5px; color: #d8d8e2; padding: 3px 0; }
+  .roaditin .rid { color: #8899a6; font-variant-numeric: tabular-nums; } .roaditin .ris { color: #4ecca3; font-weight: 600; } .roaditin .rid2 { color: #b9b9c6; }
   .empty { text-align: center; padding: 36px; color: #555; }
   footer { margin-top: 30px; color: #555; font-size: 11px; text-align: center; }
   details summary { cursor: pointer; color: #707080; font-size: 12px; }
