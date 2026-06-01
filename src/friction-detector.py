@@ -208,6 +208,13 @@ def check_notes_without_follow_up():
 
 
 def main():
+    # --stdout-only: print the friction summary but do NOT write the results/
+    # deliverable file. The morning-briefing skill folds friction inline; without
+    # this flag the bridge polls results/ and delivers it as a SEPARATE DM. The
+    # bridge unlinks the file after delivery, so the existing `output_path.exists()`
+    # guard does NOT prevent the briefing's re-invocation from regenerating + re-DMing
+    # (unlike daily-insight.py, which guards on a sentinel that survives the unlink).
+    stdout_only = "--stdout-only" in sys.argv
     today = datetime.now().strftime("%Y-%m-%d")
     output_path = RESULTS_DIR / f"friction-{today}.txt"
 
@@ -231,8 +238,9 @@ def main():
         for i, issue in enumerate(all_issues, 1):
             summary += f"  {i}. {issue}\n"
 
-    output_path.write_text(summary)
-    print(f"Friction check → {output_path}")
+    if not stdout_only:
+        output_path.write_text(summary)
+    print(f"Friction check → {output_path}" if not stdout_only else "Friction check (stdout-only):")
     print(summary)
 
 
