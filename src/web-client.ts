@@ -27,6 +27,7 @@ const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
 const WORKSPACE_DIR = resolveWorkspace();
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
+const RESULTS_DIR = join(WORKSPACE_DIR, 'results');
 const STATE_DIR = join(WORKSPACE_DIR, 'state');
 const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
 
@@ -4845,7 +4846,7 @@ const server = createServer((req, res) => {
 	}
 	if (url.pathname === '/trips/chat-result') {
 		const task = tripSafe(url.searchParams.get('task') || '');
-		const f = `results/tripchat-${task}.txt`;
+		const f = join(RESULTS_DIR, `tripchat-${task}.txt`);
 		if (task && existsSync(f)) {
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ready: true, answer: readFileSync(f, 'utf-8') }));
@@ -4870,8 +4871,8 @@ const server = createServer((req, res) => {
 				mkdirSync(dir, { recursive: true });
 				writeFileSync(`${dir}/${fname}`, Buffer.from(b64, 'base64'));
 				const ts = Date.now();
-				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-ingest\naccess_tier: owner\ntask: Ingest the file skills/trip-radar/state/corpus/${tripId}/${fname} into trip "${tripId}"'s corpus. IMPORTANT: parse it with the Read tool on that exact file path (the Read tool natively extracts text from PDFs and images — do NOT cat/utf-8/text-parse it, which fails on PDFs). Extract the key facts (itinerary, hotel names, dates, contacts), append a dated summary to skills/trip-radar/state/corpus/${tripId}/_corpus.md, and if it contains booking/itinerary detail, update that trip's record in skills/trip-radar/state/trips.json (segments / tour / road_itinerary). Write a one-line confirmation to results/tripchat-${ts}.txt (page polls it); do not deliver via bridge.\n`;
-				writeFileSync(`tasks/task-${ts}.txt`, taskBody);
+				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-ingest\naccess_tier: owner\ntask: Ingest the file skills/trip-radar/state/corpus/${tripId}/${fname} into trip "${tripId}"'s corpus. IMPORTANT: parse it with the Read tool on that exact file path (the Read tool natively extracts text from PDFs and images — do NOT cat/utf-8/text-parse it, which fails on PDFs). Extract the key facts (itinerary, hotel names, dates, contacts), append a dated summary to skills/trip-radar/state/corpus/${tripId}/_corpus.md, and if it contains booking/itinerary detail, update that trip's record in skills/trip-radar/state/trips.json (segments / tour / road_itinerary). Write a one-line confirmation to ${join(RESULTS_DIR, `tripchat-${ts}.txt`)} (page polls it); do not deliver via bridge.\n`;
+				writeFileSync(join(TASK_DIR, `task-${ts}.txt`), taskBody);
 				writeOwnerActivity('web-tripingest', `Attach ${fname} → ${tripId}`);
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true, task: String(ts), filename: fname }));
@@ -4891,8 +4892,8 @@ const server = createServer((req, res) => {
 				const tripId = tripSafe(b.trip_id);
 				if (!tripId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'trip_id required' })); return; }
 				const ts = Date.now();
-				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-calsync\naccess_tier: owner\ntask: Sync trip "${tripId}" to Google Calendar with CORRECT timezones.\n\n1. Read that trip's segments from skills/trip-radar/state/trips.json.\n2. For each flight/hotel/car/train segment, use the Google Calendar MCP (mcp__claude_ai_Google_Calendar__list_events) to find a matching event near its date on the owner's primary calendar.\n3. For a MISSING segment: create it (mcp__claude_ai_Google_Calendar__create_event) as a timezone-correct event — use the segment's local start/end and set the event timeZone to match the segment's offset region (e.g. +05:30 → Asia/Kolkata, -07:00 → America/Los_Angeles). Flights = timed event (dep→arr, title like "AI2479 DEL→LEH"); hotels = check-in→check-out.\n4. For a MISMATCH (event exists but the time/date is wrong vs the segment): correct it with mcp__claude_ai_Google_Calendar__update_event to the segment's real local time + correct timeZone.\n5. Do NOT duplicate events that are already correct. Be conservative; never delete unrelated events.\n6. Write a concise per-segment summary (added / fixed / already-ok, with the corrected times) to results/tripchat-${ts}.txt — page polls it; do not deliver via any bridge.\n`;
-				writeFileSync(`tasks/task-${ts}.txt`, taskBody);
+				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-calsync\naccess_tier: owner\ntask: Sync trip "${tripId}" to Google Calendar with CORRECT timezones.\n\n1. Read that trip's segments from skills/trip-radar/state/trips.json.\n2. For each flight/hotel/car/train segment, use the Google Calendar MCP (mcp__claude_ai_Google_Calendar__list_events) to find a matching event near its date on the owner's primary calendar.\n3. For a MISSING segment: create it (mcp__claude_ai_Google_Calendar__create_event) as a timezone-correct event — use the segment's local start/end and set the event timeZone to match the segment's offset region (e.g. +05:30 → Asia/Kolkata, -07:00 → America/Los_Angeles). Flights = timed event (dep→arr, title like "AI2479 DEL→LEH"); hotels = check-in→check-out.\n4. For a MISMATCH (event exists but the time/date is wrong vs the segment): correct it with mcp__claude_ai_Google_Calendar__update_event to the segment's real local time + correct timeZone.\n5. Do NOT duplicate events that are already correct. Be conservative; never delete unrelated events.\n6. Write a concise per-segment summary (added / fixed / already-ok, with the corrected times) to ${join(RESULTS_DIR, `tripchat-${ts}.txt`)} — page polls it; do not deliver via any bridge.\n`;
+				writeFileSync(join(TASK_DIR, `task-${ts}.txt`), taskBody);
 				writeOwnerActivity('web-tripcalsync', `Calendar sync (${tripId})`);
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true, task: String(ts) }));
