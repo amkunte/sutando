@@ -38,6 +38,18 @@ For each confirmation, extract: type (flight/hotel/car/train/lodging), confirmat
 - `new_trips` — trips not present last scan.
 - `changes` — segment delays / gate / seat / cancellation / new segment added to an existing trip.
 
+## Phase A.5 — rich itinerary ingestion (docs, sheets, operator emails)
+
+Airline/hotel confirmations only give the skeleton. The DETAILED itinerary for a tour/road-trip (day-by-day route, overnight stops, named hotels, the operator's plan) usually lives in **a Google Doc/Sheet or a tour-operator email**, not a standard confirmation — and is exactly what users care about. For each upcoming trip, also look there:
+
+1. **Google Drive** — `mcp__claude_ai_Google_Drive__search_files` for docs/sheets matching the destination/operator/dates (e.g. `fullText contains 'Ladakh'`, `title contains '<destination>'`, mimeType doc/spreadsheet). Read the match with `read_file_content` (it renders Docs, Sheets, AND PDFs). Extract the day-by-day plan.
+2. **Operator / agent / aggregator emails** — search beyond airline/hotel senders: the tour operator (often a plain gmail/business address), Amex GBT, TripIt, "itinerary"/"confirmed itinerary" subjects. These carry the schedule + named lodging.
+3. **PDF e-tickets** — Air India and many carriers put the actual flight times ONLY in a PDF attachment; the email body is just "ticket attached." The Gmail tools here CANNOT read attachment bytes — so do NOT guess those dates. Either (a) read the same e-ticket if it's also saved in Drive (`read_file_content` handles PDF), or (b) mark the segment dates "verify" and ask the owner. Never fabricate flight times.
+
+Persist the rich plan onto the trip:
+- `trip.tour` = `{operator, name, dates, route, max_altitude, distance, bike, lodging, doc(view-url)}`
+- `trip.road_itinerary` = `[{date, stop, detail}, …]` (day-by-day). The `/trips` page renders both.
+
 ## Phase B — concierge suggestions (only for `new_trips`, or on-demand for a named destination)
 
 For each new trip, using `travel-preferences.json` + the destination + dates + trip purpose (infer business vs leisure from segment mix / day-of-week / past patterns), research and assemble:
