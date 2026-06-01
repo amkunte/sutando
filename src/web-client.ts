@@ -4812,7 +4812,15 @@ const server = createServer((req, res) => {
 	};
 	// SYNCHRONOUS chat — direct Gemini generateContent (google-search grounded),
 	// trip record + corpus as context. No task-bridge round-trip → instant.
+	const forbidNonLocal = (): boolean => {
+		const remote = req.socket?.remoteAddress || '';
+		if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1') return false;
+		res.writeHead(403, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ ok: false, error: 'forbidden: trip-radar endpoints accept localhost connections only' }));
+		return true;
+	};
 	if (url.pathname === '/trips/chat' && req.method === 'POST') {
+		if (forbidNonLocal()) return;
 		const chunks: Buffer[] = [];
 		req.on('data', (c: Buffer) => chunks.push(c));
 		req.on('end', async () => {
@@ -4858,6 +4866,7 @@ const server = createServer((req, res) => {
 	}
 	// Attach a doc/PDF/image to a trip's corpus (base64 JSON — avoids multipart).
 	if (url.pathname === '/trips/upload' && req.method === 'POST') {
+		if (forbidNonLocal()) return;
 		const chunks: Buffer[] = [];
 		req.on('data', (c: Buffer) => chunks.push(c));
 		req.on('end', () => {
@@ -4867,6 +4876,9 @@ const server = createServer((req, res) => {
 				const fname = tripSafe((b.filename || '').split('/').pop() || '');
 				const b64 = String(b.contentB64 || '');
 				if (!tripId || !fname || !b64) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'trip_id, filename, contentB64 required' })); return; }
+				// tripSafe strips '/', but a bare '..' component survives the charclass — reject it so the corpus path can't escape its dir.
+				if (tripId === '..' || tripId.includes('..') || fname === '..' || fname.includes('..')) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid trip_id/filename' })); return; }
+				if (b64.length > 28_000_000) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'file too large (max ~20MB)' })); return; }
 				const dir = `skills/trip-radar/state/corpus/${tripId}`;
 				mkdirSync(dir, { recursive: true });
 				writeFileSync(`${dir}/${fname}`, Buffer.from(b64, 'base64'));
@@ -4884,6 +4896,7 @@ const server = createServer((req, res) => {
 	// (the Google Calendar MCP lives in the agent session, not here). The page
 	// polls /trips/chat-result for the summary.
 	if (url.pathname === '/trips/calendar-sync' && req.method === 'POST') {
+		if (forbidNonLocal()) return;
 		const chunks: Buffer[] = [];
 		req.on('data', (c: Buffer) => chunks.push(c));
 		req.on('end', () => {
