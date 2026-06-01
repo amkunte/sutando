@@ -43,11 +43,17 @@ def _load(path: Path) -> dict:
 
 
 def _seg_key(seg: dict) -> str:
-    """Identity of a segment: confirmation# if present, else type+start+route."""
+    """Stable identity of a *leg*. Includes the route, not the date, so:
+    - the two legs of a round-trip (same confirmation#, different route) stay
+      DISTINCT (keying on conf# alone collided them into one),
+    - a reschedule (same conf# + route, new date) keeps the same key → reads as
+      a status/time change, not a drop + add.
+    """
     conf = (seg.get("confirmation") or "").strip().upper()
+    route = f"{seg.get('from') or ''}>{seg.get('to') or ''}"
     if conf:
-        return f"conf:{conf}"
-    return f"{seg.get('type')}|{seg.get('start')}|{seg.get('from')}|{seg.get('to')}"
+        return f"conf:{conf}|{seg.get('type')}|{route}"
+    return f"{seg.get('type')}|{(seg.get('start') or '')[:10]}|{route}"
 
 
 def _slug(s: str) -> str:
@@ -61,35 +67,85 @@ def _trip_id(trip: dict) -> str:
     return f"{_slug(trip.get('destination'))}-{trip.get('start','?')[:10]}"
 
 
+def _conf_set(trip: dict) -> set:
+    return {(s.get("confirmation") or "").strip().upper()
+            for s in trip.get("segments", []) if (s.get("confirmation") or "").strip()}
+
+
+def _date_overlap(a: dict, b: dict) -> bool:
+    """True if two trips share a metro AND their [start,end] date ranges overlap."""
+    if _slug(a.get("destination")) != _slug(b.get("destination")):
+        return False
+    a0, a1 = (a.get("start") or "")[:10], (a.get("end") or a.get("start") or "")[:10]
+    b0, b1 = (b.get("start") or "")[:10], (b.get("end") or b.get("start") or "")[:10]
+    return a0 <= b1 and b0 <= a1
+
+
+def _is_future(seg: dict) -> bool:
+    return (seg.get("start") or "")[:10] >= datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _match_prior(trip: dict, priors: list, used: set):
+    """Find the prior trip this extraction refers to. Match on a shared
+    confirmation# first (stable across reschedules), then fall back to
+    same-metro + overlapping dates. Returns (index, prior) or None."""
+    ec = _conf_set(trip)
+    if ec:
+        for i, p in enumerate(priors):
+            if i not in used and (_conf_set(p) & ec):
+                return i, p
+    for i, p in enumerate(priors):
+        if i not in used and _date_overlap(trip, p):
+            return i, p
+    return None
+
+
 def merge(extracted: list[dict], prior: dict) -> tuple[dict, list, list]:
-    prior_by_id = {t.get("trip_id") or _trip_id(t): t for t in prior.get("trips", [])}
-    merged: dict[str, dict] = {}
+    priors = prior.get("trips", [])
+    used: set = set()
+    merged: list[dict] = []
     new_trips: list[str] = []
     changes: list[str] = []
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     for trip in extracted:
-        tid = _trip_id(trip)
-        trip["trip_id"] = tid
-        old = prior_by_id.get(tid)
-        if old is None:
-            new_trips.append(tid)
+        m = _match_prior(trip, priors, used)
+        if m is None:
+            trip["trip_id"] = _trip_id(trip)
+            trip["first_seen"] = today
+            new_trips.append(trip["trip_id"])
         else:
+            i, old = m
+            used.add(i)
+            # reuse the prior trip_id so a reschedule (date shift) does NOT mint
+            # a phantom "new trip"
+            trip["trip_id"] = old.get("trip_id") or _trip_id(old)
+            trip["first_seen"] = old.get("first_seen", today)
             old_segs = {_seg_key(s): s for s in old.get("segments", [])}
-            for s in trip.get("segments", []):
-                k = _seg_key(s)
+            new_segs = {_seg_key(s): s for s in trip.get("segments", [])}
+            tid = trip["trip_id"]
+            for k, s in new_segs.items():
                 if k not in old_segs:
                     changes.append(f"{tid}: new segment {s.get('type')} {s.get('from','')}→{s.get('to','')}")
                 elif s.get("status") and s.get("status") != old_segs[k].get("status"):
                     changes.append(f"{tid}: {s.get('type')} status {old_segs[k].get('status')}→{s.get('status')}")
-            trip["first_seen"] = old.get("first_seen", trip.get("first_seen"))
-        merged[tid] = trip
+            # cancellation: a FUTURE prior segment that vanished from the new extraction
+            for k, s in old_segs.items():
+                if k not in new_segs and _is_future(s):
+                    changes.append(f"{tid}: {s.get('type')} {s.get('from','')}→{s.get('to','')} dropped — possible cancellation (verify)")
+        trip["last_seen"] = today
+        merged.append(trip)
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    for t in merged.values():
-        t.setdefault("first_seen", today)
-        t["last_seen"] = today
+    # Carry forward prior trips this scan didn't re-surface but that are still
+    # upcoming — the Gmail query window may simply not have re-matched an older
+    # confirmation. Dropping them would lose real trips; only the agent removing
+    # a cancelled trip should delete one.
+    for i, p in enumerate(priors):
+        if i not in used and (p.get("end") or p.get("start") or "")[:10] >= today:
+            merged.append(p)
+
     out = {"last_scan": datetime.now(timezone.utc).isoformat(),
-           "trips": sorted(merged.values(), key=lambda t: t.get("start", ""))}
+           "trips": sorted(merged, key=lambda t: t.get("start", ""))}
     return out, new_trips, changes
 
 
