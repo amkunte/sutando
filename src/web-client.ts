@@ -4044,6 +4044,10 @@ function renderAmazonOrdersHtml(rawJson: string): string {
   .channel.whole-foods { color: #74c365; }
   .channel.amazon-fresh { color: #2bbf64; }
   .notes { color: #707080; font-size: 11px; font-style: italic; max-width: 240px; }
+  .dlv-check { font-size: 11px; color: #888; margin-left: 8px; cursor: pointer; white-space: nowrap; }
+  .dlv-check:hover { color: #4ecca3; }
+  .dlv-check input { vertical-align: middle; cursor: pointer; margin-right: 2px; }
+  .manual-tag { font-size: 10px; color: #b48cff; border: 1px solid #3a2f55; border-radius: 4px; padding: 0 4px; margin-left: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
   .date-cell { color: #a0a0b0; font-variant-numeric: tabular-nums; font-size: 12px; }
   .date-cell.muted { color: #555; }
   .date-cell.return-started { color: #f0ad4e; }
@@ -4148,6 +4152,19 @@ function renderAmazonOrdersHtml(rawJson: string): string {
     if (!d) return '<span class="date-cell muted">—</span>';
     return '<span class="date-cell">' + escHtml(d) + '</span>';
   }
+  function fmtDelivered(o) {
+    if (!o.delivered_date) return '<span class="date-cell muted">—</span>';
+    const manual = o.delivery_source === 'manual';
+    return '<span class="date-cell">' + escHtml(o.delivered_date) + (manual ? ' <span class="manual-tag" title="manually marked delivered">manual</span>' : '') + '</span>';
+  }
+  async function markDelivered(id, el) {
+    el.disabled = true;
+    try {
+      const r = await fetch('/amazon/mark-delivered', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+      const j = await r.json();
+      if (j.ok) { location.reload(); } else { el.disabled = false; alert(j.error || 'failed to mark delivered'); }
+    } catch (e) { el.disabled = false; alert(e.message || 'network error'); }
+  }
 
   function renderSummary() {
     const orders = data.orders || [];
@@ -4223,10 +4240,10 @@ function renderAmazonOrdersHtml(rawJson: string): string {
       tr.innerHTML = \`
         <td><div class="item">\${escHtml(o.item)}</div><div class="channel \${channelClass}">\${escHtml((o.channel || 'amazon').replace('-', ' '))}\${o.split_shipment ? ' · split' : ''}</div></td>
         <td class="amount" style="text-align:right;font-variant-numeric:tabular-nums">\${fmtPrice(o)}</td>
-        <td><span class="status \${escHtml(o.status || 'ordered')}">\${escHtml((o.status || 'ordered').replace(/_/g, ' '))}</span></td>
+        <td><span class="status \${escHtml(o.status || 'ordered')}">\${escHtml((o.status || 'ordered').replace(/_/g, ' '))}</span>\${o.status === 'delivered' ? '' : ' <label class="dlv-check" title="I know this was delivered — move it to Delivered"><input type="checkbox" onchange="markDelivered(&apos;' + escHtml(o.id) + '&apos;,this)"> delivered?</label>'}</td>
         <td>\${fmtDate(o.ordered_date)}</td>
         <td>\${fmtDate(o.shipped_date)}</td>
-        <td>\${fmtDate(o.delivered_date)}</td>
+        <td>\${fmtDelivered(o)}</td>
         <td>\${o.returns_started_date ? '<span class="date-cell return-started">' + escHtml(o.returns_started_date) + '</span>' : '<span class="date-cell muted">—</span>'}</td>
         <td>\${o.refund_issued_date ? '<span class="date-cell refund-issued">' + escHtml(o.refund_issued_date) + '</span>' : '<span class="date-cell muted">—</span>'}</td>
         <td><span class="notes">\${escHtml(o.notes || '')}</span></td>
@@ -5249,6 +5266,39 @@ const server = createServer((req, res) => {
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
 		}
+		return;
+	}
+	// Manually mark an Amazon order delivered (when no "Delivered:" email arrived).
+	// Mutates orders.json; localhost-gated since the server binds 0.0.0.0.
+	if (url.pathname === '/amazon/mark-delivered' && req.method === 'POST') {
+		const remote = req.socket?.remoteAddress || '';
+		if (!(remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1')) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /amazon/mark-delivered accepts localhost connections only' }));
+			return;
+		}
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const id = String(JSON.parse(Buffer.concat(chunks).toString('utf-8')).id || '');
+				if (!id) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
+				const dataPath = 'skills/amazon-orders/state/orders.json';
+				if (!existsSync(dataPath)) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'no orders.json' })); return; }
+				const data = JSON.parse(readFileSync(dataPath, 'utf-8'));
+				const o = (data.orders || []).find((x: any) => x.id === id);
+				if (!o) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'order not found' })); return; }
+				const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD, local tz
+				o.status = 'delivered';
+				o.delivered_date = today;
+				o.delivery_source = 'manual';
+				if (!String(o.notes || '').includes('marked delivered manually')) o.notes = (o.notes ? o.notes + ' · ' : '') + 'marked delivered manually';
+				writeFileSync(dataPath, JSON.stringify(data, null, 2) + '\n');
+				writeOwnerActivity('web-amazon', `Marked delivered: ${(o.item || id).slice(0, 40)}`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true }));
+			} catch (e: any) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: e?.message || String(e) })); }
+		});
 		return;
 	}
 
