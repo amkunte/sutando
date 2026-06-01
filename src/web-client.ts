@@ -3872,6 +3872,15 @@ function renderTripRadarHtml(rawJson: string): string {
 			${renderTour(t.tour)}
 			${renderRoadItin(t.road_itinerary)}
 			${renderSuggestions(t.suggestions)}
+			<div class="tripchat" data-trip="${escapeHtml(t.trip_id || '')}">
+				<div class="sug-h">💬 Chat about this trip · 📎 attach docs to its memory</div>
+				<div class="tc-log"></div>
+				<div class="tc-row">
+					<input class="tc-in" type="text" placeholder="e.g. must-visit in Nubra Valley? authentic parathas in Delhi?" onkeydown="if(event.key==='Enter')tripChat(this)">
+					<button class="tc-ask" onclick="tripChat(this)">Ask</button>
+					<label class="tc-attach" title="Attach a PDF / image / doc to this trip">📎<input type="file" accept=".pdf,.png,.jpg,.jpeg,.docx,.txt,.csv" onchange="tripAttach(this)"></label>
+				</div>
+			</div>
 		</div>`;
 	};
 
@@ -3916,6 +3925,18 @@ function renderTripRadarHtml(rawJson: string): string {
   .tour .tk { color: #8899a6; min-width: 92px; } .tour .tv { color: #d8d8e2; }
   ol.roaditin { margin: 4px 0 0 18px; padding: 0; } ol.roaditin li { font-size: 12.5px; color: #d8d8e2; padding: 3px 0; }
   .roaditin .rid { color: #8899a6; font-variant-numeric: tabular-nums; } .roaditin .ris { color: #4ecca3; font-weight: 600; } .roaditin .rid2 { color: #b9b9c6; }
+  .tripchat { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #262630; }
+  .tc-log { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; max-height: 280px; overflow-y: auto; }
+  .tc-log:empty { display: none; }
+  .tc-msg { font-size: 13px; line-height: 1.4; padding: 6px 10px; border-radius: 8px; white-space: pre-wrap; }
+  .tc-msg.you { background: #1e3a5f; color: #dbeafe; align-self: flex-end; max-width: 85%; }
+  .tc-msg.bot { background: #15151f; color: #d8d8e2; align-self: flex-start; max-width: 92%; border: 1px solid #22222e; }
+  .tc-who { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: #7a7a88; margin-bottom: 2px; }
+  .tc-row { display: flex; gap: 8px; align-items: center; }
+  .tc-in { flex: 1; background: #0f0f17; border: 1px solid #2a2a3e; color: #e8e8ee; padding: 8px 12px; border-radius: 8px; font-size: 13px; font-family: inherit; }
+  .tc-ask { background: #1e4028; color: #4ecca3; border: 1px solid #2a4a36; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .tc-ask:hover { background: #2a503a; }
+  .tc-attach { cursor: pointer; font-size: 18px; padding: 4px 6px; border: 1px solid #2a2a3e; border-radius: 8px; } .tc-attach input { display: none; }
   .empty { text-align: center; padding: 36px; color: #555; }
   footer { margin-top: 30px; color: #555; font-size: 11px; text-align: center; }
   details summary { cursor: pointer; color: #707080; font-size: 12px; }
@@ -3931,6 +3952,14 @@ function renderTripRadarHtml(rawJson: string): string {
   ${upcoming.length ? '<h2>Upcoming</h2>' + upcoming.map(t => renderTrip(t, true)).join('') : ''}
   ${past.length ? `<details><summary>Past trips (${past.length})</summary><div style="margin-top:12px">` + past.map(t => renderTrip(t, false)).join('') + '</div></details>' : ''}
   <footer>Itinerary lives at <code>skills/trip-radar/state/trips.json</code>. Concierge suggestions are generated on new-trip detection (history-based). Source: Gmail confirmations via Claude MCP.</footer>
+<script>
+function tcAppend(log,who,text){var id='tc'+Math.random().toString(36).slice(2);var d=document.createElement('div');d.className='tc-msg '+who;d.id=id;var s=document.createElement('span');s.className='tc-who';s.textContent=(who==='you'?'You':'Sutando');d.appendChild(s);d.appendChild(document.createTextNode(text));log.appendChild(d);log.scrollTop=log.scrollHeight;return id;}
+function tcPoll(task,id,tries){tries=tries||0;if(tries>150){var e=document.getElementById(id);if(e)e.lastChild.textContent=' (still working — check back / refresh)';return;}
+ fetch('/trips/chat-result?task='+encodeURIComponent(task)).then(function(r){return r.json();}).then(function(j){var e=document.getElementById(id);if(j.ready&&e){e.lastChild.textContent=j.answer;}else{setTimeout(function(){tcPoll(task,id,tries+1);},2000);}}).catch(function(){setTimeout(function(){tcPoll(task,id,tries+1);},2000);});}
+function tripChat(el){var box=el.closest('.tripchat');var trip=box.getAttribute('data-trip');var inp=box.querySelector('.tc-in');var log=box.querySelector('.tc-log');var q=(inp.value||'').trim();if(!q)return;inp.value='';tcAppend(log,'you',q);var id=tcAppend(log,'bot','…thinking');
+ fetch('/trips/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,message:q})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');tcPoll(j.task,id);}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});}
+function tripAttach(input){var box=input.closest('.tripchat');var trip=box.getAttribute('data-trip');var log=box.querySelector('.tc-log');var f=input.files[0];if(!f)return;var id=tcAppend(log,'bot','📎 ingesting '+f.name+' …');var rd=new FileReader();rd.onload=function(){var b64=String(rd.result).split(',')[1];fetch('/trips/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,filename:f.name,contentB64:b64})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');tcPoll(j.task,id);}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});};rd.readAsDataURL(f);input.value='';}
+</script>
 </div></body></html>`;
 }
 
@@ -4745,6 +4774,65 @@ const server = createServer((req, res) => {
 			res.writeHead(500, { 'Content-Type': 'text/plain' });
 			res.end('Error reading trips: ' + (e?.message || String(e)));
 		}
+		return;
+	}
+
+	// Per-trip chat: ask a question about a trip; answered async by the core
+	// agent using the trip's data + its corpus + web. Writes a task; the page
+	// polls /trips/chat-result for the answer.
+	const tripSafe = (s: string) => String(s || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
+	if (url.pathname === '/trips/chat' && req.method === 'POST') {
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const b = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+				const tripId = tripSafe(b.trip_id); const msg = String(b.message || '').slice(0, 2000);
+				if (!tripId || !msg) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'trip_id and message required' })); return; }
+				const ts = Date.now();
+				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-chat\naccess_tier: owner\ntask: Trip-chat for trip "${tripId}". The user asks: "${msg}"\n\nAnswer using (a) that trip's record in skills/trip-radar/state/trips.json, (b) any files/notes in skills/trip-radar/state/corpus/${tripId}/ (read them — PDFs/images included), and (c) web research for current specifics (places, food, logistics). Be concise and practical. WRITE YOUR ANSWER to results/tripchat-${ts}.txt (plain text/markdown) — do NOT deliver it via any bridge; the web page polls that file.\n`;
+				writeFileSync(`tasks/task-${ts}.txt`, taskBody);
+				writeOwnerActivity('web-tripchat', `Trip chat (${tripId})`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true, task: String(ts) }));
+			} catch (e: any) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e?.message || 'bad request' })); }
+		});
+		return;
+	}
+	if (url.pathname === '/trips/chat-result') {
+		const task = tripSafe(url.searchParams.get('task') || '');
+		const f = `results/tripchat-${task}.txt`;
+		if (task && existsSync(f)) {
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ready: true, answer: readFileSync(f, 'utf-8') }));
+		} else {
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ready: false }));
+		}
+		return;
+	}
+	// Attach a doc/PDF/image to a trip's corpus (base64 JSON — avoids multipart).
+	if (url.pathname === '/trips/upload' && req.method === 'POST') {
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const b = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+				const tripId = tripSafe(b.trip_id);
+				const fname = tripSafe((b.filename || '').split('/').pop() || '');
+				const b64 = String(b.contentB64 || '');
+				if (!tripId || !fname || !b64) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'trip_id, filename, contentB64 required' })); return; }
+				const dir = `skills/trip-radar/state/corpus/${tripId}`;
+				mkdirSync(dir, { recursive: true });
+				writeFileSync(`${dir}/${fname}`, Buffer.from(b64, 'base64'));
+				const ts = Date.now();
+				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-ingest\naccess_tier: owner\ntask: Ingest the file skills/trip-radar/state/corpus/${tripId}/${fname} into trip "${tripId}"'s corpus. Read it (Read handles PDF + images), extract the key facts (itinerary, hotel names, dates, contacts), append a dated summary to skills/trip-radar/state/corpus/${tripId}/_corpus.md, and if it contains booking/itinerary detail, update that trip's record in skills/trip-radar/state/trips.json (segments / tour / road_itinerary). Write a one-line confirmation to results/tripchat-${ts}.txt (page polls it); do not deliver via bridge.\n`;
+				writeFileSync(`tasks/task-${ts}.txt`, taskBody);
+				writeOwnerActivity('web-tripingest', `Attach ${fname} → ${tripId}`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true, task: String(ts), filename: fname }));
+			} catch (e: any) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e?.message || 'bad request' })); }
+		});
 		return;
 	}
 
