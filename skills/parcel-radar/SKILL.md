@@ -59,9 +59,16 @@ Matching the two by **tracking number** yields a full picture: merchant + item (
 - **On-demand**: `/parcel-radar` → scan + show the board.
 - **Voice/chat**: "what's arriving today?", "where's my package from Best Buy?", "anything out for delivery?" → read `state/parcels.json`.
 
-## Page
+## Agent actions
 
-`/parcels` reads `state/parcels.json` and renders a sortable board grouped by status (in transit on top, delivered below), with merchant, carrier badge, a clickable tracking link, status, shipped/ETA/delivered dates. A localhost-gated **"Scan now"** button POSTs to `/parcels/scan` (writes a task the next loop pass runs).
+The skill is agent-driven and works with no web UI:
+- **Scan** — run `scan-prompt.md` (on demand, via `/parcel-radar`, or the cron) to refresh `state/parcels.json`.
+- **Query** — answer "what's arriving today / out for delivery / from <merchant>?" by reading `state/parcels.json`.
+- **Mark delivered (manual)** — when the user knows a parcel arrived but the carrier never sent a final update, set that parcel's `status: "delivered"`, `delivered_date` to today's local date, and `delivery_source: "manual"` (so manual marks are distinguishable from carrier-confirmed ones).
+
+## Optional web dashboard
+
+If the host ships a web UI, it can render `state/parcels.json` as a sortable board (in transit on top, delivered below) with merchant, carrier badge, clickable tracking link, status, and ETA. In this repo, `src/web-client.ts` serves `/parcels`, a localhost-gated **"Scan now"** button (`/parcels/scan` → queues the scan task), and a localhost-gated **"delivered?"** checkbox (`/parcels/mark-delivered` → the manual-mark action above). None of this is required — the dashboard is a convenience layer over the same state file + agent actions.
 
 ## Privacy
 
