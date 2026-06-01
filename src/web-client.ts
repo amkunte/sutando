@@ -4379,6 +4379,10 @@ function renderParcelRadarHtml(rawJson: string): string {
   .track-link { color: #60a5fa; text-decoration: none; font-variant-numeric: tabular-nums; font-size: 12px; }
   .track-link:hover { color: #8fc1ff; text-decoration: underline; }
   .notes { color: #ff9b9b; font-size: 11px; font-style: italic; max-width: 220px; }
+  .dlv-check { font-size: 11px; color: #888; margin-left: 8px; cursor: pointer; white-space: nowrap; }
+  .dlv-check:hover { color: #4ecca3; }
+  .dlv-check input { vertical-align: middle; cursor: pointer; margin-right: 2px; }
+  .manual-tag { font-size: 10px; color: #b48cff; border: 1px solid #3a2f55; border-radius: 4px; padding: 0 4px; margin-left: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
   .date-cell { color: #a0a0b0; font-variant-numeric: tabular-nums; font-size: 12px; }
   .date-cell.muted { color: #555; }
 
@@ -4460,6 +4464,19 @@ function renderParcelRadarHtml(rawJson: string): string {
 
   function escHtml(s) { if (s === null || s === undefined) return ''; return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
   function fmtDate(d) { if (!d) return '<span class="date-cell muted">—</span>'; return '<span class="date-cell">' + escHtml(d) + '</span>'; }
+  function fmtDelivered(p) {
+    if (!p.delivered_date) return '<span class="date-cell muted">—</span>';
+    const manual = p.delivery_source === 'manual';
+    return '<span class="date-cell">' + escHtml(p.delivered_date) + (manual ? ' <span class="manual-tag" title="manually marked delivered">manual</span>' : '') + '</span>';
+  }
+  async function markDelivered(id, el) {
+    el.disabled = true;
+    try {
+      const r = await fetch('/parcels/mark-delivered', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+      const j = await r.json();
+      if (j.ok) { location.reload(); } else { el.disabled = false; alert(j.error || 'failed to mark delivered'); }
+    } catch (e) { el.disabled = false; alert(e.message || 'network error'); }
+  }
   function track(p) {
     const t = p.tracking ? escHtml(p.tracking) : '';
     if (!t) return '<span class="date-cell muted">—</span>';
@@ -4512,9 +4529,9 @@ function renderParcelRadarHtml(rawJson: string): string {
         <td><div class="item">\${escHtml(p.item || '(unknown item)')}</div><div class="merchant">\${escHtml(p.merchant || '(unknown)')}</div></td>
         <td><span class="carrier \${cc}">\${escHtml(p.carrier || 'other')}</span></td>
         <td>\${track(p)}</td>
-        <td><span class="status \${escHtml(p.status || 'shipped')}">\${escHtml((p.status || 'shipped').replace(/_/g, ' '))}</span></td>
+        <td><span class="status \${escHtml(p.status || 'shipped')}">\${escHtml((p.status || 'shipped').replace(/_/g, ' '))}</span>\${deliveredCol ? '' : ' <label class="dlv-check" title="I know this was delivered — move it to Delivered"><input type="checkbox" onchange="markDelivered(&apos;' + escHtml(p.id) + '&apos;,this)"> delivered?</label>'}</td>
         <td>\${fmtDate(p.shipped_date)}</td>
-        <td>\${fmtDate(deliveredCol ? p.delivered_date : p.est_delivery)}</td>
+        <td>\${deliveredCol ? fmtDelivered(p) : fmtDate(p.est_delivery)}</td>
         <td><span class="notes">\${escHtml(p.notes || '')}</span></td>
       \`;
       tbody.appendChild(tr);
@@ -5282,6 +5299,41 @@ const server = createServer((req, res) => {
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
 		}
+		return;
+	}
+	// Manually mark a parcel delivered (when the carrier never sent a final
+	// update). Mutates state/parcels.json; localhost-gated since the server
+	// binds 0.0.0.0. Tags delivery_source: "manual" + today's local date.
+	if (url.pathname === '/parcels/mark-delivered' && req.method === 'POST') {
+		const remote = req.socket?.remoteAddress || '';
+		if (!(remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1')) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /parcels/mark-delivered accepts localhost connections only' }));
+			return;
+		}
+		const chunks: Buffer[] = [];
+		req.on('data', (c: Buffer) => chunks.push(c));
+		req.on('end', () => {
+			try {
+				const id = String(JSON.parse(Buffer.concat(chunks).toString('utf-8')).id || '');
+				if (!id) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
+				const dataPath = 'skills/parcel-radar/state/parcels.json';
+				if (!existsSync(dataPath)) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'no parcels.json' })); return; }
+				const data = JSON.parse(readFileSync(dataPath, 'utf-8'));
+				const p = (data.parcels || []).find((x: any) => x.id === id);
+				if (!p) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'parcel not found' })); return; }
+				const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD, local tz
+				p.status = 'delivered';
+				p.delivered_date = today;
+				p.delivery_source = 'manual';
+				p.last_update = today;
+				if (!String(p.notes || '').includes('marked delivered manually')) p.notes = (p.notes ? p.notes + ' · ' : '') + 'marked delivered manually';
+				writeFileSync(dataPath, JSON.stringify(data, null, 2) + '\n');
+				writeOwnerActivity('web-parcels', `Marked delivered: ${p.merchant || id}`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ ok: true }));
+			} catch (e: any) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: e?.message || String(e) })); }
+		});
 		return;
 	}
 
