@@ -3828,7 +3828,19 @@ function renderTripRadarHtml(rawJson: string): string {
 	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
 	const today = new Date().toISOString().slice(0, 10);
 	const trips: any[] = Array.isArray(data.trips) ? data.trips : [];
-	const fmtDate = (s: string) => { if (!s) return '—'; const d = new Date(s); return isNaN(+d) ? escapeHtml(String(s).slice(0, 16)) : d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+	// Show the LOCAL airport wall-clock exactly as encoded in the ISO string —
+	// do NOT convert to the viewer's timezone (that shifted IST flights back a
+	// day into PDT). Parse the literal Y-M-D / H:M components from the string.
+	const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+	const fmtDate = (s: string) => {
+		if (!s) return '—';
+		const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+		if (!m) return escapeHtml(String(s).slice(0, 16));
+		const mon = MONTHS[(parseInt(m[2], 10) || 1) - 1]; const day = parseInt(m[3], 10);
+		if (m[4] === undefined) return `${mon} ${day}`;
+		let h = parseInt(m[4], 10); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
+		return `${mon} ${day}, ${h}:${m[5]} ${ap}`;
+	};
 	const segIcon = (t: string) => ({ flight: '✈️', hotel: '🏨', lodging: '🏨', car: '🚗', train: '🚆' } as any)[t] || '•';
 	const dateRange = (t: any) => `${escapeHtml((t.start || '').slice(0, 10))} → ${escapeHtml((t.end || '').slice(0, 10))}`;
 
@@ -3951,7 +3963,7 @@ function renderTripRadarHtml(rawJson: string): string {
   ${trips.length === 0 ? '<div class="empty">No trips on record yet. Trip Radar populates from flight/hotel/car confirmations in your inbox on the next scan.</div>' : ''}
   ${upcoming.length ? '<h2>Upcoming</h2>' + upcoming.map(t => renderTrip(t, true)).join('') : ''}
   ${past.length ? `<details><summary>Past trips (${past.length})</summary><div style="margin-top:12px">` + past.map(t => renderTrip(t, false)).join('') + '</div></details>' : ''}
-  <footer>Itinerary lives at <code>skills/trip-radar/state/trips.json</code>. Concierge suggestions are generated on new-trip detection (history-based). Source: Gmail confirmations via Claude MCP.</footer>
+  <footer>Itinerary lives at <code>skills/trip-radar/state/trips.json</code>. Concierge suggestions are generated on new-trip detection (history-based). Source: Gmail confirmations via Claude MCP. All segment times are shown in <strong>local airport time</strong>.</footer>
 <script>
 function tcAppend(log,who,text){var id='tc'+Math.random().toString(36).slice(2);var d=document.createElement('div');d.className='tc-msg '+who;d.id=id;var s=document.createElement('span');s.className='tc-who';s.textContent=(who==='you'?'You':'Sutando');d.appendChild(s);d.appendChild(document.createTextNode(text));log.appendChild(d);log.scrollTop=log.scrollHeight;return id;}
 function tcPoll(task,id,tries){tries=tries||0;if(tries>150){var e=document.getElementById(id);if(e)e.lastChild.textContent=' (still working — check back / refresh)';return;}
