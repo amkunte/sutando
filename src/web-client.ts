@@ -30,6 +30,17 @@ const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
 const STATE_DIR = join(WORKSPACE_DIR, 'state');
 const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
 
+// karts-air ships as a GLOBAL skill under ~/.claude/skills (where its cron/scan
+// writes), NOT the repo skills/ tree — so the web page must read there. The old
+// repo-relative path didn't exist, so the page rendered the empty default
+// (owner reported a blank /karts-air, 2026-06-01). Prefer the home dir, fall
+// back to the repo path for any host where the skill IS vendored in-repo.
+function kartsAirDataPath(): string {
+	const home = join(process.env.HOME || REPO_ROOT, '.claude/skills/karts-air/state/karts-air-data.json');
+	const repo = join(REPO_ROOT, 'skills/karts-air/state/karts-air-data.json');
+	return existsSync(home) ? home : repo;
+}
+
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4512,7 +4523,7 @@ const server = createServer((req, res) => {
 	const kaPath = url.pathname.toUpperCase();
 	if (kaPath === '/KARTS-AIR') {
 		try {
-			const dataPath = 'skills/karts-air/state/karts-air-data.json';
+			const dataPath = kartsAirDataPath();
 			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
 			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 			res.end(renderKartsAirHtml(raw));
@@ -4524,7 +4535,7 @@ const server = createServer((req, res) => {
 	}
 	if (kaPath === '/KARTS-AIR/DATA') {
 		try {
-			const dataPath = 'skills/karts-air/state/karts-air-data.json';
+			const dataPath = kartsAirDataPath();
 			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"candidates":[],"scan_history":[],"sources_status":{}}';
 			res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
 			res.end(raw);
