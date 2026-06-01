@@ -66,3 +66,7 @@ The `/trips` page gives each trip a chat box + 📎 attach control:
 - **Attach** — upload a PDF/image/doc; it's saved to `state/corpus/<trip_id>/` (base64 JSON, no multipart) and an ingest task extracts its facts (Read handles PDF+images) into `state/corpus/<trip_id>/_corpus.md` and, when it carries booking/itinerary detail, into the trip's record. This is how PDF-only e-tickets (which the Gmail tools can't read) get into the trip.
 
 When you (core) pick up a `from: trip-chat` or `from: trip-ingest` task, follow its self-describing body verbatim and write the result to the `results/tripchat-<id>.txt` path it names.
+
+## Calendar sync (web) — timezone-correct
+
+Each upcoming trip on `/trips` has a **🗓 Check & sync to Calendar** button. It POSTs to `/trips/calendar-sync`; the core agent then uses the Google Calendar MCP to (1) cross-check every flight/hotel segment against the calendar, (2) create any MISSING ones, and (3) correct any with wrong times — always with an explicit `timeZone` matching the segment's offset region (e.g. +05:30 → `Asia/Kolkata`), because Gmail's auto-add frequently mislabels timezones / drops legs. Summary is written to `results/tripchat-<id>.txt` (page polls). When you (core) pick up a `from: trip-calsync` task, follow its body: list_events to match, create_event/update_event to fix, never delete unrelated events, write the per-segment summary.
