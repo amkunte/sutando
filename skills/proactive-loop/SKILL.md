@@ -68,6 +68,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 2. **Check pending questions.** Read `pending-questions.md`. If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
+2.5. **Scheduled-delivery catch-up (self-healing).** Run `python3 src/scheduled-catchup.py`. Daily deliveries (morning briefing 06:00, Siemens drip 07:33) are session-only crons that silently SKIP their slot if the host slept/was busy at the fire minute. For each `CATCHUP <name> :: <hint>` line the script prints, that delivery is overdue today, not yet delivered, and still inside its useful window — so **run it now** (`/morning-briefing`, or the Siemens drip per the hint), which writes its own `state/<key>-delivered-<date>.sentinel`. The sentinel makes this idempotent: a delivery that fired on time already wrote its sentinel and won't re-run; a delivery already run earlier this pass-cycle won't double-fire. Silent output = nothing overdue. (This is the reliable backstop because the 10-min loop fires far more dependably than the early-AM daily crons — see build_log 2026-06-01.)
+
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
 4. **Read the build log** (`build_log.md`) — understand what exists. Do not rebuild what works.
