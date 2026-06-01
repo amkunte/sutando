@@ -188,6 +188,10 @@ def generate_insight():
 
 
 def main():
+    # --stdout-only: print the insight but do NOT write the results/ deliverable
+    # file. The morning-briefing skill folds insight inline; without this flag the
+    # bridge polls results/ and delivers it as a SEPARATE DM, fragmenting the brief.
+    stdout_only = "--stdout-only" in sys.argv
     today = datetime.now().strftime("%Y-%m-%d")
     output_path = RESULTS_DIR / f"insight-{today}.txt"
     # Sentinel survives discord-bridge's `dm-fallback` unlink of the
@@ -203,9 +207,10 @@ def main():
         return
 
     insight = generate_insight()
-    output_path.write_text(insight)
+    if not stdout_only:
+        output_path.write_text(insight)
     sentinel.write_text(insight)
-    print(f"Daily insight → {output_path}")
+    print(f"Daily insight → {output_path}" if not stdout_only else "Daily insight (stdout-only):")
     print(insight)
 
 
