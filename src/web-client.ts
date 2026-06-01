@@ -5004,7 +5004,7 @@ const server = createServer((req, res) => {
 			// Pointer (not inline) — avoids header-injection class issues
 			// from any header-shaped lines inside scan-prompt.md.
 			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Cirrus SR22 deal-hunter scan (out-of-cycle, triggered from /KARTS-AIR UI). Read the full instructions in skills/karts-air/scan-prompt.md and follow them verbatim.\nsource: web\nfrom: karts-air-ui\naccess_tier: owner\n`;
-			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			writeFileSync(join(TASK_DIR, `${taskId}.txt`), taskContent);
 			writeOwnerActivity('web-karts-air', 'Scan now (KARTS-AIR)');
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up. Refresh in ~2-3 min for results.' }));
@@ -5211,12 +5211,20 @@ const server = createServer((req, res) => {
 		return;
 	}
 	if (url.pathname === '/amazon/scan' && req.method === 'POST') {
+		// Localhost-only: writes an owner-tier task file run with full agent
+		// privileges, and the server binds 0.0.0.0 (PR #651 / #71 threat model).
+		const remote = req.socket?.remoteAddress || '';
+		if (!(remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1')) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ ok: false, error: 'forbidden: /amazon/scan accepts localhost connections only' }));
+			return;
+		}
 		try {
 			const taskId = `task-${Date.now()}`;
 			const promptPath = 'skills/amazon-orders/scan-prompt.md';
 			const promptBody = existsSync(promptPath) ? readFileSync(promptPath, 'utf-8') : '(scan-prompt.md missing — run Amazon orders scan)';
 			const taskContent = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\ntask: Run Amazon orders scan (out-of-cycle, triggered from /amazon UI). Follow the instructions in skills/amazon-orders/scan-prompt.md verbatim:\n\n${promptBody}\nsource: web\nfrom: amazon-orders-ui\n`;
-			writeFileSync(`tasks/${taskId}.txt`, taskContent);
+			writeFileSync(join(TASK_DIR, `${taskId}.txt`), taskContent);
 			writeOwnerActivity('web-amazon', 'Scan now (Amazon orders)');
 			res.writeHead(200, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: true, task_id: taskId, message: 'Scan queued; the next proactive-loop pass will pick it up (~1 min).' }));
