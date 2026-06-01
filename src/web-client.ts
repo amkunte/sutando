@@ -4637,6 +4637,27 @@ function writeOwnerActivity(channel: string, summary: string): void {
 	}
 }
 
+// Shared by /amazon/mark-delivered + /parcels/mark-delivered. Marks one item in
+// a state file delivered with delivery_source:'manual' + today's local date
+// (the server runs in the user's tz, and the data model uses local YYYY-MM-DD).
+// Read-modify-write; callers localhost-gate before invoking. Returns the HTTP
+// status + body to send, plus a label for the owner-activity log.
+function markStateItemDelivered(dataPath: string, listKey: 'orders' | 'parcels', id: string): { status: number; body: any; label?: string } {
+	if (!id) return { status: 400, body: { ok: false, error: 'id required' } };
+	if (!existsSync(dataPath)) return { status: 404, body: { ok: false, error: `no ${listKey}.json` } };
+	const data = JSON.parse(readFileSync(dataPath, 'utf-8'));
+	const item = (data[listKey] || []).find((x: any) => x.id === id);
+	if (!item) return { status: 404, body: { ok: false, error: `${listKey === 'orders' ? 'order' : 'parcel'} not found` } };
+	const today = new Date().toLocaleDateString('en-CA');
+	item.status = 'delivered';
+	item.delivered_date = today;
+	item.delivery_source = 'manual';
+	item.last_update = today;
+	if (!String(item.notes || '').includes('marked delivered manually')) item.notes = (item.notes ? item.notes + ' · ' : '') + 'marked delivered manually';
+	writeFileSync(dataPath, JSON.stringify(data, null, 2) + '\n');
+	return { status: 200, body: { ok: true }, label: String(item.merchant || item.item || id).slice(0, 40) };
+}
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -5282,21 +5303,10 @@ const server = createServer((req, res) => {
 		req.on('end', () => {
 			try {
 				const id = String(JSON.parse(Buffer.concat(chunks).toString('utf-8')).id || '');
-				if (!id) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
-				const dataPath = 'skills/amazon-orders/state/orders.json';
-				if (!existsSync(dataPath)) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'no orders.json' })); return; }
-				const data = JSON.parse(readFileSync(dataPath, 'utf-8'));
-				const o = (data.orders || []).find((x: any) => x.id === id);
-				if (!o) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'order not found' })); return; }
-				const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD, local tz
-				o.status = 'delivered';
-				o.delivered_date = today;
-				o.delivery_source = 'manual';
-				if (!String(o.notes || '').includes('marked delivered manually')) o.notes = (o.notes ? o.notes + ' · ' : '') + 'marked delivered manually';
-				writeFileSync(dataPath, JSON.stringify(data, null, 2) + '\n');
-				writeOwnerActivity('web-amazon', `Marked delivered: ${(o.item || id).slice(0, 40)}`);
-				res.writeHead(200, { 'Content-Type': 'application/json' });
-				res.end(JSON.stringify({ ok: true }));
+				const r = markStateItemDelivered('skills/amazon-orders/state/orders.json', 'orders', id);
+				if (r.status === 200) writeOwnerActivity('web-amazon', `Marked delivered: ${r.label}`);
+				res.writeHead(r.status, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(r.body));
 			} catch (e: any) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: e?.message || String(e) })); }
 		});
 		return;
@@ -5366,22 +5376,10 @@ const server = createServer((req, res) => {
 		req.on('end', () => {
 			try {
 				const id = String(JSON.parse(Buffer.concat(chunks).toString('utf-8')).id || '');
-				if (!id) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
-				const dataPath = 'skills/parcel-radar/state/parcels.json';
-				if (!existsSync(dataPath)) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'no parcels.json' })); return; }
-				const data = JSON.parse(readFileSync(dataPath, 'utf-8'));
-				const p = (data.parcels || []).find((x: any) => x.id === id);
-				if (!p) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'parcel not found' })); return; }
-				const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD, local tz
-				p.status = 'delivered';
-				p.delivered_date = today;
-				p.delivery_source = 'manual';
-				p.last_update = today;
-				if (!String(p.notes || '').includes('marked delivered manually')) p.notes = (p.notes ? p.notes + ' · ' : '') + 'marked delivered manually';
-				writeFileSync(dataPath, JSON.stringify(data, null, 2) + '\n');
-				writeOwnerActivity('web-parcels', `Marked delivered: ${p.merchant || id}`);
-				res.writeHead(200, { 'Content-Type': 'application/json' });
-				res.end(JSON.stringify({ ok: true }));
+				const r = markStateItemDelivered('skills/parcel-radar/state/parcels.json', 'parcels', id);
+				if (r.status === 200) writeOwnerActivity('web-parcels', `Marked delivered: ${r.label}`);
+				res.writeHead(r.status, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(r.body));
 			} catch (e: any) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: e?.message || String(e) })); }
 		});
 		return;
