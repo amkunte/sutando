@@ -53,6 +53,11 @@ Deliver via:
 - Write to `results/briefing-{date}.txt` so the voice agent can speak it
 - Send via Discord DM if configured
 
+**After delivering, mark today done** — touch the delivery sentinel so the proactive-loop's scheduled-catchup (`src/scheduled-catchup.py`) knows the briefing went out and does NOT re-run it:
+```bash
+touch "${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/briefing-delivered-$(date +%F).sentinel"
+```
+
 ## Scheduling
 
 To run daily, add to the proactive loop or use `/loop`:
