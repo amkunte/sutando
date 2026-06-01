@@ -663,6 +663,8 @@ const HTML = /* html */ `<!DOCTYPE html>
           <a href="/karts-air">✈ KARTS-AIR (Cirrus SR22)</a>
           <a href="/amazon">📦 Amazon Orders</a>
           <a href="/paidsubscriptions">💳 Paid Subscriptions</a>
+          <a href="/siemens-prep">🎯 Siemens Interview Prep</a>
+          <a href="/hogan">📊 Hogan Assessment</a>
         </div>
       </details>
       <span class="stats" id="stats"></span>
@@ -3401,6 +3403,121 @@ async function triggerScan() {
 // /paidsubscriptions page — full HTML, server-side rendered from
 // skills/subscription-scanner/state/subscriptions.json. Sortable table,
 // diff highlights from last scan, "Scan now" button.
+// --- Markdown doc pages (Siemens interview prep, Hogan results) -------------
+// Render a Markdown source file from the workspace into the shared dark-theme
+// skill-page look. Confidential content — routes are localhost-gated below.
+function mdEscape(s: string): string {
+	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function mdInline(s: string): string {
+	// `s` is already HTML-escaped.
+	s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+	s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+	s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+	s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+	return s;
+}
+function markdownToHtml(md: string): string {
+	const lines = md.replace(/\r\n/g, '\n').split('\n');
+	const out: string[] = [];
+	let i = 0;
+	let inList = false;
+	const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+	while (i < lines.length) {
+		const t = lines[i].trim();
+		if (/^\|.*\|/.test(t) && i + 1 < lines.length && /^\|[\s:|-]+\|$/.test(lines[i + 1].trim())) {
+			closeList();
+			const header = t.split('|').slice(1, -1).map(c => c.trim());
+			out.push('<table><thead><tr>' + header.map(h => '<th>' + mdInline(mdEscape(h)) + '</th>').join('') + '</tr></thead><tbody>');
+			i += 2;
+			while (i < lines.length && /^\|.*\|/.test(lines[i].trim())) {
+				const cells = lines[i].trim().split('|').slice(1, -1).map(c => c.trim());
+				out.push('<tr>' + cells.map(c => '<td>' + mdInline(mdEscape(c)) + '</td>').join('') + '</tr>');
+				i++;
+			}
+			out.push('</tbody></table>');
+			continue;
+		}
+		if (t === '') { closeList(); i++; continue; }
+		if (/^---+$/.test(t)) { closeList(); out.push('<hr>'); i++; continue; }
+		let m: RegExpMatchArray | null;
+		if ((m = t.match(/^(#{1,6})\s+(.*)$/))) {
+			closeList();
+			const lvl = m[1].length;
+			out.push(`<h${lvl}>` + mdInline(mdEscape(m[2])) + `</h${lvl}>`);
+			i++; continue;
+		}
+		if ((m = t.match(/^[-*]\s+(.*)$/)) || (m = t.match(/^\d+\.\s+(.*)$/))) {
+			if (!inList) { out.push('<ul>'); inList = true; }
+			out.push('<li>' + mdInline(mdEscape(m[1])) + '</li>');
+			i++; continue;
+		}
+		closeList();
+		out.push('<p>' + mdInline(mdEscape(t)) + '</p>');
+		i++;
+	}
+	closeList();
+	return out.join('\n');
+}
+function renderMarkdownDocPage(emoji: string, title: string, subtitle: string, mdSource: string, srcLabel: string, extraNav: string = ''): string {
+	const body = markdownToHtml(mdSource);
+	const generated = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+	return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${mdEscape(title)} — Sutando</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #d6d6e0; padding: 24px; min-height: 100vh; line-height: 1.6; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; flex-wrap: wrap; }
+  h1.page { font-size: 22px; font-weight: 700; color: #fff; }
+  .subtitle { color: #707080; font-size: 13px; }
+  .back { margin-left: auto; color: #707080; font-size: 12px; text-decoration: none; border: 1px solid #2a2a3e; padding: 5px 12px; border-radius: 6px; }
+  .back:hover { background: #1a1a2e; }
+  .meta { display: flex; gap: 16px; font-size: 12px; color: #888; margin: 10px 0 18px; flex-wrap: wrap; align-items: center; }
+  .meta a { color: #5ab0ff; text-decoration: none; }
+  .conf { background: #2a1a1a; border: 1px solid #5a2a2a; color: #e6a0a0; font-size: 12px; padding: 8px 12px; border-radius: 8px; margin-bottom: 18px; }
+  .doc { background: #14141e; border: 1px solid #22222e; border-radius: 12px; padding: 26px 30px; }
+  .doc h1 { font-size: 21px; color: #fff; margin: 22px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #22222e; }
+  .doc h1:first-child { margin-top: 0; }
+  .doc h2 { font-size: 17px; color: #4ecca3; margin: 24px 0 8px; }
+  .doc h3 { font-size: 14.5px; color: #c8b6e6; margin: 18px 0 6px; }
+  .doc h4 { font-size: 13px; color: #aeb6c2; margin: 14px 0 4px; }
+  .doc p { margin: 8px 0; color: #d0d0db; font-size: 14px; }
+  .doc ul { margin: 8px 0 8px 22px; }
+  .doc li { margin: 4px 0; font-size: 14px; color: #d0d0db; }
+  .doc a { color: #5ab0ff; text-decoration: none; }
+  .doc a:hover { text-decoration: underline; }
+  .doc strong { color: #fff; font-weight: 650; }
+  .doc code { background: #0a0a12; border: 1px solid #26263a; border-radius: 4px; padding: 1px 5px; font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-size: 12.5px; color: #4ecca3; }
+  .doc hr { border: none; border-top: 1px solid #22222e; margin: 22px 0; }
+  .doc table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13px; }
+  .doc th { text-align: left; background: #1b1b28; color: #c0c0d0; padding: 7px 10px; border: 1px solid #2a2a3e; font-weight: 600; }
+  .doc td { padding: 7px 10px; border: 1px solid #22222e; color: #d0d0db; vertical-align: top; }
+  .doc tbody tr:nth-child(even) { background: #16161f; }
+  .doc blockquote { border-left: 3px solid #4ecca3; margin: 10px 0; padding: 4px 14px; color: #aeb6c2; background: #12121a; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1 class="page">${emoji} ${mdEscape(title)}</h1>
+      <div class="subtitle">${mdEscape(subtitle)}</div>
+      <a class="back" href="/">← Dashboard</a>
+    </header>
+    <div class="meta"><span>📄 <code>${mdEscape(srcLabel)}</code></span><span>rendered ${mdEscape(generated)}</span>${extraNav}</div>
+    <div class="conf">🔒 Confidential — served localhost-only. Don't screen-share this tab.</div>
+    <div class="doc">
+${body}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 function renderSubscriptionsHtml(rawJson: string): string {
 	let data: any;
 	try { data = JSON.parse(rawJson); } catch (e: any) { data = { last_scan: null, subscriptions: [], scan_history: [], _parse_error: e?.message }; }
@@ -4528,6 +4645,45 @@ const server = createServer((req, res) => {
 		} catch (e: any) {
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+		}
+		return;
+	}
+
+	// --- Confidential markdown doc pages (localhost-only) -------------------
+	// Siemens interview prep + Hogan results. Content is sensitive (active
+	// confidential interview), so gate to loopback even though the server
+	// binds 0.0.0.0. Owner can open these up if they want LAN access.
+	if (url.pathname === '/siemens-prep' || url.pathname === '/hogan' || url.pathname === '/hogan/items') {
+		const remote = req.socket.remoteAddress || '';
+		const isLocal = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+		if (!isLocal) {
+			res.writeHead(403, { 'Content-Type': 'text/plain' });
+			res.end('Forbidden — this page is confidential and served localhost-only.');
+			return;
+		}
+		try {
+			let p = '', emoji = '', title = '', subtitle = '', srcLabel = '', extraNav = '';
+			if (url.pathname === '/siemens-prep') {
+				p = join(WORKSPACE_DIR, 'notes/siemens-prep/dossier.md');
+				emoji = '🎯'; title = 'Siemens Interview Prep'; subtitle = 'Peter Koerte — June 9 · running dossier';
+				srcLabel = 'notes/siemens-prep/dossier.md';
+			} else if (url.pathname === '/hogan') {
+				p = join(WORKSPACE_DIR, 'state/hogan-analysis-20260531/analysis.md');
+				emoji = '📊'; title = 'Hogan Assessment Results'; subtitle = 'Real-instrument reconstruction + analysis';
+				srcLabel = 'state/hogan-analysis-20260531/analysis.md';
+				extraNav = '<a href="/hogan/items">view all 455 reconstructed items →</a>';
+			} else {
+				p = join(WORKSPACE_DIR, 'state/hogan-analysis-20260531/reconstruction.md');
+				emoji = '📋'; title = 'Hogan — Item-by-Item'; subtitle = 'All reconstructed answers (HPI / HDS / MVPI)';
+				srcLabel = 'state/hogan-analysis-20260531/reconstruction.md';
+				extraNav = '<a href="/hogan">← back to analysis</a>';
+			}
+			const md = existsSync(p) ? readFileSync(p, 'utf-8') : `# ${title}\n\n_Source file not found: ${srcLabel}_`;
+			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+			res.end(renderMarkdownDocPage(emoji, title, subtitle, md, srcLabel, extraNav));
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'text/plain' });
+			res.end('Error rendering page: ' + (e?.message || String(e)));
 		}
 		return;
 	}
