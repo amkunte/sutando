@@ -3956,8 +3956,8 @@ function renderTripRadarHtml(rawJson: string): string {
 function tcAppend(log,who,text){var id='tc'+Math.random().toString(36).slice(2);var d=document.createElement('div');d.className='tc-msg '+who;d.id=id;var s=document.createElement('span');s.className='tc-who';s.textContent=(who==='you'?'You':'Sutando');d.appendChild(s);d.appendChild(document.createTextNode(text));log.appendChild(d);log.scrollTop=log.scrollHeight;return id;}
 function tcPoll(task,id,tries){tries=tries||0;if(tries>150){var e=document.getElementById(id);if(e)e.lastChild.textContent=' (still working — check back / refresh)';return;}
  fetch('/trips/chat-result?task='+encodeURIComponent(task)).then(function(r){return r.json();}).then(function(j){var e=document.getElementById(id);if(j.ready&&e){e.lastChild.textContent=j.answer;}else{setTimeout(function(){tcPoll(task,id,tries+1);},2000);}}).catch(function(){setTimeout(function(){tcPoll(task,id,tries+1);},2000);});}
-function tripChat(el){var box=el.closest('.tripchat');var trip=box.getAttribute('data-trip');var inp=box.querySelector('.tc-in');var log=box.querySelector('.tc-log');var q=(inp.value||'').trim();if(!q)return;inp.value='';tcAppend(log,'you',q);var id=tcAppend(log,'bot','…thinking');
- fetch('/trips/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,message:q})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');tcPoll(j.task,id);}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});}
+function tripChat(el){var box=el.closest('.tripchat');var trip=box.getAttribute('data-trip');var inp=box.querySelector('.tc-in');var log=box.querySelector('.tc-log');var q=(inp.value||'').trim();if(!q)return;inp.value='';tcAppend(log,'you',q);var id=tcAppend(log,'bot','…');
+ fetch('/trips/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,message:q})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');document.getElementById(id).lastChild.textContent=j.answer;}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});}
 function tripAttach(input){var box=input.closest('.tripchat');var trip=box.getAttribute('data-trip');var log=box.querySelector('.tc-log');var f=input.files[0];if(!f)return;var id=tcAppend(log,'bot','📎 ingesting '+f.name+' …');var rd=new FileReader();rd.onload=function(){var b64=String(rd.result).split(',')[1];fetch('/trips/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trip_id:trip,filename:f.name,contentB64:b64})}).then(function(r){return r.json();}).then(function(j){if(!j.ok)throw new Error(j.error||'failed');tcPoll(j.task,id);}).catch(function(e){document.getElementById(id).lastChild.textContent='⚠ '+e.message;});};rd.readAsDataURL(f);input.value='';}
 </script>
 </div></body></html>`;
@@ -4781,21 +4781,42 @@ const server = createServer((req, res) => {
 	// agent using the trip's data + its corpus + web. Writes a task; the page
 	// polls /trips/chat-result for the answer.
 	const tripSafe = (s: string) => String(s || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80);
+	const geminiKey = (): string => {
+		if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
+		try { const m = readFileSync('.env', 'utf-8').match(/^\s*GEMINI_API_KEY\s*=\s*(.+)\s*$/m); if (m) return m[1].trim(); } catch { /* */ }
+		return '';
+	};
+	// SYNCHRONOUS chat — direct Gemini generateContent (google-search grounded),
+	// trip record + corpus as context. No task-bridge round-trip → instant.
 	if (url.pathname === '/trips/chat' && req.method === 'POST') {
 		const chunks: Buffer[] = [];
 		req.on('data', (c: Buffer) => chunks.push(c));
-		req.on('end', () => {
+		req.on('end', async () => {
 			try {
 				const b = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
 				const tripId = tripSafe(b.trip_id); const msg = String(b.message || '').slice(0, 2000);
 				if (!tripId || !msg) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'trip_id and message required' })); return; }
-				const ts = Date.now();
-				const taskBody = `id: task-${ts}\ntimestamp: ${new Date().toISOString()}\nsource: web\nfrom: trip-chat\naccess_tier: owner\ntask: Trip-chat for trip "${tripId}". The user asks: "${msg}"\n\nAnswer using (a) that trip's record in skills/trip-radar/state/trips.json, (b) any files/notes in skills/trip-radar/state/corpus/${tripId}/ (read them — PDFs/images included), and (c) web research for current specifics (places, food, logistics). Be concise and practical. WRITE YOUR ANSWER to results/tripchat-${ts}.txt (plain text/markdown) — do NOT deliver it via any bridge; the web page polls that file.\n`;
-				writeFileSync(`tasks/task-${ts}.txt`, taskBody);
+				const key = geminiKey();
+				if (!key) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'GEMINI_API_KEY not available' })); return; }
+				let tripCtx = '(trip not found)';
+				try { const all = JSON.parse(readFileSync('skills/trip-radar/state/trips.json', 'utf-8')); const t = (all.trips || []).find((x: any) => x.trip_id === tripId); if (t) tripCtx = JSON.stringify(t); } catch { /* */ }
+				let corpus = ''; const cf = `skills/trip-radar/state/corpus/${tripId}/_corpus.md`; if (existsSync(cf)) corpus = readFileSync(cf, 'utf-8').slice(0, 8000);
+				const model = process.env.TRIP_CHAT_MODEL || 'gemini-2.5-flash';
+				const grounding = process.env.TRIP_CHAT_GROUNDING === '1';  // opt-in; google_search is not free-tier
+				const sys = `You are Sutando's trip concierge. Answer the user's question about THIS specific trip concisely and practically (a few sentences or a short bulleted list). Lean on the trip data + corpus below for specifics; use your knowledge for general recommendations (places, food, logistics). Never invent bookings or confirmation details.\n\nTRIP DATA (JSON):\n${tripCtx}\n\nATTACHED CORPUS:\n${corpus || '(none)'}`;
+				const callGemini = async (withTool: boolean) => {
+					const body: any = { systemInstruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: msg }] }], generationConfig: { maxOutputTokens: 900 } };
+					if (withTool) body.tools = [{ google_search: {} }];
+					const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+					return resp.json() as any;
+				};
+				let data = await callGemini(grounding);
+				if (grounding && data?.error && /tool|google_search|function|unsupported|quota/i.test(data.error.message || '')) data = await callGemini(false);
+				const ans = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).filter(Boolean).join('') || data?.error?.message || 'No answer returned.';
 				writeOwnerActivity('web-tripchat', `Trip chat (${tripId})`);
 				res.writeHead(200, { 'Content-Type': 'application/json' });
-				res.end(JSON.stringify({ ok: true, task: String(ts) }));
-			} catch (e: any) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e?.message || 'bad request' })); }
+				res.end(JSON.stringify({ ok: true, answer: ans }));
+			} catch (e: any) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e?.message || 'chat failed' })); }
 		});
 		return;
 	}
