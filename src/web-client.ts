@@ -671,6 +671,7 @@ const HTML = /* html */ `<!DOCTYPE html>
       <details class="skills-nav" id="skills-nav">
         <summary>Skills ▾</summary>
         <div class="skills-menu">
+          <a href="/trips">✈️ Trip Radar</a>
           <a href="/karts-air">✈ KARTS-AIR (Cirrus SR22)</a>
           <a href="/amazon">📦 Amazon Orders</a>
           <a href="/paidsubscriptions">💳 Paid Subscriptions</a>
@@ -3818,6 +3819,100 @@ function escapeHtml(s: string): string {
 	return String(s).replace(/[<>&"']/g, c => (({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'} as Record<string, string>)[c] || c));
 }
 
+// /trips page — renders skills/trip-radar/state/trips.json: upcoming trips as
+// cards (segments + concierge suggestions if stored), past trips collapsed.
+// Server-rendered (no client fetch) — simple + robust.
+function renderTripRadarHtml(rawJson: string): string {
+	let data: any;
+	try { data = JSON.parse(rawJson); } catch (e: any) { data = { last_scan: null, trips: [], _parse_error: e?.message }; }
+	const lastScan = data.last_scan ? new Date(data.last_scan).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) : '— never scanned —';
+	const today = new Date().toISOString().slice(0, 10);
+	const trips: any[] = Array.isArray(data.trips) ? data.trips : [];
+	const fmtDate = (s: string) => { if (!s) return '—'; const d = new Date(s); return isNaN(+d) ? escapeHtml(String(s).slice(0, 16)) : d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+	const segIcon = (t: string) => ({ flight: '✈️', hotel: '🏨', lodging: '🏨', car: '🚗', train: '🚆' } as any)[t] || '•';
+	const dateRange = (t: any) => `${escapeHtml((t.start || '').slice(0, 10))} → ${escapeHtml((t.end || '').slice(0, 10))}`;
+
+	const renderSuggestions = (sug: any) => {
+		if (!sug || typeof sug !== 'object') return '';
+		const block = (title: string, items: any[]) => {
+			if (!Array.isArray(items) || !items.length) return '';
+			const lis = items.map((it: any) => {
+				const name = it.url ? `<a href="${escapeHtml(it.url)}" target="_blank" rel="noopener">${escapeHtml(it.name || '—')}</a>` : escapeHtml(it.name || '—');
+				const meta = [it.area, it.cuisine, it.price].filter(Boolean).map((x: string) => escapeHtml(String(x))).join(' · ');
+				const why = it.why ? ` — <span class="why">${escapeHtml(it.why)}</span>` : '';
+				return `<li>${name}${meta ? ` <span class="smeta">${meta}</span>` : ''}${why}</li>`;
+			}).join('');
+			return `<div class="sug"><div class="sug-h">${title}</div><ul>${lis}</ul></div>`;
+		};
+		return block('🏨 Hotels', sug.hotels) + block('🍽 Restaurants', sug.restaurants) + block('🎟 Activities', sug.activities);
+	};
+
+	const renderTrip = (t: any, upcoming: boolean) => {
+		const segs = (Array.isArray(t.segments) ? t.segments : []).map((s: any) =>
+			`<tr><td>${segIcon(s.type)} ${escapeHtml(s.type || '')}</td><td>${escapeHtml(s.from || '')}${s.to ? ' → ' + escapeHtml(s.to) : ''}</td><td>${escapeHtml(s.provider || '')}</td><td class="date-cell">${fmtDate(s.start)}</td><td class="date-cell">${fmtDate(s.end)}</td><td>${escapeHtml(s.confirmation || '—')}</td><td><span class="status ${escapeHtml(s.status || '')}">${escapeHtml(s.status || '—')}</span></td></tr>`
+		).join('');
+		const purpose = t.purpose ? `<span class="badge ${escapeHtml(t.purpose)}">${escapeHtml(t.purpose)}</span>` : '';
+		return `<div class="trip ${upcoming ? 'up' : 'past'}">
+			<div class="trip-h"><span class="dest">${escapeHtml(t.destination || 'Trip')}</span> ${purpose}<span class="trip-dates">${dateRange(t)}</span></div>
+			<table class="segs"><thead><tr><th>Type</th><th>Route</th><th>Provider</th><th>Start</th><th>End</th><th>Conf #</th><th>Status</th></tr></thead><tbody>${segs || '<tr><td colspan="7" class="empty">no segments</td></tr>'}</tbody></table>
+			${renderSuggestions(t.suggestions)}
+		</div>`;
+	};
+
+	const upcoming = trips.filter(t => (t.end || t.start || '').slice(0, 10) >= today).sort((a, b) => (a.start || '').localeCompare(b.start || ''));
+	const past = trips.filter(t => (t.end || t.start || '').slice(0, 10) < today).sort((a, b) => (b.start || '').localeCompare(a.start || ''));
+
+	return /* html */ `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trip Radar — Sutando</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif; background: #0e0e14; color: #e8e8ee; padding: 24px; min-height: 100vh; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+  h1 { font-size: 22px; font-weight: 700; }
+  h2 { font-size: 13px; font-weight: 600; color: #a0a0b0; margin: 26px 0 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .subtitle { color: #707080; font-size: 13px; }
+  .meta { font-size: 13px; color: #888; margin: 12px 0 8px; }
+  .meta strong { color: #c0c0d0; }
+  .trip { background: #14141e; border: 1px solid #1e1e2a; border-radius: 12px; padding: 16px 18px; margin-bottom: 14px; }
+  .trip.up { border-left: 3px solid #4ecca3; }
+  .trip.past { opacity: 0.72; }
+  .trip-h { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .dest { font-size: 17px; font-weight: 700; }
+  .trip-dates { color: #8899a6; font-size: 13px; font-variant-numeric: tabular-nums; margin-left: auto; }
+  .badge { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 8px; border-radius: 10px; font-weight: 700; }
+  .badge.business { background: #1e3a5f; color: #60a5fa; }
+  .badge.leisure { background: #2a3a18; color: #a3e055; }
+  table.segs { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.segs th { text-align: left; color: #707080; font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; padding: 4px 8px; border-bottom: 1px solid #22222e; }
+  table.segs td { padding: 5px 8px; border-bottom: 1px solid #191922; color: #cfd0da; }
+  .date-cell { font-variant-numeric: tabular-nums; color: #a0a0b0; }
+  .status { font-size: 10px; padding: 1px 7px; border-radius: 9px; text-transform: uppercase; letter-spacing: .4px; }
+  .status.confirmed { background:#1e4028; color:#4ecca3; } .status.cancelled { background:#4a1e22; color:#f08a8a; } .status.delayed { background:#2a2418; color:#f0ad4e; }
+  .sug { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #262630; }
+  .sug-h { font-size: 12px; color: #b48cff; font-weight: 600; margin: 8px 0 4px; }
+  .sug ul { list-style: none; padding-left: 4px; } .sug li { font-size: 13px; color: #d8d8e2; padding: 3px 0; }
+  .sug a { color: #7c83ff; text-decoration: none; } .sug a:hover { text-decoration: underline; }
+  .sug .smeta { color: #8899a6; font-size: 11px; } .sug .why { color: #8a8a98; font-size: 12px; font-style: italic; }
+  .empty { text-align: center; padding: 36px; color: #555; }
+  footer { margin-top: 30px; color: #555; font-size: 11px; text-align: center; }
+  details summary { cursor: pointer; color: #707080; font-size: 12px; }
+</style></head>
+<body><div class="wrap">
+  <header>
+    <h1>✈️ Trip Radar</h1>
+    <div class="subtitle">itinerary + concierge — parsed from Gmail</div>
+    <div style="margin-left:auto"><a href="/" style="color:#707080;font-size:12px;text-decoration:none;border:1px solid #2a2a3e;padding:5px 12px;border-radius:6px;">← Dashboard</a></div>
+  </header>
+  <div class="meta"><strong>Last scan:</strong> ${escapeHtml(lastScan)} · <strong>${upcoming.length}</strong> upcoming · <strong>${past.length}</strong> past</div>
+  ${trips.length === 0 ? '<div class="empty">No trips on record yet. Trip Radar populates from flight/hotel/car confirmations in your inbox on the next scan.</div>' : ''}
+  ${upcoming.length ? '<h2>Upcoming</h2>' + upcoming.map(t => renderTrip(t, true)).join('') : ''}
+  ${past.length ? `<details><summary>Past trips (${past.length})</summary><div style="margin-top:12px">` + past.map(t => renderTrip(t, false)).join('') + '</div></details>' : ''}
+  <footer>Itinerary lives at <code>skills/trip-radar/state/trips.json</code>. Concierge suggestions are generated on new-trip detection (history-based). Source: Gmail confirmations via Claude MCP.</footer>
+</div></body></html>`;
+}
+
 // /amazon page — renders skills/amazon-orders/state/orders.json as a sortable
 // table grouped by status (in-progress at top, delivered below).
 function renderAmazonOrdersHtml(rawJson: string): string {
@@ -4614,6 +4709,20 @@ const server = createServer((req, res) => {
 			console.error('[web-client] /paidsubscriptions/scan failed:', e);
 			res.writeHead(500, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify({ ok: false, error: 'failed to enqueue scan' }));
+		}
+		return;
+	}
+
+	// Trip Radar dashboard. Reads skills/trip-radar/state/trips.json.
+	if (url.pathname === '/trips' || url.pathname === '/trip-radar') {
+		try {
+			const dataPath = 'skills/trip-radar/state/trips.json';
+			const raw = existsSync(dataPath) ? readFileSync(dataPath, 'utf-8') : '{"last_scan":null,"trips":[]}';
+			res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+			res.end(renderTripRadarHtml(raw));
+		} catch (e: any) {
+			res.writeHead(500, { 'Content-Type': 'text/plain' });
+			res.end('Error reading trips: ' + (e?.message || String(e)));
 		}
 		return;
 	}
