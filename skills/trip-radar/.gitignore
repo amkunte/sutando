@@ -1,0 +1,4 @@
+# user trip data + learned prefs are runtime state, not source
+state/*.json
+!state/*.example.json
+state/history/
