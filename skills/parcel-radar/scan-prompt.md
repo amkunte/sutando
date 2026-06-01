@@ -49,6 +49,7 @@ From each store email extract: **merchant** (brand from sender domain or email b
 - **Dedup id**: stable hash of the tracking number; when there's no tracking #, hash `merchant|item|shipped_date`.
 - **Status precedence** when multiple emails exist for one parcel: `delivered > out_for_delivery > in_transit > shipped > ordered`; `exception` overrides unless a later `delivered` exists.
 - **Carrier emails are authoritative for status/ETA.** When a carrier and a store email disagree, take status, `est_delivery`, and `last_update` from the carrier (it reflects the live network state); take `merchant` + `item` from the store. Never downgrade a carrier "out_for_delivery"/"delivered" to a store's older "shipped".
+- **Preserve manual marks.** Load the existing `parcels.json` first. If a parcel there has `delivery_source: "manual"`, keep its `delivered` status + `delivered_date` + `delivery_source` even though no carrier/store email confirms delivery — the user set it deliberately via the manual mark-delivered action. A scan must never revert a manually-delivered parcel back to "shipped"/"in_transit".
 
 ## Diff vs previous scan
 
