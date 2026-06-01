@@ -1,0 +1,51 @@
+{
+  "last_scan": "2026-06-01T12:00:00-07:00",
+  "since": "newer_than:90d",
+  "parcels": [
+    {
+      "id": "ups-1z999aa10123456784",
+      "merchant": "Best Buy",
+      "item": "Sony WH-1000XM5 headphones",
+      "carrier": "ups",
+      "tracking": "1Z999AA10123456784",
+      "tracking_url": "https://www.ups.com/track?tracknum=1Z999AA10123456784",
+      "status": "out_for_delivery",
+      "shipped_date": "2026-05-29",
+      "est_delivery": "2026-06-01",
+      "delivered_date": null,
+      "last_update": "2026-06-01",
+      "notes": ""
+    },
+    {
+      "id": "usps-9400100000000000000000",
+      "merchant": "Etsy — NorthwoodCeramics",
+      "item": "Stoneware mug set",
+      "carrier": "usps",
+      "tracking": "9400100000000000000000",
+      "tracking_url": "https://tools.usps.com/go/TrackConfirmAction?tLabels=9400100000000000000000",
+      "status": "in_transit",
+      "shipped_date": "2026-05-30",
+      "est_delivery": "2026-06-03",
+      "delivered_date": null,
+      "last_update": "2026-05-31",
+      "notes": ""
+    },
+    {
+      "id": "fedex-770000000000",
+      "merchant": "REI",
+      "item": "Trekking poles",
+      "carrier": "fedex",
+      "tracking": "770000000000",
+      "tracking_url": "https://www.fedex.com/fedextrack/?trknbr=770000000000",
+      "status": "delivered",
+      "shipped_date": "2026-05-24",
+      "est_delivery": "2026-05-28",
+      "delivered_date": "2026-05-27",
+      "last_update": "2026-05-27",
+      "notes": ""
+    }
+  ],
+  "scan_history": [
+    { "date": "2026-06-01T12:00:00-07:00", "total": 3, "in_transit": 2, "delivered": 1, "added": ["Best Buy — Sony WH-1000XM5 headphones"], "delivered_since_last": ["REI — Trekking poles"], "exceptions": [] }
+  ]
+}
