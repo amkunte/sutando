@@ -41,6 +41,16 @@ For each new trip, using `travel-preferences.json` + the destination + dates + t
 
 Use WebSearch/WebFetch for current, real options (never invent venues or prices — if unsure, say "verify"). Keep it tight and skimmable.
 
+**Persist the suggestions onto the trip** so they show on the `/trips` web page (not just the ephemeral Telegram message): write them into that trip's `suggestions` field in `state/trips.json` as:
+```json
+"suggestions": {
+  "hotels":      [{"name": "...", "url": "...", "area": "...", "price": "$$$", "why": "..."}],
+  "restaurants": [{"name": "...", "url": "...", "area": "...", "cuisine": "...", "why": "..."}],
+  "activities":  [{"name": "...", "url": "...", "why": "..."}]
+}
+```
+(The `/trips` page renders `name` as a link when `url` is present, plus `area`/`cuisine`/`price` meta and the `why` line.)
+
 ## Deliver
 
 - **New trip detected** → write `results/proactive-tripradar-{epoch}.txt`:
