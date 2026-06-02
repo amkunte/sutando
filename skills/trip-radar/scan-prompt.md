@@ -63,6 +63,7 @@ Use WebSearch/WebFetch for current, real options (never invent venues or prices 
 **Persist the suggestions onto the trip** so they show on the `/trips` web page (not just the ephemeral Telegram message): write them into that trip's `suggestions` field in `state/trips.json` as:
 ```json
 "suggestions": {
+  "generated_at": "<ISO date you researched these>",
   "hotels":      [{"name": "...", "url": "...", "area": "...", "price": "$$$", "why": "..."}],
   "restaurants": [{"name": "...", "url": "...", "area": "...", "cuisine": "...", "why": "..."}],
   "activities":  [{"name": "...", "url": "...", "why": "..."}]
