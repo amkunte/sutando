@@ -30,6 +30,7 @@ duplicate to every configured bridge.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 # Channels whose bridges actually deliver `proactive-*.txt` files.
@@ -47,6 +48,15 @@ from pathlib import Path
 # silently stranding the proactive file in `results/` until the
 # next discord/telegram message restored a known activity channel.
 BRIDGE_CHANNELS = frozenset({"discord", "telegram"})
+
+# Where to send a proactive message when the owner's last activity was on a
+# NON-bridge surface (web/chat/voice/github-commits/…) or no activity is
+# recorded yet. Upstream default is "discord" (canonical first-channel install);
+# deployments whose canonical DM channel is Telegram set
+# SUTANDO_DEFAULT_PROACTIVE_CHANNEL=telegram in .env (exported to the bridges via
+# startup.sh `set -a; source .env`). Invalid values fall back to "discord".
+_DEFAULT = os.environ.get("SUTANDO_DEFAULT_PROACTIVE_CHANNEL", "discord").strip().lower()
+DEFAULT_PROACTIVE_CHANNEL = _DEFAULT if _DEFAULT in BRIDGE_CHANNELS else "discord"
 
 
 def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
@@ -79,16 +89,16 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     try:
         data = json.loads(state_file_path.read_text())
     except FileNotFoundError:
-        return this_channel == "discord"
+        return this_channel == DEFAULT_PROACTIVE_CHANNEL
     except (OSError, json.JSONDecodeError):
-        return this_channel == "discord"
+        return this_channel == DEFAULT_PROACTIVE_CHANNEL
 
     if not isinstance(data, dict):
-        return this_channel == "discord"
+        return this_channel == DEFAULT_PROACTIVE_CHANNEL
 
     last_channel = data.get("channel", "")
     if not isinstance(last_channel, str) or not last_channel:
-        return this_channel == "discord"
+        return this_channel == DEFAULT_PROACTIVE_CHANNEL
 
     # If the last-active channel is a known bridge, match strictly so
     # only that bridge claims.
@@ -98,4 +108,4 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     # Non-bridge channel (voice / github-commits / etc.): the owner
     # most recently interacted on a surface that doesn't deliver DMs.
     # Default Discord rather than strand the proactive file.
-    return this_channel == "discord"
+    return this_channel == DEFAULT_PROACTIVE_CHANNEL
