@@ -42,15 +42,16 @@ Walk these in order. Where a step needs the owner (secrets, a Discord token, a C
 - [ ] **Cloudflare Access** policy: allow ONLY the owner's Google email (a.kunte@gmail.com). This is the real security boundary — see ⚠️ below.
 - [ ] Add a **PWA manifest** + icons to the web-client pages so the site installs to the phone home screen (icon, standalone display). Add `<link rel="manifest">` + a minimal `manifest.webmanifest`.
 - [ ] Run `cloudflared` under launchd so the tunnel survives reboot.
-- ⚠️ **Security:** the `/*/scan`, `/parcels/mark-delivered`, `/amazon/mark-delivered`, etc. endpoints are gated to `127.0.0.1`. A tunnel makes external requests arrive AS localhost, so that gate no longer protects them — **Cloudflare Access (owner-email-only) becomes the boundary.** Add a shared-secret header that `cloudflared`/Access injects and the web-client verifies, as defense-in-depth, before exposing write endpoints.
+- ⚠️ **Security (DECIDED 2026-06-02: do both):** the `/*/scan`, `/parcels/mark-delivered`, `/amazon/mark-delivered`, etc. endpoints are gated to `127.0.0.1`. A tunnel makes external requests arrive AS localhost, so that gate no longer protects them — **Cloudflare Access (owner-email-only) is the primary boundary.** PLUS add a shared-secret header (Cloudflare Access service-token / a header `cloudflared` injects) that the web-client verifies on the write endpoints — required, not optional — so a tunnel misconfig can't expose owner-tier actions. Verify a request WITHOUT the header/Access is rejected before going live.
 
 ## 6. Always-on + memory sync
 - [ ] launchd watchdog: install `com.sutando.core` on Goose (`scripts/install-core-launchagent.sh`) — RunAtLoad + keepalive so Sutando survives reboot/crash.
 - [ ] Memory sync: clone `~/.sutando-memory-sync` (private repo `github.com/amkunte/sutando-memory.git`) and schedule `sync-memory.sh` — Goose pulls Maverick's memory + pushes its own. Both nodes converge.
 
-## 7. bot2bot wiring  ← DECISION REQUIRED
-- [ ] **Does Goose run its own Discord bot, or stay headless?** For true two-way bot2bot (claims / reviews / coordination posts), Goose needs its OWN Discord app+token ("Goose"), invited to the same server. Alternative: Goose is headless infra and Maverick stays the sole Discord face (simpler, but no Goose-voice in chat). RECOMMEND: give Goose its own bot for real Maverick↔Goose coordination.
-- [ ] If dual-bot: create the "Goose" Discord app + token (Developer Portal), invite to the server, enroll owner, set Goose's `discord-config`. Configure `bot2bot-post` so each node @-mentions the other in a coord channel (e.g. a `#bot2bot` or reuse `#sutando-upstream`).
+## 7. bot2bot wiring  (DECIDED 2026-06-02: Goose gets its OWN Discord bot)
+- [ ] Create the **"Goose" Discord app + bot token** (Developer Portal) — separate from Maverick's bot. Enable Message Content Intent. Invite it to the same server with the same permission set Maverick has (incl. Manage Channels if it'll create/manage channels). Set `bot_public=false` (private, like Maverick).
+- [ ] Goose's bridge uses ITS token; set Goose's `state/discord-config.json` (`node_name: "Goose"`, owner id, channel map). Enroll the owner on the Goose bot (pair/TOFU).
+- [ ] Configure `bot2bot-post` so each node @-mentions the OTHER in a coordination channel (reuse `#sutando-upstream`, or a dedicated `#bot2bot`). Maverick ↔ Goose post claims/reviews/done there.
 - [ ] **Avoid double-processing:** ensure the two bots don't both handle the same owner DM (distinct bot tokens + each only processes its own mentions/DMs; the file-bridge task dedup + per-node claim logic must be sane). Verify no echo loops before leaving it running.
 
 ## 8. Cutover verification
