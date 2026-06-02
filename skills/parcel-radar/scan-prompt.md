@@ -1,6 +1,6 @@
 # Parcel Radar — scan-prompt (follow verbatim)
 
-Update `skills/parcel-radar/state/parcels.json` with every inbound parcel currently in transit or recently delivered, scanned from the user's Gmail. **Exclude Amazon** — it's covered by the `amazon-orders` skill (skip `*@amazon.com` shipment mail).
+Update `skills/parcel-radar/state/parcels.json` with every inbound parcel currently in transit or recently delivered, scanned from the user's Gmail. **Exclude Amazon** — it's covered by the `amazon-orders` skill. Skip ALL Amazon senders, not just `.com`: `*@amazon.*` (amazon.com / amazon.co.uk / amazon.ca / …) plus Amazon Logistics / "shipped by Amazon" notices — the query uses `-from:amazon.` (dot) so regional TLDs don't slip through and double-count against amazon-orders.
 
 Workspace paths resolve under `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}` — write state to the skill's `state/` dir; deliver via `results/`.
 
@@ -26,14 +26,14 @@ Build `tracking_url` from the carrier + tracking number:
 - OnTrac → `https://www.ontrac.com/tracking?number=<T>`
 - LaserShip/Veho/other → best-known tracking URL, else leave `tracking_url: null`.
 
-Infer carrier from tracking-number shape when the sender is ambiguous: UPS `1Z…` (18 char); USPS 20–22 digits or `9400…`/`9205…`; FedEx 12/15/20 digits; DHL 10–11 digits.
+Infer carrier from tracking-number shape when the sender is ambiguous: UPS `1Z…` (18 char); USPS 20–22 digits or `9400…`/`9205…`; FedEx 12/15/20 digits; DHL 10–11 digits. This shape heuristic is **best-effort** — USPS/FedEx/DHL digit-only formats overlap, so when only a bare number is present the `carrier` (and thus `tracking_url`) may be wrong; prefer the sending carrier's identity when known, and treat a shape-only guess as tentative (a wrong guess just yields a dead `tracking_url`, not bad status).
 
 ## Phase 2 — e-commerce store shipment confirmations (merchant origin + item)
 
 These tell you WHAT shipped and from WHOM (the carrier email often doesn't). Run:
 
 ```
-subject:("your order has shipped" OR "has shipped" OR "on its way" OR "order is on the way" OR "shipment confirmation" OR "tracking number" OR "out for delivery" OR shipped) -from:amazon.com in:anywhere newer_than:90d
+subject:("your order has shipped" OR "has shipped" OR "on its way" OR "order is on the way" OR "shipment confirmation" OR "tracking number" OR "out for delivery" OR shipped) -from:amazon. in:anywhere newer_than:90d
 from:(shopifyemail.com OR bestbuy.com OR target.com OR walmart.com OR apple.com OR nike.com OR etsy.com OR ebay.com OR chewy.com OR rei.com OR newegg.com OR bhphotovideo.com OR uniqlo.com OR wayfair.com) subject:(shipped OR shipment OR "on its way" OR tracking OR "out for delivery" OR delivered) in:anywhere newer_than:90d
 ```
 
@@ -43,7 +43,7 @@ From each store email extract: **merchant** (brand from sender domain or email b
 
 ## Merge the two sources
 
-- **Match by tracking number first**: if a Phase-2 store email and a Phase-1 carrier email share a tracking #, they're ONE parcel — combine (merchant + item from the store; status + ETA from the carrier).
+- **Match by tracking number first** — but NORMALIZE before comparing. Store and carrier emails render the same tracking # differently (spaces, dashes, leading-zero handling — e.g. store `1Z 999 AA1 01 2345 6784` vs carrier `1Z999AA10123456784`). Canonicalize both sides (strip all non-alphanumerics, uppercase) before the join, else a real pair silently splits into two parcels. Store the canonical form in `tracking`. If a Phase-2 store email and a Phase-1 carrier email share the canonical tracking #, they're ONE parcel — combine (merchant + item from the store; status + ETA from the carrier).
 - A store email with a tracking # but no carrier email yet → a parcel at `shipped`/`in_transit` with merchant + item known.
 - A carrier email with no matching store email → a parcel with status known but `merchant`/`item` unknown (set `merchant: "(unknown)"`, best-effort `item`).
 - **Dedup id**: stable hash of the tracking number; when there's no tracking #, hash `merchant|item|shipped_date`.
@@ -60,7 +60,7 @@ Snapshot the prior `parcels.json` to `state/history/<previous-scan-date>.json` (
 
 ## Update state
 
-Set `last_scan` to current ISO8601-with-timezone; write `parcels.json` (sorted: in-transit first by `est_delivery` asc, then delivered by `delivered_date` desc). Append the `scan_history` entry.
+Set `last_scan` to current ISO8601-with-timezone; write `parcels.json` (sorted: in-transit first by `est_delivery` asc, then delivered by `delivered_date` desc). Append the `scan_history` entry, then **cap `scan_history` to the last 30 entries** (trim oldest) so the file doesn't grow unbounded — the dated per-scan snapshots already live in `state/history/`.
 
 ## Notify
 
