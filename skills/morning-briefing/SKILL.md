@@ -50,8 +50,13 @@ Good morning. Here's your briefing:
 ```
 
 Deliver via:
-- Write to `results/briefing-{date}.txt` so the voice agent can speak it
-- Send via Discord DM if configured
+- **Primary: post to the Discord #dailybriefings channel** (owner's request 2026-06-02 — briefs live in their own channel, not DMs). Post directly with the channel id from `state/discord-config.json` → `channels.dailybriefings`:
+  ```bash
+  CH=$(python3 -c "import json,os;from pathlib import Path;ws=os.environ.get('SUTANDO_WORKSPACE',str(Path.home()/'.sutando/workspace'));print(json.load(open(Path(ws)/'state/discord-config.json'))['channels']['dailybriefings'])")
+  python3 src/discord_post.py "$CH" "$BRIEF_TEXT"
+  ```
+  This posts straight to the channel via the bot token — deterministic, NOT subject to proactive-DM routing. If `channels.dailybriefings` is missing, fall back to the proactive path below.
+- Keep a record at `notes/briefings/briefing-{date}.md` (a NON-polled path). **Do NOT write `results/briefing-{date}.txt` or any `results/proactive-*` copy** — those prefixes are polled by the Telegram/Discord bridges and would double-deliver the brief to the owner's DM. The #dailybriefings channel post is the sole delivery.
 
 **After delivering, mark today done** — touch the delivery sentinel so the proactive-loop's scheduled-catchup (`src/scheduled-catchup.py`) knows the briefing went out and does NOT re-run it:
 ```bash
