@@ -77,12 +77,29 @@ def _seg_key(seg: dict) -> str:
     return f"{seg.get('type')}|{(seg.get('start') or '')[:10]}|{route}"
 
 
-def _seg_uid(trip_id: str, seg: dict) -> str:
-    """Deterministic, stable per-segment id used as the Google Calendar dedup
-    marker. Same segment → same uid across runs, so the calendar sync can match
-    an existing event structurally (by `[trip-radar:<uid>]` in its description)
-    instead of relying on fuzzy time/route matching."""
-    return "tr-" + _slug(trip_id) + "-" + _slug(_seg_key(seg))
+def _trip_anchor(trip: dict) -> str:
+    """A RESCHEDULE-STABLE trip identity for the calendar uid prefix.
+
+    NOT `trip_id`: `trip_id` embeds `trip.start` (`{slug(dest)}-{start[:10]}`),
+    so if the first segment is rescheduled to another day `trip.start` shifts →
+    `trip_id` changes → every segment uid changes → the `[trip-radar:<uid>]`
+    markers stop matching the existing calendar events → the sync creates
+    DUPLICATES instead of correcting in place (the whole point of the marker is
+    reschedule-stability). Anchor on the lexically-smallest confirmation# across
+    the trip's segments (stable when a date moves), falling back to the
+    destination slug when no conf# exists.
+    """
+    confs = sorted(_conf_set(trip))  # _conf_set upper-cases; stable across date shifts
+    return confs[0].lower() if confs else _slug(trip.get("destination"))
+
+
+def _seg_uid(trip: dict, seg: dict) -> str:
+    """Deterministic, reschedule-stable per-segment id used as the Google
+    Calendar dedup marker. Same segment → same uid across runs (and across
+    date reschedules), so the calendar sync matches an existing event
+    structurally (by `[trip-radar:<uid>]` in its description) instead of fuzzy
+    time/route matching."""
+    return "tr-" + _slug(_trip_anchor(trip)) + "-" + _slug(_seg_key(seg))
 
 
 def _slug(s: str) -> str:
@@ -176,9 +193,8 @@ def merge(extracted: list[dict], prior: dict) -> tuple[dict, list, list]:
     # Stamp deterministic per-segment uids (the calendar-sync dedup key) on
     # every trip — matched, new, and carried-forward alike.
     for t in merged:
-        tid = t.get("trip_id") or _trip_id(t)
         for s in t.get("segments", []):
-            s["uid"] = _seg_uid(tid, s)
+            s["uid"] = _seg_uid(t, s)
 
     out = {"last_scan": datetime.now(timezone.utc).isoformat(),
            "trips": sorted(merged, key=lambda t: t.get("start", ""))}

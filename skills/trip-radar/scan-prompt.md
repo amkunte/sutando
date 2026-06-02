@@ -63,12 +63,13 @@ Use WebSearch/WebFetch for current, real options (never invent venues or prices 
 **Persist the suggestions onto the trip** (so they survive beyond the ephemeral delivery message and can be re-surfaced later or rendered by an optional web dashboard): write them into that trip's `suggestions` field in `state/trips.json` as:
 ```json
 "suggestions": {
+  "generated_at": "<ISO date you researched these>",
   "hotels":      [{"name": "...", "url": "...", "area": "...", "price": "$$$", "why": "..."}],
   "restaurants": [{"name": "...", "url": "...", "area": "...", "cuisine": "...", "why": "..."}],
   "activities":  [{"name": "...", "url": "...", "why": "..."}]
 }
 ```
-(When present, `url` makes `name` a link; `area`/`cuisine`/`price` are display meta alongside the `why` line.)
+(When present, `url` makes `name` a link; `area`/`cuisine`/`price` are display meta alongside the `why` line. `generated_at` lets the UI/agent flag stale prices/availability — re-research if it's weeks old before re-surfacing.)
 
 ## Deliver
 
