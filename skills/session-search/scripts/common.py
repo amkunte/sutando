@@ -113,15 +113,36 @@ CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
 END;
 CREATE TABLE IF NOT EXISTS files(
   path TEXT PRIMARY KEY,
-  offset INTEGER NOT NULL DEFAULT 0,  -- bytes consumed (transcripts); mtime-keyed for docs
+  offset INTEGER NOT NULL DEFAULT 0,  -- bytes consumed (transcripts); 0 for docs
   mtime REAL,
-  nrows INTEGER NOT NULL DEFAULT 0,
+  nrows INTEGER NOT NULL DEFAULT 0,   -- transcripts: last raw-LINE cursor (carries line_no
+                                      -- across incremental runs; NOT a row count). docs: rows.
   indexed_at TEXT
 );
 """
 
 
 def connect() -> sqlite3.Connection:
-    con = sqlite3.connect(str(db_path()))
+    con = sqlite3.connect(str(db_path()), timeout=30)
+    # WAL lets search.py read concurrently while index.py writes (no
+    # "database is locked" during a reindex). synchronous=NORMAL is safe
+    # under WAL and much faster for the bulk insert.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(SCHEMA)
     return con
+
+
+def index_lock():
+    """Acquire an exclusive, non-blocking file lock for indexing. Returns the
+    open lock-file handle on success (keep it alive for the run), or None if
+    another index run already holds it — callers should exit cleanly to avoid
+    two indexers double-inserting (no row-level dedup exists)."""
+    import fcntl
+    lf = (resolve_workspace() / "state" / ".session-search.index.lock").open("w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lf
+    except OSError:
+        lf.close()
+        return None

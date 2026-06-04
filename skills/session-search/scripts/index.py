@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import connect, transcript_dir, doc_sources
+from common import connect, transcript_dir, doc_sources, index_lock
 
 # Block types in an assistant message whose text we index. 'thinking' is
 # excluded (internal, huge) and tool_use/tool_result are excluded (noisy).
@@ -51,9 +51,14 @@ def _extract(line: str):
         for b in content:
             if isinstance(b, dict) and b.get("type") in _TEXT_BLOCKS:
                 txt = b.get("text")
-                if txt:
+                # Type-guard: a non-str text value (int/list/None from an
+                # unexpected content shape) would otherwise crash str.join,
+                # abort the whole file's indexing, leave its offset unadvanced,
+                # and re-crash every future run — permanently hiding that
+                # transcript from search (B2).
+                if isinstance(txt, str) and txt:
                     parts.append(txt)
-    text = "\n".join(p for p in parts if p).strip()
+    text = "\n".join(parts).strip()
     if not text:
         return None
     return (t, ts, text)
@@ -65,7 +70,18 @@ def _index_transcript(con, path: Path) -> int:
     size = path.stat().st_size
     start_offset, base_lineno = (row[0], row[1]) if row else (0, 0)
 
-    if start_offset > size:  # file shrank → rewritten; reindex from scratch
+    # Rewrite/compaction detection (B1). We ALWAYS advance the offset to just
+    # past a '\n', so the invariant is: byte[offset-1] == '\n'. A pure append
+    # preserves the bytes before offset, so the invariant still holds. A
+    # rewrite (shrink OR same/larger size with new content) changes those
+    # bytes, so byte[offset-1] is no longer that newline → reset and reindex.
+    # The size-only `> size` check missed same-or-larger rewrites entirely.
+    rewritten = start_offset > size
+    if not rewritten and start_offset > 0:
+        with path.open("rb") as _fh:
+            _fh.seek(start_offset - 1)
+            rewritten = _fh.read(1) != b"\n"
+    if rewritten:
         cur.execute("DELETE FROM docs WHERE source=?", (str(path),))
         start_offset, base_lineno = 0, 0
 
@@ -161,6 +177,14 @@ def main() -> int:
         nfiles = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         byrole = dict(cur.execute("SELECT role, COUNT(*) FROM docs GROUP BY role").fetchall())
         print(f"indexed rows: {nrows}  files: {nfiles}  by-role: {byrole}")
+        return 0
+
+    # Serialize indexers: a cron run + a manual run overlapping would both read
+    # the same offset and double-insert (no row-level dedup). Hold an exclusive
+    # file lock for the whole run; if another indexer has it, exit cleanly.
+    lock = index_lock()
+    if lock is None:
+        print("session-search: another index run is in progress; skipping")
         return 0
 
     if args.rebuild:

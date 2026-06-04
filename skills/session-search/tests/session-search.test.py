@@ -98,6 +98,38 @@ def main() -> int:
     r = run("search.py", "--json", "kangaroo")
     check("rebuild does not duplicate rows", len(json.loads(r.stdout or "[]")) == 2)
 
+    # B2: a non-string text block must not crash/poison the file's indexing
+    t2 = tdir / "sess2.jsonl"
+    write_jsonl(t2, [
+        {"type": "assistant", "timestamp": "2026-01-03T00:00:00Z",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": 12345}]}},
+        {"type": "user", "timestamp": "2026-01-03T00:00:01Z",
+         "message": {"role": "user", "content": "platypus survives the bad block"}},
+    ])
+    r = run("index.py")
+    check("non-string text block does not crash index", r.returncode == 0 and "WARN" not in r.stderr)
+    r = run("search.py", "--json", "platypus")
+    check("good line after a bad block is still indexed", len(json.loads(r.stdout or "[]")) == 1)
+
+    # B1: rewrite to SAME-OR-LARGER size must be detected (not just shrink)
+    t3 = tdir / "sess3.jsonl"
+    write_jsonl(t3, [{"type": "user", "timestamp": "2026-01-04T00:00:00Z",
+                      "message": {"role": "user", "content": "OLD aardvark content here"}}])
+    run("index.py")
+    # overwrite in place with new, LONGER content (no shrink)
+    t3.write_text("")
+    write_jsonl(t3, [
+        {"type": "user", "timestamp": "2026-01-04T01:00:00Z",
+         "message": {"role": "user", "content": "NEW narwhal content alpha beta"}},
+        {"type": "user", "timestamp": "2026-01-04T01:00:02Z",
+         "message": {"role": "user", "content": "NEW narwhal content gamma delta epsilon"}},
+    ])
+    run("index.py")
+    r = run("search.py", "--json", "aardvark")
+    check("rewrite-to-larger drops stale rows (no aardvark)", json.loads(r.stdout or "[]") == [])
+    r = run("search.py", "--json", "narwhal")
+    check("rewrite-to-larger indexes ALL new lines (2 narwhal)", len(json.loads(r.stdout or "[]")) == 2)
+
     # phrase + prefix query
     r = run("search.py", "--json", "\"kangaroo exporter\"")
     check("quoted phrase match works", len(json.loads(r.stdout or "[]")) >= 1)
