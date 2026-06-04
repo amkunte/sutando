@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "_comment": "Declarative exec-approval policy. The agent classifies a high-risk action (by --kind, or by pattern-matching a --command string) and this file decides allow|confirm|deny PER ACCESS TIER. 'confirm' = pause and request async owner sign-off in #approvals before proceeding. Edit freely; check_policy.py reads it on every call (no restart). SECURITY POSTURE: the default is FAIL-CLOSED ('confirm') — an action the rules don't recognize is held for owner sign-off, never silently allowed. Add explicit allow-rules for known-safe action classes if the confirm volume is too high; do NOT flip the default back to 'allow'.",
+  "default_decision": "confirm",
+  "tiers": ["owner", "team", "other"],
+  "rules": [
+    {
+      "kind": "email_send",
+      "summary": "Send or schedule an outbound email",
+      "patterns": ["\\bgmail\\b.*\\bsend\\b", "Gmail.*(send|create_draft)", "send_message.*mail", "osascript.*Mail", "\\bsendmail\\b", "smtplib", "\\bmail\\b.*\\bsend\\b"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "message_external",
+      "summary": "Post to an external/social surface or message a non-owner (X/Twitter, SMS, outbound DM)",
+      "patterns": ["\\btweet\\b", "\\b(post|publish)\\b.*\\b(x|twitter|tweet|mastodon|linkedin)\\b", "twilio", "\\bsms\\b", "imessage", "whatsapp.*send"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "file_delete",
+      "summary": "Delete or overwrite/truncate files, or destructively reset a repo",
+      "patterns": ["\\brm\\s+-", "\\brm\\s+--", "\\brm\\b", "\\bunlink\\b", "find\\b.*-delete", "shutil\\.rmtree", "os\\.(remove|unlink)", "git\\s+push\\s+.*--force", "git\\s+clean\\s+-", "git\\s+reset\\s+--hard", "\\bmv\\b", "\\btruncate\\b", ">\\s*[^>|& ]"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "financial",
+      "summary": "Initiate a payment, purchase, or financial transaction",
+      "patterns": ["\\bcheckout\\b", "place.*order", "stripe.*charge", "\\bpayment\\b", "buy now", "\\b(venmo|paypal|zelle|wire transfer)\\b", "add to cart"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "upstream_push",
+      "summary": "Push or open a PR against an upstream third-party repo (e.g. sonichi/*), or merge any PR",
+      "patterns": ["gh\\s+pr\\s+create.*sonichi/", "git\\s+push\\s+upstream", "gh\\s+pr\\s+merge", "git\\s+push\\s+.*sonichi"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "credential_exfil",
+      "summary": "Read a secret/token/key into output or send it off-host",
+      "patterns": ["(cat|less|head|tail|bat|base64|strings)\\s+.*(\\.env|\\.pem|id_rsa|id_ed25519|access\\.json|credentials)", "\\b(env|printenv)\\b", "_TOKEN", "_KEY", "API_KEY", "SECRET", "PASSWORD", "\\.env\\b", "id_rsa", "access\\.json"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    }
+  ]
+}
