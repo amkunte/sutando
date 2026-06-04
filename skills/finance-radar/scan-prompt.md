@@ -9,42 +9,51 @@ Config: `skills/finance-radar/config.json` (`sheet_id`, focus `tabs`, alert
 thresholds). Coupled skill — it needs the in-session **Google Drive MCP**
 connector to read the sheet, so it runs in the core agent session.
 
-## Step 1 — read the sheet
+## Step 1 — download the sheet as xlsx
 
-Read the sheet via `mcp__claude_ai_Google_Drive__read_file_content` with the
-`sheet_id` from config. It returns a text representation of ALL tabs. **Focus
-ONLY on the `dashboard`, `master journal`, and `daily` tabs — ignore the rest.**
-(The sheet is large; if the tool truncates, the dashboard block is near the top
-of the relevant section — that's the one that matters.)
+Do **not** use `read_file_content` — its text rep truncates the ~1,800-row
+`daily` tab to ~191 rows (which once made us wrongly think the tab was dead).
+Download the real binary workbook instead:
 
-> Note: the `daily` tab is a dead time-series (stopped updating Nov 2021). Do
-> NOT use it for the live number — the live net worth is the dashboard's
-> "Current Net Worth" cell. The `master journal` refreshes only ~quarterly.
-
-## Step 2 — extract the dashboard into latest-snapshot.json
-
-From the **dashboard** tab, extract these figures and write them to
-`skills/finance-radar/state/latest-snapshot.json` (omit any field you can't find
-— the digest degrades gracefully; never guess a number):
-
-```json
-{
-  "as_of": "YYYY-MM-DD",          // the dashboard "as of"/Live date
-  "net_worth": 0,                  // Current Net Worth (REQUIRED)
-  "ath": 0, "ath_date": "YYYY-MM-DD",
-  "asset_classes": {"Cash": 0, "Liabilities": 0, "Real Estate": 0, "Side Inv": 0, "Stock": 0},
-  "mag7": {"concentration_pct": 0.0, "holdings": {"MSFT": 0, "GOOG": 0, "TSLA": 0, "NVDA": 0}},
-  "liquid_cash": 0,
-  "fire_net_worth": 0,             // "FIRE Net Worth (excl. primary residence)"
-  "next_milestone": 0              // next un-crossed $0.5M net-worth milestone
-}
 ```
-Liabilities are negative; real-estate and stock positive. Use whole dollars.
+mcp__claude_ai_Google_Drive__download_file_content(
+    fileId=<sheet_id from config>,
+    exportMimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+```
+The result is JSON `{content: <base64 xlsx>}` (large → likely saved to a
+tool-result file path; if so, read the `content` field from that path). Decode
+the base64 to a temp file:
+```bash
+python3 - <<'PY'
+import json, base64
+src = "<inline JSON or the saved tool-result file path>"
+d = json.load(open(src)) if src.endswith(".txt") else json.loads(src)
+open("/tmp/finance.xlsx","wb").write(base64.b64decode(d["content"]))
+print("wrote /tmp/finance.xlsx")
+PY
+```
+
+## Step 2 — extract the sheet → latest-snapshot.json (deterministic)
+
+The `daily` tab is the **live** net-worth time-series (updates ~1:15pm after
+market close, day-over-day Change column, 5+ yrs history) — it is the headline
+source. The `Dashboard` tab supplies composition (asset split, Mag-7
+concentration, liquid cash, FIRE, ATH, milestone ladder). `extract_sheet.py`
+parses BOTH from the xlsx with openpyxl — no eyeballing, no guessing:
+
+```bash
+python3 -c "import openpyxl" 2>/dev/null || pip install --user --quiet openpyxl
+python3 skills/finance-radar/scripts/extract_sheet.py /tmp/finance.xlsx
+```
+This writes `skills/finance-radar/state/latest-snapshot.json` with: `net_worth`
+(latest daily Total), `as_of`, **`day_change` / `day_change_pct`** (the sheet's
+real day-over-day change), `trend_7d` (last 7 daily Totals), plus the dashboard
+composition fields. Then delete `/tmp/finance.xlsx` (it holds raw financials).
 
 ## Step 3 — diff, alert, post
 
-Run the digest (it computes week-over-week Δ vs the stored prior point, evaluates
-threshold alerts, renders, posts to #finance, then rotates state):
+Run the digest (renders today's Δ + 7-day trend + composition + alerts, posts to
+#finance, rotates state):
 ```bash
 python3 skills/finance-radar/scripts/digest.py --post
 ```

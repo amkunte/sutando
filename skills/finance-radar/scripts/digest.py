@@ -54,14 +54,29 @@ def _pct(n):
 
 def compute(snap: dict, prior: dict, cfg: dict) -> dict:
     nw = snap.get("net_worth")
-    out = {"alerts": [], "nw_delta": None, "nw_delta_pct": None,
-           "off_ath_pct": None, "days_since_prior": None}
+    out = {"alerts": [], "nw_delta": None, "nw_delta_pct": None, "off_ath_pct": None,
+           "day_change": None, "day_change_pct": None, "week_delta": None, "week_start": None}
+
+    # Day-over-day change comes straight from the live `daily` tab (authoritative
+    # — it's why the owner keeps that tab). day_change_pct is already in %.
+    if isinstance(snap.get("day_change"), (int, float)):
+        out["day_change"] = snap["day_change"]
+    if isinstance(snap.get("day_change_pct"), (int, float)):
+        out["day_change_pct"] = snap["day_change_pct"]
+
+    # 7-day trend from the daily tab's last 7 Totals.
+    trend = [t for t in (snap.get("trend_7d") or []) if isinstance(t, (int, float))]
+    if len(trend) >= 2:
+        out["week_delta"] = trend[-1] - trend[0]
+        out["week_start"] = trend[0]
 
     ath = snap.get("ath")
     if isinstance(nw, (int, float)) and isinstance(ath, (int, float)) and ath:
         out["off_ath_pct"] = (nw - ath) / ath * 100.0
 
-    if prior and isinstance(prior.get("net_worth"), (int, float)) and isinstance(nw, (int, float)):
+    # Fallback "since last digest" delta only if the daily tab gave nothing.
+    if (out["day_change"] is None and prior
+            and isinstance(prior.get("net_worth"), (int, float)) and isinstance(nw, (int, float))):
         pnw = prior["net_worth"]
         out["nw_delta"] = nw - pnw
         out["nw_delta_pct"] = ((nw - pnw) / pnw * 100.0) if pnw else None
@@ -100,7 +115,11 @@ def compute(snap: dict, prior: dict, cfg: dict) -> dict:
 def render(snap: dict, c: dict) -> str:
     L = ["💰 **Finance digest** — net worth " + money(snap.get("net_worth"))
          + f"  (as of {snap.get('as_of','?')})"]
-    if c["nw_delta"] is not None:
+    if c["day_change"] is not None:
+        L.append(f"Today: {signed(c['day_change'])} ({_pct(c['day_change_pct'])})")
+    if c["week_delta"] is not None:
+        L.append(f"7-day: {signed(c['week_delta'])}  (from {money(c['week_start'])})")
+    if c["nw_delta"] is not None:  # fallback path only
         L.append(f"Δ vs last digest: {signed(c['nw_delta'])} ({_pct(c['nw_delta_pct'])})")
     if c["off_ath_pct"] is not None:
         L.append(f"Off ATH: {c['off_ath_pct']:+.2f}%  (ATH {money(snap.get('ath'))})")

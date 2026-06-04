@@ -13,17 +13,22 @@ radar) and no DM/Telegram, because the data is sensitive.
 
 ## How it works
 
-1. The core agent reads the configured sheet via the in-session **Google Drive
-   MCP** (this makes it a *coupled* skill — it runs in the core session, not
-   standalone) and extracts the **dashboard** tab into
-   `state/latest-snapshot.json`.
-2. `scripts/digest.py` diffs that against the stored prior week's point,
-   evaluates alert thresholds, renders the digest, posts it to #finance, and
-   rotates state (so next week has a baseline for the Δ).
+1. The core agent downloads the sheet as **xlsx** via the in-session Google
+   Drive MCP (coupled skill — runs in the core session). Binary export, NOT
+   `read_file_content`, because the text rep truncates the ~1,800-row `daily`
+   tab.
+2. `scripts/extract_sheet.py` parses it with **openpyxl**:
+   - the **`daily`** tab (the live net-worth time-series — updates ~1:15pm after
+     market close, 5+ yrs of daily rows) → latest net worth + the sheet's own
+     **day-over-day change** + a 7-day trend;
+   - the **`Dashboard`** tab → asset-class split, Mag-7 concentration, liquid
+     cash, FIRE net worth, ATH, milestone ladder.
+3. `scripts/digest.py` renders today's Δ + 7-day trend + composition + threshold
+   alerts, posts to #finance, rotates state.
 
-The `daily` tab of the sheet is a dead time-series (stopped Nov 2021), so the
-skill keeps its OWN weekly history in `state/` — resurrecting the
-week-over-week delta the dead tab used to provide.
+The day-over-day delta comes straight from the `daily` tab (authoritative); the
+skill persists its own prior point only as a fallback + for the milestone
+re-cross guard. **Dependency:** `openpyxl` (`pip install --user openpyxl`).
 
 ## Usage
 
