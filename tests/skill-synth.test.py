@@ -95,6 +95,48 @@ def run():
             import shutil
             shutil.rmtree(cdir, ignore_errors=True)
 
+        # --- REGRESSION: brace-laden task text must not crash (was a .format bug) ---
+        braces_id = "1000000000005"
+        (tmp / "tasks" / f"task-{braces_id}.txt").write_text(
+            f"id: {braces_id}\nsource: discord\n"
+            'task: parse this JSON {"a": {"b": 1}} and generate a report with f"{x}" stuff\n')
+        (tmp / "results" / f"task-{braces_id}.txt").write_text('done: {"ok": true} ' * 20)
+        synb = subprocess.run(
+            [sys.executable, str(SCRIPTS / "synthesize.py"),
+             "--from-task", braces_id, "--name", "braces-test"],
+            capture_output=True, text=True, env={**os.environ})
+        bdir = SCRIPTS.parent / "candidates" / "braces-test"
+        try:
+            checks = [
+                ("brace-laden task: synthesize exit 0 (no .format crash)", synb.returncode == 0),
+                ("brace-laden task: brief written", (bdir / "brief.md").exists()),
+                ("brace-laden task: braces preserved verbatim",
+                 '{"a": {"b": 1}}' in (bdir / "brief.md").read_text() if (bdir / "brief.md").exists() else False),
+            ]
+            for name, cond in checks:
+                print(("PASS" if cond else "FAIL") + "  " + name); ok = ok and cond
+        finally:
+            import shutil
+            shutil.rmtree(bdir, ignore_errors=True)
+
+        # --- REGRESSION: path-traversal --name must be neutralized ---
+        subprocess.run(
+            [sys.executable, str(SCRIPTS / "synthesize.py"),
+             "--from-text", "do a thing", "--name", "../../../tmp/evil"],
+            capture_output=True, text=True, env={**os.environ})
+        cand_root = SCRIPTS.parent / "candidates"
+        try:
+            no_escape = not (Path("/tmp/evil") / "SKILL.md").exists()
+            landed_inside = (cand_root / "evil").exists()
+            for name, cond in [
+                ("traversal --name: nothing created outside candidates/", no_escape),
+                ("traversal --name: sanitized to candidates/evil", landed_inside),
+            ]:
+                print(("PASS" if cond else "FAIL") + "  " + name); ok = ok and cond
+        finally:
+            import shutil
+            shutil.rmtree(cand_root / "evil", ignore_errors=True)
+
     print("ALL PASS" if ok else "SOME FAILED")
     return 0 if ok else 1
 

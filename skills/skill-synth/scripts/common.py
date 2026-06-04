@@ -95,7 +95,13 @@ def iter_tasks(ws: Path) -> list:
     files = []
     for d in _task_dirs(ws):
         files += [p for p in d.glob("task-*.txt") if TASK_RE.match(p.name)]
-    files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime  # TOCTOU-safe: file may vanish mid-scan
+        except OSError:
+            return 0.0
+    files.sort(key=_mtime, reverse=True)
     for p in files:
         t = parse_task_file(p)
         if not t["id"] or t["id"] in seen:
