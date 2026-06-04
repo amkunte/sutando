@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "_comment": "Declarative exec-approval policy. The agent classifies a high-risk action (by --kind, or by pattern-matching a --command string) and this file decides allow|confirm|deny PER ACCESS TIER. 'confirm' = pause and request async owner sign-off in #approvals before proceeding. Edit freely; check_policy.py reads it on every call (no restart).",
+  "default_decision": "allow",
+  "tiers": ["owner", "team", "other"],
+  "rules": [
+    {
+      "kind": "email_send",
+      "summary": "Send or schedule an outbound email",
+      "patterns": ["\\bgmail\\b.*\\bsend\\b", "send_message.*mail", "osascript.*Mail", "\\bsendmail\\b", "smtplib"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "message_external",
+      "summary": "Post to an external/social surface or message a non-owner (X/Twitter, SMS, outbound DM)",
+      "patterns": ["\\b(tweet|post)\\b.*\\b(x|twitter)\\b", "twilio.*messages", "\\bsms\\b.*send", "imessage.*send"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "file_delete",
+      "summary": "Delete or overwrite files outside the workspace scratch dirs",
+      "patterns": ["\\brm\\s+-[rf]", "\\brm\\s+.*/", "shutil\\.rmtree", "os\\.remove", "git\\s+push\\s+.*--force"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "financial",
+      "summary": "Initiate a payment, purchase, or financial transaction",
+      "patterns": ["\\bcheckout\\b", "place.*order", "stripe.*charge", "\\bpayment\\b.*create", "buy now"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "upstream_push",
+      "summary": "Push or open a PR against an upstream third-party repo (e.g. sonichi/*)",
+      "patterns": ["gh\\s+pr\\s+create.*sonichi/", "git\\s+push\\s+upstream", "gh\\s+pr\\s+merge"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    },
+    {
+      "kind": "credential_exfil",
+      "summary": "Read a secret/token/key into output or send it off-host",
+      "patterns": ["cat\\s+.*\\.env", "DISCORD_BOT_TOKEN", "B2_.*KEY", "API_KEY", "SECRET"],
+      "decision": { "owner": "confirm", "team": "deny", "other": "deny" }
+    }
+  ]
+}
