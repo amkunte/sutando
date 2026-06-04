@@ -1,0 +1,12 @@
+{
+  "_comment": "finance-radar config. Personal/deployment skill — reads the owner's Google Sheet via the in-session Drive MCP, posts a digest ONLY to Discord #finance (no web page). Edit thresholds freely.",
+  "sheet_id": "11wjXdlm-yXg_HSKfj6TrBul8zrTp-kqL8MrR8tN1H2E",
+  "tabs": ["dashboard", "master journal", "daily"],
+  "cadence": "weekly",
+  "alerts": {
+    "mag7_concentration_pct": 30.0,
+    "liquid_cash_floor": 250000,
+    "milestone_step": 500000,
+    "drawdown_from_ath_pct": 10.0
+  }
+}
