@@ -49,9 +49,19 @@ Walk these in order. Where a step needs the owner (secrets, a Discord token, a C
 - [ ] Memory sync: clone `~/.sutando-memory-sync` (private repo `github.com/amkunte/sutando-memory.git`) and schedule `sync-memory.sh` — Goose pulls Maverick's memory + pushes its own. Both nodes converge.
 
 ## 7. bot2bot wiring  (DECIDED 2026-06-02: Goose gets its OWN Discord bot)
-- [ ] Create the **"Goose" Discord app + bot token** (Developer Portal) — separate from Maverick's bot. Enable Message Content Intent. Invite it to the same server with the same permission set Maverick has (incl. Manage Channels if it'll create/manage channels). Set `bot_public=false` (private, like Maverick).
-- [ ] Goose's bridge uses ITS token; set Goose's `state/discord-config.json` (`node_name: "Goose"`, owner id, channel map). Enroll the owner on the Goose bot (pair/TOFU).
-- [ ] Configure `bot2bot-post` so each node @-mentions the OTHER in a coordination channel (reuse `#sutando-upstream`, or a dedicated `#bot2bot`). Maverick ↔ Goose post claims/reviews/done there.
+
+> **Channels already exist (pre-created 2026-06-04, idea #2).** The 🤖 AGENTS
+> category holds **#bot2bot**, **#maverick**, and **#goose**. Their ids are in
+> Maverick's `state/discord-config.json` → `channels.{bot2bot,maverick,goose}`
+> and `node_channels`. #bot2bot is already tagged `{"role":"bot2bot"}` in
+> Maverick's `~/.claude/channels/discord/access.json.groups` with Maverick's
+> bot id seeded in that group's `allowFrom`. So the steps below are WIRING the
+> already-created channels to Goose's bot, NOT creating channels.
+
+- [ ] Create the **"Goose" Discord app + bot token** (Developer Portal) — separate from Maverick's bot. Enable Message Content Intent. Invite it to the same server with the same permission set Maverick has (incl. Manage Channels). Set `bot_public=false` (private, like Maverick).
+- [ ] Goose's bridge uses ITS token; copy the channel map (incl. the AGENTS channels above) into Goose's `state/discord-config.json` (`node_name: "Goose"`, owner id). Enroll the owner on the Goose bot (pair/TOFU).
+- [ ] **Add Goose's bot user-id to the #bot2bot group's `allowFrom`** in BOTH nodes' `~/.claude/channels/discord/access.json` (`groups."<#bot2bot id>".allowFrom` must list BOTH bot ids) — `resolve_other_bot` reads the OTHER bot's id from that channel's allowFrom. Mirror the same `{"role":"bot2bot"}`-tagged group into Goose's access.json so `bot2bot-post` resolves the same channel on Goose.
+- [ ] Point each node's heartbeat/status at its OWN node channel: Maverick → #maverick, Goose → #goose (via `node_channels` in discord-config.json). #bot2bot stays the shared coord channel.
 - [ ] **Avoid double-processing:** ensure the two bots don't both handle the same owner DM (distinct bot tokens + each only processes its own mentions/DMs; the file-bridge task dedup + per-node claim logic must be sane). Verify no echo loops before leaving it running.
 
 ## 8. Cutover verification
