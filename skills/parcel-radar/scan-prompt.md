@@ -64,7 +64,7 @@ Set `last_scan` to current ISO8601-with-timezone; write `parcels.json` (sorted: 
 
 ## Notify
 
-If `added`, `delivered_since_last`, or `exceptions` is non-empty, write a brief Telegram notification to `results/proactive-parcel-radar-{epoch}.txt`:
+If `added`, `delivered_since_last`, or `exceptions` is non-empty, deliver this update:
 
 ```
 📦 Parcels update:
@@ -73,5 +73,12 @@ If `added`, `delivered_since_last`, or `exceptions` is non-empty, write a brief 
 ✅ N delivered: <merchant — item>
 ⚠️ N exception: <merchant — item — reason>
 ```
+
+**Delivery — post to the Discord `#parcels` channel** (deterministic; bypasses DM/Telegram proactive routing). Resolve the channel id from `discord-config.json` and post via the bot:
+```bash
+CH=$(python3 -c "import json,os;from pathlib import Path;ws=os.environ.get('SUTANDO_WORKSPACE',str(Path.home()/'.sutando/workspace'));print(json.load(open(Path(ws)/'state/discord-config.json')).get('channels',{}).get('parcels',''))" 2>/dev/null)
+if [ -n "$CH" ]; then python3 src/discord_post.py "$CH" "$MSG"; else printf '%s' "$MSG" > "results/proactive-parcel-radar-$(date +%s).txt"; fi
+```
+Post to the channel **OR** write the `results/proactive-*.txt` fallback — never both (writing both double-notifies). The channel post is the sole delivery when `#parcels` is configured; the `results/` fallback only fires when the key is absent (non-Discord setups → DM/Telegram).
 
 If nothing changed, stay silent.
