@@ -70,7 +70,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 2.5. **Scheduled-delivery catch-up (self-healing).** Run `python3 src/scheduled-catchup.py`. Daily deliveries (morning briefing 06:00, Siemens drip 07:33) are session-only crons that silently SKIP their slot if the host slept/was busy at the fire minute. For each `CATCHUP <name> :: <hint>` line the script prints, that delivery is overdue today, not yet delivered, and still inside its useful window — so **run it now** (`/morning-briefing`, or the Siemens drip per the hint), which writes its own `state/<key>-delivered-<date>.sentinel`. The sentinel makes this idempotent: a delivery that fired on time already wrote its sentinel and won't re-run; a delivery already run earlier this pass-cycle won't double-fire. Silent output = nothing overdue. (This is the reliable backstop because the 10-min loop fires far more dependably than the early-AM daily crons — see build_log 2026-06-01.)
 
-3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
+3. **Check system health.** Run `python3 src/health-check.py --notify-discord`. The `--notify-discord` flag posts health-state **transitions** (a check newly fails, or everything recovers) to the Discord **#health** channel — silent while the failing set is unchanged, so it won't spam every pass. If issues found, fix what you can (`--fix` flag), note what you can't.
 
 4. **Read the build log** (`build_log.md`) — understand what exists. Do not rebuild what works.
 
@@ -104,7 +104,12 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    - **No merge authority for bots.** All merges remain owner's call. Bots prepare + review; owner merges.
    - Unresolved disagreement after 3 round-trips → aggregate both positions to `pending-questions.md`, proceed with whichever option is cheaper to reverse.
 
-11. **Heartbeat.** If this pass shipped anything substantive (commit / PR opened or merged / memory edit / new note / new skill) AND (#bot2bot is configured AND other bot is active), post a short `done: <one-line summary>` to #bot2bot via the `bot2bot-post` skill. Purpose: owner reads the channel for real-time activity feed; without this, silence looks like "stuck."
+11. **Heartbeat / activity feed.** If this pass shipped anything substantive (commit / PR opened or merged / memory edit / new note / new skill), post a short `done: <one-line summary>` to the **#activity** channel — the owner's real-time activity feed for this node. Resolve the channel id and post deterministically via the bot:
+    ```bash
+    CH=$(python3 -c "import json,os;from pathlib import Path;ws=os.environ.get('SUTANDO_WORKSPACE',str(Path.home()/'.sutando/workspace'));print(json.load(open(Path(ws)/'state/discord-config.json')).get('channels',{}).get('activity',''))" 2>/dev/null)
+    [ -n "$CH" ] && python3 src/discord_post.py "$CH" "done: <summary>"
+    ```
+    Only post when something actually shipped — routine idle passes stay silent (don't narrate "nothing to do"). Additionally, when **#bot2bot is configured AND the other bot is active**, also post the `done:` to #bot2bot via the `bot2bot-post` skill (cross-node coordination). #activity is the solo-node feed; #bot2bot is for inter-node coord — they're complementary.
 
    **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from `pending-questions.md`), surface it via a different file Sutando.app reads, not by competing as a writer.
 

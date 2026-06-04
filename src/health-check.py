@@ -1937,12 +1937,83 @@ def recover_core_if_wedged(
             lock_fh.close()
 
 
+def _resolve_discord_channel(name: str) -> str:
+    """Channel id for `name` from workspace discord-config.json; '' if unset
+    or non-numeric."""
+    p = WORKSPACE_DIR / "state" / "discord-config.json"
+    try:
+        cid = json.loads(p.read_text()).get("channels", {}).get(name, "")
+    except Exception:
+        return ""
+    return str(cid).strip() if str(cid).strip().isdigit() else ""
+
+
+def _default_health_poster(cid: str, msg: str) -> bool:
+    try:
+        subprocess.run([sys.executable, str(REPO_DIR / "src" / "discord_post.py"), cid, msg],
+                       check=False, timeout=20)
+        return True
+    except Exception:
+        return False
+
+
+def notify_discord_health(checks: list, state_file: Optional[Path] = None,
+                          poster=None, channel_getter=None) -> None:
+    """Post health-state TRANSITIONS to the Discord #health channel — a message
+    when checks newly fail and again when everything recovers. SILENT while the
+    failing set is unchanged, so a steady outage doesn't spam every loop pass
+    (unlike the 1h-cooldown macOS/Slack surfaces — for a dedicated channel,
+    transition-on-change is the right cadence). Separate state file. `poster`
+    and `channel_getter` are injected by tests.
+
+    NOTE: 'warn' is deliberately EXCLUDED — it's advisory, and on-demand
+    services (e.g. discord-voice not running) sit at 'warn' normally; alarming
+    on them would make #health cry wolf. Only true outages (down/missing/
+    not_loaded/fail/stale) post here."""
+    failures = [c for c in checks if c["status"] in
+                ("down", "missing", "not_loaded", "fail", "stale")]
+    failing = sorted(c["name"] for c in failures)
+
+    if state_file is None:
+        state_file = WORKSPACE_DIR / "state" / "health-discord-state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prev = json.loads(state_file.read_text()).get("failing", [])
+    except Exception:
+        prev = []
+
+    if failing == prev:
+        return  # no transition → stay quiet
+
+    cid = (channel_getter or _resolve_discord_channel)("health")
+    if not cid:
+        return
+
+    if failing:
+        newly = [n for n in failing if n not in prev]
+        recov = [n for n in prev if n not in failing]
+        head = f"🔴 Health: {len(failing)} issue(s)"
+        if newly:
+            head += f" · new: {', '.join(newly)}"
+        if recov:
+            head += f" · recovered: {', '.join(recov)}"
+        lines = [head] + [f"• {c['name']}: {c['status']} — {str(c.get('detail',''))[:90]}"
+                          for c in failures[:6]]
+        msg = "\n".join(lines)
+    else:
+        msg = f"✅ Health recovered — all systems operational (was: {', '.join(prev)})"
+
+    if (poster or _default_health_poster)(cid, msg):
+        state_file.write_text(json.dumps({"failing": failing}))
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
     do_emit = "--emit-task" in sys.argv
     do_notify = "--notify-on-fail" in sys.argv
     do_notify_slack = "--notify-slack" in sys.argv
+    do_notify_discord = "--notify-discord" in sys.argv
     do_recover = "--recover-core" in sys.argv
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
@@ -1965,6 +2036,11 @@ def main():
     # the launchd-supervised fallback invocation so outages self-report.
     if do_notify_slack:
         notify_slack_for_failures(checks)
+
+    # Optional: post health-state transitions to the Discord #health channel.
+    # Transition-based (new failures / recovery), so it's quiet while steady.
+    if do_notify_discord:
+        notify_discord_health(checks)
 
     # Optional: auto-recover a wedged core (alive-but-stuck) by restarting it.
     # Independent of the checks list — keys off the queue-drain + heartbeat
