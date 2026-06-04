@@ -48,4 +48,11 @@ If you can't tell whether something is a real subscription (e.g. unclear if it's
 
 ## Notify on changes
 
-If the scan finds anything `added` or `removed` since the previous run, write a `proactive-{ts}.txt` to `results/` with a brief summary (not the full table — just "+1 added: X. -1 removed: Y") so the change is surfaced via Telegram.
+If the scan finds anything `added` or `removed` since the previous run, build a brief summary into `$MSG` (not the full table — just "+1 added: X. -1 removed: Y").
+
+**Delivery — post to the Discord `#finance` channel** (deterministic; bypasses DM/Telegram proactive routing). Resolve the channel id from `discord-config.json` and post via the bot:
+```bash
+CH=$(python3 -c "import json,os;from pathlib import Path;ws=os.environ.get('SUTANDO_WORKSPACE',str(Path.home()/'.sutando/workspace'));print(json.load(open(Path(ws)/'state/discord-config.json')).get('channels',{}).get('finance',''))" 2>/dev/null)
+if [ -n "$CH" ]; then python3 src/discord_post.py "$CH" "$MSG"; else printf '%s' "$MSG" > "results/proactive-subscriptions-$(date +%s).txt"; fi
+```
+Post to the channel **OR** write the `results/proactive-*.txt` fallback — never both. The channel post is the sole delivery when `#finance` is configured; the `results/` fallback only fires when the key is absent.
