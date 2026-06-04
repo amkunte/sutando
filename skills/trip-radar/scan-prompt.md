@@ -73,7 +73,7 @@ Use WebSearch/WebFetch for current, real options (never invent venues or prices 
 
 ## Deliver
 
-- **New trip detected** → write `results/proactive-tripradar-{epoch}.txt`:
+- **New trip detected** → message body:
   ```
   ✈️ Trip detected: <Destination> <start>–<end> (<purpose>)
   🏨 Hotels: <3 with 1-line why + link>
@@ -81,9 +81,17 @@ Use WebSearch/WebFetch for current, real options (never invent venues or prices 
   🎟 Do: <0–3>
   (Reply "more hotels" / "cheaper" / "I prefer X" to refine — I'll learn it.)
   ```
-- **Change detected** (delay/gate/cancel) → concise proactive alert.
+- **Change detected** (delay/gate/cancel) → concise alert body.
 - **Imminent check-in** (flight <24h, no check-in seen) → reminder with airline + conf #.
-- **Nothing new / no change** → stay silent (write nothing). On-demand `/trip-radar` always replies (show upcoming itinerary even if unchanged).
+
+**Delivery — post to the Discord `#travel` channel** (deterministic; bypasses DM/Telegram proactive routing). Resolve the channel id from `discord-config.json` and post the message body via the bot:
+```bash
+CH=$(python3 -c "import json,os;from pathlib import Path;ws=os.environ.get('SUTANDO_WORKSPACE',str(Path.home()/'.sutando/workspace'));print(json.load(open(Path(ws)/'state/discord-config.json')).get('channels',{}).get('travel',''))" 2>/dev/null)
+if [ -n "$CH" ]; then python3 src/discord_post.py "$CH" "$MSG"; else printf '%s' "$MSG" > "results/proactive-tripradar-$(date +%s).txt"; fi
+```
+Post to the channel **OR** write the `results/proactive-*.txt` fallback — never both. The channel post is the sole delivery when `#travel` is configured; the `results/` fallback only fires when the key is absent.
+
+- **Nothing new / no change** → stay silent (post nothing). On-demand `/trip-radar` always replies (show upcoming itinerary even if unchanged).
 
 ## Refinement = learning
 
