@@ -67,12 +67,19 @@ Set `last_scan` to current ISO8601-with-timezone, write the updated `orders.json
 
 ## Notify
 
-If `added.length > 0` OR `delivered_since_last.length > 0`, write a brief Telegram notification to `results/proactive-amazon-orders-{ts}.txt`:
+If `added.length > 0` OR `delivered_since_last.length > 0`, deliver this update:
 
 ```
 📦 Amazon orders update:
 +N newly ordered: <item titles>
 ✅ N just delivered: <item titles>
 ```
+
+**Delivery — post to the Discord `#orders` channel** (deterministic; bypasses DM/Telegram proactive routing). Resolve the channel id from `discord-config.json` and post via the bot:
+```bash
+CH=$(python3 -c "import json,os;from pathlib import Path;ws=os.environ.get('SUTANDO_WORKSPACE',str(Path.home()/'.sutando/workspace'));print(json.load(open(Path(ws)/'state/discord-config.json')).get('channels',{}).get('orders',''))" 2>/dev/null)
+if [ -n "$CH" ]; then python3 src/discord_post.py "$CH" "$MSG"; else printf '%s' "$MSG" > "results/proactive-amazon-orders-$(date +%s).txt"; fi
+```
+Post to the channel **OR** write the `results/proactive-*.txt` fallback — never both. The channel post is the sole delivery when `#orders` is configured; the `results/` fallback only fires when the key is absent.
 
 If nothing changed, stay silent.
