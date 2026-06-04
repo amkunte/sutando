@@ -1,0 +1,3 @@
+state/approvals/
+*.pyc
+__pycache__/
