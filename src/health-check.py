@@ -1948,11 +1948,23 @@ def _resolve_discord_channel(name: str) -> str:
     return str(cid).strip() if str(cid).strip().isdigit() else ""
 
 
+# On-demand services that idle at status 'warn' (not running ≠ outage). Their
+# 'warn' must NOT alarm #health, but every OTHER 'warn' (stuck core-proactive-
+# loop, task-queue pileup, stale memory-sync, dead-log bridge) IS a real,
+# actionable outage and must post.
+_ON_DEMAND_WARN = {"discord-voice", "conversation-server"}
+
+
 def _default_health_poster(cid: str, msg: str) -> bool:
     try:
-        subprocess.run([sys.executable, str(REPO_DIR / "src" / "discord_post.py"), cid, msg],
-                       check=False, timeout=20)
-        return True
+        # check=False won't raise on a non-zero exit, so gate on returncode —
+        # otherwise a failed Discord post (bad token / 404 / 429 / missing
+        # script) would still report success and burn the one alert (the state
+        # advances, the transition guard never re-fires). Only a true success
+        # may record the transition.
+        return subprocess.run(
+            [sys.executable, str(REPO_DIR / "src" / "discord_post.py"), cid, msg],
+            check=False, timeout=20).returncode == 0
     except Exception:
         return False
 
@@ -1966,12 +1978,13 @@ def notify_discord_health(checks: list, state_file: Optional[Path] = None,
     transition-on-change is the right cadence). Separate state file. `poster`
     and `channel_getter` are injected by tests.
 
-    NOTE: 'warn' is deliberately EXCLUDED — it's advisory, and on-demand
-    services (e.g. discord-voice not running) sit at 'warn' normally; alarming
-    on them would make #health cry wolf. Only true outages (down/missing/
-    not_loaded/fail/stale) post here."""
-    failures = [c for c in checks if c["status"] in
-                ("down", "missing", "not_loaded", "fail", "stale")]
+    'warn' IS included (a stuck core-loop, task pileup, stale memory-sync all
+    surface as 'warn' and are exactly what #health should report) EXCEPT for
+    the on-demand services in _ON_DEMAND_WARN, which idle at 'warn' normally —
+    those alone are filtered so the channel doesn't cry wolf."""
+    failures = [c for c in checks
+                if c["status"] in ("down", "missing", "not_loaded", "fail", "stale")
+                or (c["status"] == "warn" and c["name"] not in _ON_DEMAND_WARN)]
     failing = sorted(c["name"] for c in failures)
 
     if state_file is None:
