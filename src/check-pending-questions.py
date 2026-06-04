@@ -101,6 +101,23 @@ def get_waiting_questions():
         title = title_line.strip()
         if not title:
             continue
+        # A `---` horizontal rule terminates the section: trailing footer /
+        # scaffolding prose ("Resolved questions are not archived here…")
+        # lives below the rule and is not part of any question's body.
+        body = re.split(r'^---\s*$', body, maxsplit=1, flags=re.MULTILINE)[0]
+        # Skip scaffold / resolved headers. A title marked RESOLVED/DONE/
+        # ANSWERED (commonly struck-through, e.g. `## ~~Foo~~ — RESOLVED`)
+        # is not a waiting question even without a **Status:** field.
+        if re.search(r'\b(resolved|done|answered)\b', title, re.IGNORECASE):
+            continue
+        # Skip empty / placeholder sections such as the canonical empty
+        # template `## Active\n_(none)_`. Strip HTML comments first, then
+        # treat a body that is blank or just a "none" placeholder as no-op.
+        body_text = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL).strip()
+        if not body_text or re.fullmatch(
+            r'[_*~`\s\-—]*\(?\s*none\s*\)?[_*~`\s\-—.]*', body_text, re.IGNORECASE
+        ):
+            continue
         status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
         if status_m:
             status = status_m.group(1).strip().lower()
