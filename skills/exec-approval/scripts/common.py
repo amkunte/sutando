@@ -10,10 +10,27 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+# Valid approval-id shape. The id flows from the owner's free-text reply
+# ("approve <id>") and is used to build a filesystem path — restrict it to a
+# fixed alphabet so it can never traverse out of the approvals dir (B7).
+_ID_RE = re.compile(r"^[0-9a-z]{1,16}$")
+
+
+def valid_id(s: str) -> bool:
+    return bool(_ID_RE.match(s or ""))
+
+
+def _warn(msg: str) -> None:
+    """Warnings go to STDERR — stdout is reserved for the id / JSON the caller
+    captures via $(...). Mixing them poisoned `ID=$(request_approval.py ...)` (N1)."""
+    print(msg, file=sys.stderr)
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 POLICY_FILE = SKILL_DIR / "policy.json"
@@ -65,14 +82,16 @@ def post_to_approvals(text: str) -> bool:
     approval to disk so nothing is silently lost."""
     cid = approvals_channel_id()
     if not cid:
-        print("[exec-approval] WARN: no 'approvals' channel in discord-config.json; approval not posted to Discord")
+        _warn("[exec-approval] WARN: no 'approvals' channel in discord-config.json; approval not posted to Discord")
         return False
     try:
         tok = _discord_token()
     except Exception as e:
-        print(f"[exec-approval] WARN: {e}; approval not posted to Discord")
+        _warn(f"[exec-approval] WARN: {e}; approval not posted to Discord")
         return False
-    body = json.dumps({"content": text[:1990]}).encode()
+    # allowed_mentions parse:[] neutralizes @everyone/@here/role pings that
+    # could be injected via untrusted summary/command text (N2).
+    body = json.dumps({"content": text[:1990], "allowed_mentions": {"parse": []}}).encode()
     req = urllib.request.Request(
         f"https://discord.com/api/v10/channels/{cid}/messages",
         data=body, method="POST",
@@ -83,23 +102,26 @@ def post_to_approvals(text: str) -> bool:
         urllib.request.urlopen(req, timeout=20)
         return True
     except urllib.error.HTTPError as e:
-        print(f"[exec-approval] WARN: Discord post failed ({e.code}); approval recorded to disk only")
+        _warn(f"[exec-approval] WARN: Discord post failed ({e.code}); approval recorded to disk only")
         return False
     except Exception as e:
-        print(f"[exec-approval] WARN: Discord post failed ({e}); approval recorded to disk only")
+        _warn(f"[exec-approval] WARN: Discord post failed ({e}); approval recorded to disk only")
         return False
 
 
 def new_id() -> str:
-    """Short, sortable, collision-resistant id (base36 of ms time + 2 rand chars)."""
-    ms = int(time.time() * 1000)
-    # base36 without random/Date dependencies that some sandboxes block
+    """Short, sortable, collision-resistant id: base36(ms time) + 4 random
+    base36 chars. The random suffix prevents same-millisecond collisions that
+    would let one request silently overwrite another's pending file (B6).
+    request_approval.py additionally creates the file with O_EXCL as a belt-
+    and-suspenders guard."""
     chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-    n, s = ms, ""
+    n, s = int(time.time() * 1000), ""
     while n:
         n, r = divmod(n, 36)
         s = chars[r] + s
-    return s[-8:]
+    rand = "".join(secrets.choice(chars) for _ in range(4))
+    return (s[-8:] + rand)[-12:]
 
 
 def classify(kind: str = "", command: str = "", tier: str = "owner") -> dict:
@@ -109,27 +131,40 @@ def classify(kind: str = "", command: str = "", tier: str = "owner") -> dict:
     rule's regex patterns (first match wins). Unknown → default_decision.
     """
     policy = load_policy()
-    tier = tier if tier in policy.get("tiers", ["owner"]) else "owner"
+    # Unknown/garbage tier coerces to the LEAST-privileged tier, never owner
+    # (B3) — a typo or injected tier must not escalate. 'other' is denied for
+    # every high-risk class, so an unrecognized caller gets the safe answer.
+    known = policy.get("tiers", ["owner", "team", "other"])
+    least = known[-1] if known else "other"
+    tier = tier if tier in known else least
     rules = policy.get("rules", [])
 
-    matched = None
+    # Collect EVERY matching rule — both the explicit --kind AND any rule whose
+    # patterns match --command — then take the MOST RESTRICTIVE verdict (G4).
+    # A short-circuit on --kind would let `--kind <some-allow-rule> --command
+    # "rm -rf /"` skip the command scan once an allow-rule exists in policy.
+    matched = []
     if kind:
-        matched = next((r for r in rules if r.get("kind") == kind), None)
-    if matched is None and command:
+        r = next((r for r in rules if r.get("kind") == kind), None)
+        if r:
+            matched.append(r)
+    if command:
         for r in rules:
-            for pat in r.get("patterns", []):
-                if re.search(pat, command, flags=re.IGNORECASE):
-                    matched = r
-                    break
-            if matched:
-                break
+            if any(re.search(p, command, flags=re.IGNORECASE) for p in r.get("patterns", [])):
+                matched.append(r)
 
-    if matched is None:
-        return {"decision": policy.get("default_decision", "allow"),
-                "kind": kind or "unknown", "rule": None,
-                "reason": "no rule matched; default applied"}
+    default = policy.get("default_decision", "confirm")
+    if not matched:
+        return {"decision": default, "kind": kind or "unknown", "rule": None,
+                "reason": "no rule matched; fail-closed default applied"}
 
-    decision = matched.get("decision", {}).get(tier, "confirm")
-    return {"decision": decision, "kind": matched["kind"], "rule": matched["kind"],
-            "summary": matched.get("summary", ""),
-            "reason": f"matched rule '{matched['kind']}' for tier '{tier}'"}
+    rank = {"allow": 0, "confirm": 1, "deny": 2}
+    best = None
+    for r in matched:
+        d = r.get("decision", {}).get(tier, "confirm")
+        if best is None or rank.get(d, 1) > rank.get(best[0], 1):
+            best = (d, r)
+    decision, rule = best
+    return {"decision": decision, "kind": rule["kind"], "rule": rule["kind"],
+            "summary": rule.get("summary", ""),
+            "reason": f"most-restrictive of {len(matched)} matched rule(s) for tier '{tier}'"}

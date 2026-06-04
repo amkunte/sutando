@@ -20,6 +20,12 @@ import time
 from common import approvals_dir, new_id, post_to_approvals
 
 
+def _fence_safe(s: str) -> str:
+    """Neutralize ``` so untrusted command/summary text can't break out of the
+    code fence into live Discord markdown (N2)."""
+    return s.replace("`", "ˋ")  # U+02CB modifier-letter grave: renders, can't fence
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kind", required=True)
@@ -29,9 +35,7 @@ def main() -> int:
     ap.add_argument("--requested-by", default="core")
     args = ap.parse_args()
 
-    aid = new_id()
-    rec = {
-        "id": aid,
+    rec_base = {
         "status": "pending",
         "kind": args.kind,
         "summary": args.summary,
@@ -43,16 +47,33 @@ def main() -> int:
         "decided_by": None,
         "note": None,
     }
-    path = approvals_dir() / f"{aid}.json"
-    path.write_text(json.dumps(rec, indent=2, ensure_ascii=False))
+    # Create with O_EXCL so a same-ms id collision can never silently clobber
+    # an existing pending approval (B6). Retry with a fresh id on the rare hit.
+    adir = approvals_dir()
+    aid = None
+    for _ in range(5):
+        cand = new_id()
+        path = adir / f"{cand}.json"
+        try:
+            with open(path, "x", encoding="utf-8") as fh:
+                json.dump({"id": cand, **rec_base}, fh, indent=2, ensure_ascii=False)
+            aid = cand
+            break
+        except FileExistsError:
+            continue
+    if aid is None:
+        raise SystemExit("request_approval: could not allocate a unique id after 5 tries")
 
+    # Cap summary + command at build time so the actionable footer (the reply
+    # instruction + id) always survives the 1990-char Discord cap and is never
+    # truncated away (G3).
     card = (
         f"🔐 **Approval needed** — `{aid}`\n"
-        f"**Action:** {args.kind}\n"
-        f"{args.summary}\n"
+        f"**Action:** {_fence_safe(args.kind[:80])}\n"
+        f"{_fence_safe(args.summary[:600])}\n"
     )
     if args.command:
-        card += f"```\n{args.command[:300]}\n```\n"
+        card += f"```\n{_fence_safe(args.command[:300])}\n```\n"
     card += f"Reply **@Maverick approve {aid}** or **@Maverick deny {aid}**."
     post_to_approvals(card)
 

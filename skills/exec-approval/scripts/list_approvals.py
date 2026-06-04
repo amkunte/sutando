@@ -35,7 +35,8 @@ def main() -> int:
         if not recs:
             print("(no pending approvals)")
         for r in recs:
-            print(f"{r['id']}  [{r['status']}]  {r['kind']}: {r['summary']}  ({r['created_at']})")
+            print(f"{r.get('id','?')}  [{r.get('status','?')}]  "
+                  f"{r.get('kind','?')}: {r.get('summary','')}  ({r.get('created_at','?')})")
     return 0
 
 
