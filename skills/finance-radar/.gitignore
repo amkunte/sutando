@@ -1,0 +1,5 @@
+# Sensitive financial data — NEVER commit. Only code + config are tracked.
+state/*
+!state/.gitkeep
+__pycache__/
+*.pyc
