@@ -3436,7 +3436,13 @@ async def poll_progress():
                         try:
                             await info["msg"].delete()
                         except Exception:
-                            pass
+                            # Transient delete failure (5xx / rate-limit): keep
+                            # the entry and retry next tick so the placeholder
+                            # isn't orphaned (gemini #2). Bounded so a
+                            # permanently-undeletable message can't pin it.
+                            info["del_attempts"] = info.get("del_attempts", 0) + 1
+                            if info["del_attempts"] < 5:
+                                continue
                         _progress_msgs.pop(task_id, None)
                         continue
                     if progress_stream.placeholder_expired(elapsed):
@@ -3493,7 +3499,11 @@ async def poll_progress():
                             "last_edit": now,
                         }
                     except Exception:
-                        pass
+                        # Send failed (Forbidden / rate-limit). Mark terminal so
+                        # we do NOT re-attempt the send every tick — otherwise a
+                        # task in a channel we can't post to would hammer the API
+                        # forever (gemini #1). GC drops it when the task ends.
+                        _progress_msgs[task_id] = {"expired": True}
             # GC: drop placeholders whose task is no longer pending (delivered
             # + archived → cleared from pending_replies) so none orphan.
             for task_id in list(_progress_msgs.keys()):
@@ -3504,7 +3514,12 @@ async def poll_progress():
                         try:
                             await msg.delete()
                         except Exception:
-                            pass
+                            # Retry transient delete failures next tick rather
+                            # than forgetting (and orphaning) the message
+                            # (gemini #2). Bounded.
+                            entry["del_attempts"] = entry.get("del_attempts", 0) + 1
+                            if entry["del_attempts"] < 5:
+                                continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
         except Exception as e:
