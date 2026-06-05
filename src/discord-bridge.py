@@ -63,6 +63,7 @@ from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 REPO = resolve_workspace()
 
 # Generic plugin message-hook loader. The bridge stays a THIN, plugin-AGNOSTIC
