@@ -27,7 +27,14 @@ import urllib.request
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-WORKSPACE = SKILL_DIR.parents[1]
+REPO_DIR = SKILL_DIR.parents[1]  # repo root — code-adjacent config (.env)
+# Per-user runtime state (results/) lives under $SUTANDO_WORKSPACE, NOT the repo
+# dir. The telegram-bridge polls $SUTANDO_WORKSPACE/results/, so deriving the
+# results path from the script location silently drops match notifications
+# whenever SUTANDO_WORKSPACE != repo (the default is ~/.sutando/workspace).
+WORKSPACE = Path(
+    os.environ.get("SUTANDO_WORKSPACE", str(Path.home() / ".sutando" / "workspace"))
+).expanduser()
 STATE_DIR = SKILL_DIR / "state"
 SEEN_PATH = STATE_DIR / "seen.json"
 CRITERIA_PATH = STATE_DIR / "criteria.json"
@@ -48,7 +55,7 @@ HDRS = {
 
 def load_env():
     env = {}
-    env_path = WORKSPACE / ".env"
+    env_path = REPO_DIR / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
             line = line.strip()
