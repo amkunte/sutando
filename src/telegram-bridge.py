@@ -39,6 +39,7 @@ from task_archive import find_task_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
+import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
@@ -950,6 +951,12 @@ def main():
         #       mark result with [DELIVERY-FAILED:N] tail, pop, archive.
         #     - send_reply returns False AND under cap → leave files in
         #       place; next iteration retries.
+        # Opt-in: stream live progress for long owner tasks (no-op unless enabled).
+        try:
+            poll_progress(pending_replies)
+        except Exception as e:
+            print(f"[Telegram] poll_progress error: {e}", flush=True)
+
         for task_id in list(pending_replies.keys()):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if not result_file.exists():
@@ -965,6 +972,7 @@ def main():
             parsed = parse_markers(reply_text)
             if any(a.kind == "skip" for a in parsed.actions):
                 print(f"  Skipped (marker): {task_id}", flush=True)
+                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 pending_replies.pop(task_id, None)
                 _save_pending_replies(pending_replies)
                 _clear_progress(task_id)  # remove any progress placeholder + tier tracking
@@ -983,6 +991,7 @@ def main():
 
             if ok:
                 print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
+                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 pending_replies.pop(task_id, None)
                 _save_pending_replies(pending_replies)
                 delivery_attempts.pop(task_id, None)
@@ -1006,6 +1015,7 @@ def main():
                     )
                 except Exception:
                     pass
+                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 pending_replies.pop(task_id, None)
                 _save_pending_replies(pending_replies)
                 delivery_attempts.pop(task_id, None)
