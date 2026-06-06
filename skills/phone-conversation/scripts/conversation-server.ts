@@ -54,7 +54,7 @@ import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { hostname } from 'node:os';
-import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { resolveWorkspace, statusReadPath } from '../../../src/workspace_default.js';
 
 // Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
 // Reads $SUTANDO_MEMORY_DIR (canonical post-#870), honors legacy $SUTANDO_PRIVATE_DIR
@@ -342,6 +342,8 @@ interface CallSession {
 	events: { event: string; timestamp: string }[];
 	// Per-call channel-scan state (results/<callSid>.task-*.txt pull path).
 	channelScanHandle?: NodeJS.Timeout;
+	// Per-call dead-air narration poller (opt-in: SUTANDO_VOICE_DEADAIR=1).
+	progressNarrPoller?: NodeJS.Timeout;
 	// Safety-net against silent unlinkSync failures — `name -> first-seen ms`,
 	// pruned at 60s/tick so it can't grow unbounded for long calls.
 	channelScanSeen?: Map<string, number>;
@@ -1112,6 +1114,41 @@ async function createCallSession(params: {
 		}
 	}, 3000);
 
+	// --- Per-call dead-air narration (opt-in: SUTANDO_VOICE_DEADAIR=1) ---------
+	// When a delegated task runs long, the caller otherwise hears silence. Poll
+	// core-status.step and inject a brief "still on it" nudge once work has been
+	// running past a (phone-tuned, longer) threshold. Per-call dedup state so
+	// concurrent calls are independent. OFF by default.
+	if (process.env.SUTANDO_VOICE_DEADAIR === '1') {
+		const THRESHOLD_S = 20;   // phone UX: longer than web before first nudge
+		const MIN_GAP_S = 30;
+		const FRESH_S = 120;
+		let runningSince = 0;
+		let lastNarrateAt = 0;
+		callSession.progressNarrPoller = setInterval(() => {
+			if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) { runningSince = 0; return; }
+			try {
+				const p = statusReadPath('core-status.json', WORKSPACE_DIR);
+				if (!existsSync(p)) return;
+				const s = JSON.parse(readFileSync(p, 'utf-8'));
+				const nowS = Math.floor(Date.now() / 1000);
+				const ageS = typeof s.ts === 'number' ? nowS - s.ts : 9999;
+				const step = typeof s.step === 'string' ? s.step.trim() : '';
+				const active = s.status === 'running' && !!step && ageS < FRESH_S;
+				if (!active) { runningSince = 0; lastNarrateAt = 0; return; }
+				if (runningSince === 0) runningSince = nowS;
+				const waited = nowS - runningSince;
+				if (waited < THRESHOLD_S) return;
+				if ((nowS - lastNarrateAt) < MIN_GAP_S) return;    // absolute cooldown — rapid step churn can't bypass it
+				lastNarrateAt = nowS;
+				(callSession.voiceSession as any)?.transport?.sendContent?.([
+					{ role: 'user', text: `[System: A background task is still running (current step: "${step}", ~${waited}s elapsed). Give the caller ONE short, natural reassurance that you're still working on it. Do NOT invent or guess results, do NOT repeat a prior reassurance, do NOT say goodbye.]` },
+				], true);
+			} catch { /* best-effort; never crash the call over narration */ }
+		}, 3000);
+		callSession.progressNarrPoller.unref?.();
+	}
+
 	return callSession;
 }
 
@@ -1128,6 +1165,7 @@ function cleanupCall(callSid: string): void {
 	import('../../../src/browser-tools.js').then(bt => bt.onCallEnd()).catch(() => {});
 	session.cleanupNarration?.();
 	try { if (session.channelScanHandle) clearInterval(session.channelScanHandle); } catch {}
+	try { if (session.progressNarrPoller) clearInterval(session.progressNarrPoller); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
 
