@@ -105,7 +105,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 // "default to sutando/ so Claude Code subprocess picks up CLAUDE.md" comment
 // — voice-agent no longer spawns Claude Code (task-bridge handles that via
 // the file pipeline); the dual-use rationale is obsolete.
-import { resolveWorkspace, statusPath } from './workspace_default.js';
+import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
 const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 const DEFAULT_THREAD_KEY = 'sutando_main';
@@ -1294,8 +1294,46 @@ async function main() {
 	session.eventBus.subscribe('turn.end', () => _duck('off'));
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
+	// --- Voice dead-air narration (opt-in: SUTANDO_VOICE_DEADAIR=1) -----------
+	// When a delegated `work` task runs long, the user otherwise hears silence
+	// while the core processes. Poll core-status.step and, once work has been
+	// running past a threshold, inject a brief "still on it" nudge so the dead
+	// air is filled. OFF by default. `runningSince` is tracked locally (reset
+	// when work goes idle/stale) so sub-threshold quick tasks stay silent and
+	// the `ts` field (last-write time, not task-start) can't mislead us.
+	let deadairPoller: ReturnType<typeof setInterval> | null = null;
+	if (process.env.SUTANDO_VOICE_DEADAIR === '1') {
+		const THRESHOLD_S = 15;   // continuous work before the first nudge
+		const MIN_GAP_S = 25;     // min seconds between nudges on the same span
+		const FRESH_S = 120;      // core-status must be this fresh to count as active
+		let runningSince = 0;
+		let lastNarrateAt = 0;
+		deadairPoller = setInterval(() => {
+			try {
+				if (!session.sessionManager.isActive || !session.clientConnected) { runningSince = 0; return; }
+				const p = statusReadPath('core-status.json', WORKSPACE_DIR);
+				if (!existsSync(p)) return;
+				const s = JSON.parse(readFileSync(p, 'utf-8'));
+				const nowS = Math.floor(Date.now() / 1000);
+				const ageS = typeof s.ts === 'number' ? nowS - s.ts : 9999;
+				const step = typeof s.step === 'string' ? s.step.trim() : '';
+				const active = s.status === 'running' && !!step && ageS < FRESH_S;
+				if (!active) { runningSince = 0; lastNarrateAt = 0; return; }
+				if (runningSince === 0) runningSince = nowS;       // start of a work span
+				const waited = nowS - runningSince;
+				if (waited < THRESHOLD_S) return;                  // too quick → stay silent
+				if ((nowS - lastNarrateAt) < MIN_GAP_S) return;    // absolute cooldown — rapid step churn can't bypass it
+				lastNarrateAt = nowS;
+				injectText(session, `[System: A background task is still running (current step: "${step}", ~${waited}s elapsed). Give the user ONE short, natural reassurance that you're still working on it. Do NOT invent or guess results, do NOT repeat a prior reassurance verbatim, do NOT say goodbye.]`);
+			} catch { /* best-effort; never crash the session over narration */ }
+		}, 3000);
+		deadairPoller.unref?.();  // never keep the process alive on its own
+		console.log(`${ts()} [DeadAir] voice progress narration enabled (SUTANDO_VOICE_DEADAIR=1)`);
+	}
+
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
+		if (deadairPoller) clearInterval(deadairPoller);
 		writeVoiceMetrics();
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
