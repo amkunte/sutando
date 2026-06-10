@@ -151,8 +151,17 @@ def _gemini_pick(query: str, targets: list[dict]) -> dict:
     return {"none": True}
 
 
+class NoAccess(Exception):
+    """Charlie's role can't View / Read History on the target channel."""
+
+
 def fetch_transcript(channel_id: str, limit: int = FETCH_LIMIT) -> str:
-    msgs = _api_get(f"/channels/{channel_id}/messages?limit={limit}")
+    try:
+        msgs = _api_get(f"/channels/{channel_id}/messages?limit={limit}")
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 401):
+            raise NoAccess from e
+        raise
     if not isinstance(msgs, list):
         return ""
     lines = []
@@ -214,7 +223,11 @@ def handle(message: str) -> str:
         names = ", ".join(f"#{c['name']}" for c in res["candidates"])
         return f"A few could match \"{query}\": {names}. Which one?"
     target = res["match"]
-    transcript = fetch_transcript(target["id"])
+    try:
+        transcript = fetch_transcript(target["id"])
+    except NoAccess:
+        return (f"I found **#{target['name']}** but my role can't read it (Discord 403). "
+                f"Ask Chi to grant the Charlie role View Channel + Read Message History there.")
     if not transcript:
         return f"Found #{target['name']} but it has no readable recent messages."
     summary = summarize(transcript, message, target["name"])
