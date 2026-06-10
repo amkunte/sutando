@@ -10,10 +10,20 @@
 # Both default-safe: the personal bridge (which sets neither) is unaffected.
 set -euo pipefail
 
+# Flush bridge logs in real time (Python buffers stdout when not a tty, which hides
+# the "ready" line and live activity behind nohup redirection).
+export PYTHONUNBUFFERED=1
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
-export SUTANDO_WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace-charlie}"
-export SUTANDO_DISCORD_CHANNELS_DIR="${SUTANDO_DISCORD_CHANNELS_DIR:-$HOME/.claude/channels/discord-charlie}"
+# Hard-set Charlie's workspace + channels dir. Do NOT default off an inherited
+# SUTANDO_WORKSPACE / SUTANDO_DISCORD_CHANNELS_DIR — when this script is launched
+# from a context that already exports those (e.g. the personal sutando-core), a
+# `${VAR:-default}` would inherit the PERSONAL workspace, collide on the personal
+# bridge's single-instance lock, and Charlie would exit. Override only via the
+# dedicated CHARLIE_* vars, which never leak from the personal core.
+export SUTANDO_WORKSPACE="${CHARLIE_WORKSPACE:-$HOME/.sutando/workspace-charlie}"
+export SUTANDO_DISCORD_CHANNELS_DIR="${CHARLIE_CHANNELS_DIR:-$HOME/.claude/channels/discord-charlie}"
 
 CHANNELS_DIR="$SUTANDO_DISCORD_CHANNELS_DIR"
 WS="$SUTANDO_WORKSPACE"
