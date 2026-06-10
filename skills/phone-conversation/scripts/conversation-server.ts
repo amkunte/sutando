@@ -1365,9 +1365,15 @@ function validateTwilioSignature(req: IncomingMessage, rawBody: string): boolean
 	const fullUrl = `${scheme}://${host}${req.url ?? ''}`;
 
 	// Sort POST params and concatenate key+value (no separator — Twilio spec).
+	// MUST sort by code-unit (ASCII) order, NOT localeCompare: Twilio signs with a
+	// standard lexicographic sort, where uppercase sorts before lowercase. Inbound
+	// voice webhooks include both "CallSid" and "Called"/"CallStatus", whose relative
+	// order differs under locale collation — localeCompare produced a different signed
+	// string than Twilio's → HMAC mismatch → 403 on every real inbound call (regression
+	// from the original PR #48 signature check).
 	const params = new URLSearchParams(rawBody);
 	const paramStr = [...params.entries()]
-		.sort((a, b) => a[0].localeCompare(b[0]))
+		.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
 		.map(([k, v]) => k + v)
 		.join('');
 
