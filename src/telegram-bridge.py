@@ -388,7 +388,21 @@ def api(method, **params):
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         print(f"API error {e.code}: {body}")
-        return {"ok": False}
+        # Telegram error bodies are JSON: {"ok":false,"error_code":N,"description":...}.
+        # Propagate error_code so callers can distinguish conditions — notably a
+        # 409 Conflict (another getUpdates poller is live on this token). Falls
+        # back to a bare {"ok": False, "error_code": <http>} when the body isn't
+        # valid JSON. Backward-compatible: callers checking result.get("ok")
+        # still see a falsy ok. (json.JSONDecodeError subclasses ValueError.)
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                parsed["ok"] = False
+                parsed.setdefault("error_code", e.code)
+                return parsed
+        except ValueError:
+            pass
+        return {"ok": False, "error_code": e.code}
 
 INBOX_DIR = REPO / "telegram-inbox"
 INBOX_DIR.mkdir(exist_ok=True)
@@ -709,6 +723,22 @@ def main():
         except Exception as e:
             print(f"[Telegram] Poll error: {e}", flush=True)
             time.sleep(5)
+            continue
+        # 409 Conflict = another getUpdates poller is live on this bot token
+        # (e.g. a second host running telegram-bridge — Telegram permits only
+        # ONE long-poller per token). A 409 returns immediately (it does NOT
+        # honor the 10s long-poll hold), so without a backoff this spins in a
+        # tight loop hammering the API and flooding logs with opaque
+        # "API error 409" lines. Surface the condition with an actionable
+        # message and back off so the duplicate poller is obvious and cheap to
+        # diagnose. (Guards the multi-host hazard: Maverick + Goose both
+        # polling the same bot.)
+        if not result.get("ok") and result.get("error_code") == 409:
+            print("[Telegram] 409 Conflict — another telegram-bridge is polling "
+                  "this bot token. Only one poller is allowed per token; stop "
+                  "the bridge on the other host (single owner of the Telegram "
+                  "bridge). Backing off 15s.", flush=True)
+            time.sleep(15)
             continue
         # Heartbeat advances only on a response Telegram actually accepted.
         # A bumped heartbeat now means "the Telegram API round-trip is
