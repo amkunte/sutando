@@ -172,17 +172,29 @@ except Exception:  # pragma: no cover
     def _push_vision_image(path: str, source: str = "discord") -> bool:  # type: ignore
         return False
 
+# Channels config dir — env-overridable so a second, isolated bot instance
+# (e.g. the "Charlie" community node) can co-host on the same home without
+# sharing the personal bot's token / access.json. Defaults to the historic
+# path, so the personal bot's behavior is unchanged. Removes a hardcoded
+# home-relative path (same anti-pattern class as the workspace-resolution work).
+CHANNELS_DIR = Path(
+    os.environ.get(
+        "SUTANDO_DISCORD_CHANNELS_DIR",
+        str(Path.home() / ".claude" / "channels" / "discord"),
+    )
+).expanduser()
+
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 if not TOKEN:
-    channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+    channels_env = CHANNELS_DIR / ".env"
     if channels_env.exists():
         for line in channels_env.read_text().splitlines():
             if line.startswith("DISCORD_BOT_TOKEN="):
                 TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
-    print("DISCORD_BOT_TOKEN not set in ~/.claude/channels/discord/.env")
+    print(f"DISCORD_BOT_TOKEN not set in {CHANNELS_DIR / '.env'}")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -605,8 +617,8 @@ if TEAM_TIER_OWNER:
 seen_message_ids = set()  # Discord message IDs already processed
 
 
-# Load access config
-ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+# Load access config (honors SUTANDO_DISCORD_CHANNELS_DIR for isolated instances)
+ACCESS_FILE = CHANNELS_DIR / "access.json"
 
 # Bare-except previously here masked real faults (corrupt JSON, permission
 # flip, transient OS error) as the "pre-pairing legitimate state" outcome.
