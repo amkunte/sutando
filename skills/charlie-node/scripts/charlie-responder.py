@@ -30,6 +30,10 @@ import sys
 import time
 from pathlib import Path
 
+# Owner-tier capability module (thread read + summarize) lives alongside this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import charlie_thread_read as thread_read  # noqa: E402
+
 # --- Hard-set Charlie's workspace (do NOT inherit a personal SUTANDO_WORKSPACE;
 #     same env-leak lesson as the launcher). Override only via CHARLIE_WORKSPACE.
 WS = Path(os.environ.get("CHARLIE_WORKSPACE", str(Path.home() / ".sutando" / "workspace-charlie")))
@@ -189,6 +193,21 @@ def process(path: Path) -> None:
 
     if not msg or len(re.sub(r"[^\w]", "", msg)) < 2:
         log(f"{tid}: empty/noise — archived, no reply")
+        archive(path)
+        return
+
+    # OWNER-TIER capabilities run before the community answer-only path.
+    # Only callers Charlie treats as owner (in its allowFrom) reach access_tier
+    # "owner"; everyone in the public server stays "other" and never gets here.
+    if t["access_tier"] == "owner" and thread_read.is_read_command(msg):
+        log(f"{tid}: owner thread-read command — {msg[:80]!r}")
+        try:
+            reply = thread_read.handle(msg)
+        except Exception as e:
+            log(f"{tid}: thread-read error {e!r}")
+            reply = "Hit an error reading that thread — check the responder log."
+        write_result(rid, reply)
+        log(f"{tid}: thread-read replied ({len(reply)} chars)")
         archive(path)
         return
 
