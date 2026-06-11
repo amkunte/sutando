@@ -75,6 +75,29 @@ def check_port(port: int, name: str) -> dict:
         return {"name": name, "status": "error", "detail": str(e)}
 
 
+def check_credential_proxy() -> dict:
+    """Check the quota-tracking credential proxy (port 7846).
+
+    The proxy man-in-the-middles the core's Anthropic API traffic to read the
+    rate-limit headers that feed quota-state.json. It only matters when the core
+    is routed through it (ANTHROPIC_BASE_URL=http://localhost:7846) — but when it
+    IS routed, a dead proxy means the core can't reach the API at all, so this
+    must auto-restart fast. `warn` (not `down`): a missing proxy degrades quota
+    visibility but the core still works on a direct connection; --fix relaunches
+    it. Skipped entirely when the proxy was never set up (no credential-proxy.ts).
+    """
+    proxy_ts = Path.home() / ".claude" / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
+    if not proxy_ts.exists():
+        return None  # quota-tracker not installed on this node → not applicable
+    c = check_port(7846, "credential-proxy")
+    if c["status"] == "ok":
+        c["detail"] = "port 7846 (quota tracking)"
+    else:
+        c["status"] = "warn"
+        c["detail"] = "down — quota tracking off (CRITICAL if core routed via ANTHROPIC_BASE_URL)"
+    return c
+
+
 def check_launchd(label: str) -> dict:
     """Check if a launchd job is loaded and running."""
     try:
@@ -1270,6 +1293,10 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
 
+    proxy_check = check_credential_proxy()
+    if proxy_check is not None:
+        checks.append(proxy_check)
+
     return checks
 
 
@@ -2237,6 +2264,16 @@ def main():
                                      stdout=open("/tmp/ngrok.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: restarted")
+                elif c["name"] == "credential-proxy":
+                    # Relaunch the quota proxy on port 7846 (matches startup.sh).
+                    # This is the periodic backstop; for sub-second crash recovery
+                    # when the core is routed through the proxy, supervise it via
+                    # launchd KeepAlive instead (see scripts/install-credential-proxy-launchagent.sh).
+                    proxy_ts = Path.home() / ".claude" / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
+                    subprocess.Popen(["npx", "tsx", str(proxy_ts)],
+                                     stdout=open("/tmp/credential-proxy.log", "a"),
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+                    print(f"  {c['name']}: restarted (port 7846)")
                 elif c["name"] == "tailscale-funnel":
                     # Re-enable Tailscale Funnel for port 3100
                     ts_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
