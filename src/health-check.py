@@ -863,6 +863,34 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+def check_notes_symlink() -> "dict | None":
+    """Regression guard (2026-06-11): <workspace>/notes must stay a symlink into
+    the memory-sync repo. The original drift (caught this session) was notes/
+    silently reverting to a real dir, so edits stopped syncing while sync-memory
+    only logged a WARN to cron output no one reads. Surface it as a health warn
+    instead — name is not in _ON_DEMAND_WARN, so --notify-discord posts the
+    transition to #health."""
+    ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    # On a public-repo-checkout WORKSPACE, notes/ is legitimately a real dir —
+    # the symlink architecture only applies to the ~/.sutando/workspace home
+    # (mirrors sync-memory.sh's repo-checkout skip + split-brain's same-path guard).
+    if ws_notes.resolve() == (REPO_DIR / "notes").resolve():
+        return None
+    if not ws_notes.exists() and not ws_notes.is_symlink():
+        return None  # missing entirely → notes-dir check + sync-memory bootstrap own this
+    if ws_notes.is_symlink():
+        return None  # symlink intact → silent
+    return {
+        "name": "notes-symlink",
+        "status": "warn",
+        "detail": (
+            f"{ws_notes} is a real dir, not a symlink into the memory-sync repo "
+            f"— notes edits will silently stop syncing. "
+            f"Reconcile via the rsync + rm -rf + ln -s command sync-memory.sh prints."
+        ),
+    }
+
+
 def _is_cohost_discord_bridge(pid: str) -> bool:
     """True if this discord-bridge.py PID is a co-hosted instance bound to a
     NON-default channels dir (e.g. Charlie, PR #104), identified by a
@@ -939,6 +967,11 @@ def run_all_checks() -> list[dict]:
     _notes_sb = check_notes_split_brain()
     if _notes_sb:
         checks.append(_notes_sb)
+
+    # Notes symlink regression guard: <workspace>/notes reverted to a real dir (silent sync drift)
+    _notes_sym = check_notes_symlink()
+    if _notes_sym:
+        checks.append(_notes_sym)
 
     # Memory sync
     checks.append(check_memory_sync())
