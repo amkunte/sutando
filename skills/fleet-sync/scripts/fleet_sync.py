@@ -113,27 +113,66 @@ def git(args, check=True) -> str:
     return run(["git", "-C", str(SYNC_DIR)] + args, check=check)
 
 
-def rsync(src: Path, dst: Path, dry: bool) -> bool:
-    """Mirror src/ → dst/ with --delete. Returns True if anything changed.
-    --delete is bounded to dst (a manifest-listed path), never a parent."""
-    dst.mkdir(parents=True, exist_ok=True)
+def _rsync_args(src: Path, dst: Path, dry: bool) -> list[str]:
     # Exclude history/ snapshot dirs (per-skill rollback backups) — syncing 36+
     # snapshots/skill bloats the private repo's git history permanently. We sync
     # CURRENT state cross-fleet; history stays local on the owning node
     # (red-team, Maverick 2026-06-11).
-    args = ["rsync", "-a", "--delete", "--itemize-changes",
+    # --checksum: compare by content hash, not size+mtime. The data is small
+    # (state JSONs + a personal skill dir) so the cost is trivial, and it makes
+    # change-detection content-correct — no transfer on a pure mtime bump (the
+    # churn risk), and a real content change always syncs even if size+mtime
+    # happen to match. Same pattern sync-memory.sh uses for its small rsyncs.
+    args = ["rsync", "-a", "--checksum", "--delete", "--itemize-changes",
             "--exclude=history", "--exclude=node_modules", "--exclude=__pycache__",
             "--exclude=*.pyc", "--exclude=.DS_Store", "--exclude=.venv",
             f"{src}/", f"{dst}/"]
     if dry:
         args.insert(1, "-n")
-    out = run(args, check=False)
+    return args
+
+
+def _real_changes(out: str) -> bool:
     # Count only REAL changes: itemize lines whose first char is a transfer
     # (`<`/`>`), local create/change (`c`), hardlink (`h`), or a message such
     # as `*deleting`. Lines starting with `.` are attribute-only (e.g. a
     # directory mtime bump) and must NOT trigger a commit+push — otherwise the
     # repo churns every run (the contention the red-team warned about).
     return any(ln[:1] in "<>ch*" for ln in out.splitlines() if ln.strip())
+
+
+def rsync(src: Path, dst: Path, dry: bool) -> bool:
+    """Mirror src/ → dst/ with --delete. Returns True if anything changed.
+    --delete is bounded to dst (a manifest-listed path), never a parent.
+    Used PUSH-side (dst = repo, recoverable via reflog)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    return _real_changes(run(_rsync_args(src, dst, dry), check=False))
+
+
+def rsync_pull(src: Path, dst: Path, dry: bool):
+    """Guarded PULL: dst is a LOCAL gitignored skill dir (NOT recoverable), so
+    the --delete blast radius is asymmetric vs push. Two guards before we let
+    --delete touch local state (red-team, Maverick 2026-06-11):
+
+      1. Empty-src guard: a legitimate owner state is never empty — it always
+         has at least the current-state file. An empty/partial `src` means a
+         failed/racing push or corruption; mirroring it would WIPE good local
+         state (catastrophic if a node-identity misconfig flipped the OWNER
+         into a puller). Refuse.
+      2. Mass-delete abort: dry-run, count `*deleting` lines; if it would delete
+         more than MAX_DELETE local files, refuse.
+
+    Both overridable with SUTANDO_FORCE_SYNC=1. Returns (changed, note)."""
+    if not any(p.is_file() for p in src.rglob("*")):
+        return False, "skip: source empty (refusing to --delete local state)"
+    dst.mkdir(parents=True, exist_ok=True)
+    dry_out = run(_rsync_args(src, dst, True), check=False)
+    deletes = sum(1 for ln in dry_out.splitlines() if ln.startswith("*deleting"))
+    if deletes > MAX_DELETE and os.environ.get("SUTANDO_FORCE_SYNC") != "1":
+        return False, f"skip: would delete {deletes} local files (>{MAX_DELETE}); set SUTANDO_FORCE_SYNC=1 to override"
+    if dry:
+        return _real_changes(dry_out), "dry-run"
+    return _real_changes(run(_rsync_args(src, dst, False), check=False)), ""
 
 
 def main() -> int:
@@ -197,7 +236,8 @@ def main() -> int:
             if not pushed_ok:
                 print("fleet-sync: WARN — push still failing after retries; next run will retry.")
 
-        # PULL: items this node does NOT own → expand(local)
+        # PULL: items this node does NOT own → expand(local). Guarded, because
+        # dst is unrecoverable local state (see rsync_pull).
         for it in items:
             if it.get("owner") == node:
                 continue
@@ -205,8 +245,11 @@ def main() -> int:
             if not src.exists():
                 continue  # owner hasn't pushed yet
             local = expand(it["local"])
-            if rsync(src, local, dry):
+            changed, note = rsync_pull(src, local, dry)
+            if changed:
                 pulled.append(it["id"])
+            if note and note.startswith("skip"):
+                skipped.append(f"{it['id']} pull {note}")
 
         tag = "[dry-run] " if dry else ""
         print(f"fleet-sync ({node}): {tag}pushed={pushed or '-'} pulled={pulled or '-'}"
