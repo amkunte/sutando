@@ -854,6 +854,29 @@ def check_notes_split_brain() -> "dict | None":
     }
 
 
+def _is_cohost_discord_bridge(pid: str) -> bool:
+    """True if this discord-bridge.py PID is a co-hosted instance bound to a
+    NON-default channels dir (e.g. Charlie, PR #104), identified by a
+    ``SUTANDO_DISCORD_CHANNELS_DIR`` env var that doesn't point at the default
+    ``~/.claude/channels/discord``. Such a process is a legitimate second
+    bridge on the same host, not a Maverick duplicate — so the "multiple
+    processes" check must not count it. Without this, the warn fires
+    permanently whenever Charlie co-hosts, masking a real duplicate (alarm
+    fatigue). Fails closed (returns False → counted as primary) if the env
+    can't be read, so a genuine duplicate is never silently hidden."""
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "eww", pid], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    m = re.search(r"SUTANDO_DISCORD_CHANNELS_DIR=(\S+)", out)
+    if not m:
+        return False
+    default = str(Path.home() / ".claude" / "channels" / "discord").rstrip("/")
+    return m.group(1).rstrip("/") != default
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -1061,10 +1084,20 @@ def run_all_checks() -> list[dict]:
             checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
             continue
 
-        # Check 1: Multiple processes (zombie/duplicate)
-        if len(pids) > 1:
-            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})"})
+        # Check 1: Multiple processes (zombie/duplicate). For discord-bridge,
+        # a co-hosted Charlie bridge (PR #104) legitimately runs a 2nd
+        # discord-bridge.py against a non-default channels dir — exclude those
+        # so the warn only fires on a real PRIMARY-bridge duplicate.
+        primary_pids = pids
+        if name == "discord-bridge" and len(pids) > 1:
+            primary_pids = [p for p in pids if not _is_cohost_discord_bridge(p)]
+        if len(primary_pids) > 1:
+            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(primary_pids)} PIDs: {','.join(primary_pids)})"})
             continue
+        # Co-hosts present but exactly one primary → healthy; continue checks
+        # against the primary pid (drop co-host pids from downstream logic).
+        if primary_pids:
+            pids = primary_pids
 
         # Check 2: Log file freshness — prefer logs/ (where startup.sh writes)
         # and fall back to src/ for legacy. The src/ default was silently a
