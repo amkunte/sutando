@@ -12,7 +12,7 @@ migration — a one-time fix, not a sustaining channel. This engine makes it
 durable.
 
 Design:
-  * Channel = the existing PRIVATE memory repo (~/.sutando/memory-sync, the
+  * Channel = the existing PRIVATE memory repo (~/.sutando-memory-sync, the
     same repo sync-memory.sh uses) under a distinct top-level `fleet/`
     namespace. NOT the public repo; NOT sync-memory's `machine-<host>/`
     backup namespace (that's one-way disaster-recovery only).
@@ -45,7 +45,11 @@ from pathlib import Path
 HOME = Path.home()
 REPO_DIR = Path(__file__).resolve().parents[3]  # skills/fleet-sync/scripts/<f> → repo root
 WORKSPACE = Path(os.environ.get("SUTANDO_WORKSPACE", str(HOME / ".sutando" / "workspace"))).expanduser()
-SYNC_DIR = Path(os.environ.get("SUTANDO_MEMORY_SYNC_DIR", str(HOME / ".sutando" / "memory-sync"))).expanduser()
+# Default must match where sync-memory.sh actually clones the repo on every
+# node: `$HOME/.sutando-memory-sync` (hyphenated, NOT ~/.sutando/memory-sync).
+# The old default never existed on disk, so the engine failed at startup on any
+# node without the SUTANDO_MEMORY_SYNC_DIR override. Override still honored.
+SYNC_DIR = Path(os.environ.get("SUTANDO_MEMORY_SYNC_DIR", str(HOME / ".sutando-memory-sync"))).expanduser()
 FLEET_DIR = SYNC_DIR / "fleet"
 MANIFEST = FLEET_DIR / "manifest.json"
 DATA_DIR = FLEET_DIR / "data"
