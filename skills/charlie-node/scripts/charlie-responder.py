@@ -33,6 +33,7 @@ from pathlib import Path
 # Owner-tier capability module (thread read + summarize) lives alongside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charlie_thread_read as thread_read  # noqa: E402
+import charlie_relay as relay  # noqa: E402
 
 # --- Hard-set Charlie's workspace (do NOT inherit a personal SUTANDO_WORKSPACE;
 #     same env-leak lesson as the launcher). Override only via CHARLIE_WORKSPACE.
@@ -42,6 +43,8 @@ RESULTS_DIR = WS / "results"
 ARCHIVE_DIR = WS / "tasks" / "archive"
 LOG_FILE = WS / "logs" / "responder.log"
 LOCK_FILE = WS / "state" / "locks" / "charlie-responder.lock"
+# Charlie's most recent reply, so "send THAT to Maverick" (anaphora) can resolve it.
+LAST_REPLY_FILE = WS / "state" / "last-reply.txt"
 
 POLL_SECONDS = 3
 RATE_MAX_PER_MIN = 6           # cap gemini calls / rolling minute
@@ -185,6 +188,22 @@ def write_result(task_id: str, body: str) -> None:
     (RESULTS_DIR / f"task-{task_id}.txt").write_text(body)
 
 
+def store_last_reply(body: str) -> None:
+    """Remember Charlie's last substantive reply so 'send THAT to Maverick' resolves it."""
+    try:
+        LAST_REPLY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_REPLY_FILE.write_text(body)
+    except OSError:
+        pass
+
+
+def read_last_reply() -> str | None:
+    try:
+        return LAST_REPLY_FILE.read_text()
+    except OSError:
+        return None
+
+
 def process(path: Path) -> None:
     t = parse_task(path)
     tid, msg = t["id"], t["message"]
@@ -207,7 +226,21 @@ def process(path: Path) -> None:
             log(f"{tid}: thread-read error {e!r}")
             reply = "Hit an error reading that thread — check the responder log."
         write_result(rid, reply)
+        store_last_reply(reply)
         log(f"{tid}: thread-read replied ({len(reply)} chars)")
+        archive(path)
+        return
+
+    # OWNER-TIER relay (option B): hand content to Maverick via #bot2bot.
+    if t["access_tier"] == "owner" and relay.is_relay_command(msg):
+        log(f"{tid}: owner relay command — {msg[:80]!r}")
+        try:
+            reply = relay.handle(msg, read_last_reply())
+        except Exception as e:
+            log(f"{tid}: relay error {e!r}")
+            reply = "Hit an error relaying to #bot2bot — check the responder log."
+        write_result(rid, reply)
+        log(f"{tid}: relay replied ({len(reply)} chars)")
         archive(path)
         return
 
@@ -221,6 +254,8 @@ def process(path: Path) -> None:
     reply = run_gemini(msg)
     if reply:
         write_result(rid, reply)
+        if t["access_tier"] == "owner":
+            store_last_reply(reply)  # so the owner can later "send that to Maverick"
         log(f"{tid}: replied ({len(reply)} chars)")
     else:
         # Stay silent on engine failure rather than emit a broken reply.
