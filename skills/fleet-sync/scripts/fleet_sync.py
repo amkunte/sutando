@@ -234,29 +234,38 @@ def main() -> int:
                 pushed.append(it["id"])
                 changed = True
 
-        # Commit + push owned changes (with race-safe retry against sync-memory.sh)
-        if changed and not dry:
+        # Commit + push any pending fleet/ change (race-safe retry vs sync-memory.sh).
+        # Stage the WHOLE fleet/ tree — owned-item data AND a hand-edited manifest.
+        # The manifest must propagate too (e.g. an ownership flip): keying the
+        # commit only on rsync data-changes left a manifest edit sitting
+        # uncommitted until some data also changed (gap found 2026-06-11 during
+        # the karts-air ownership move). `git add fleet` only touches fleet/, so
+        # this never interferes with sync-memory's memory/ commits in the same repo.
+        if not dry:
             git(["add", "fleet"])
-            deleted = len([l for l in git(["diff", "--cached", "--name-only", "--diff-filter=D"]).splitlines() if l])
-            if deleted > MAX_DELETE and os.environ.get("SUTANDO_FORCE_SYNC") != "1":
-                git(["reset", "-q"], check=False)
-                print(f"fleet-sync: ABORT — push would delete {deleted} files (>{MAX_DELETE}). Set SUTANDO_FORCE_SYNC=1 to override.")
-                return 1
-            git(["commit", "-m", f"fleet-sync: {node} push [{', '.join(pushed)}]"], check=False)
-            # Bounded rebase-retry: the private repo has up to 4 writers
-            # (each node's sync-memory.sh + this engine). Non-fast-forward
-            # rejections are normal under contention — pull-rebase and retry.
-            pushed_ok = False
-            for attempt in range(6):
-                git(["pull", "--rebase", "--autostash"], check=False)
-                r = subprocess.run(["git", "-C", str(SYNC_DIR), "push"],
-                                   capture_output=True, text=True)
-                if r.returncode == 0:
-                    pushed_ok = True
-                    break
-                time.sleep(1 + attempt)  # small backoff
-            if not pushed_ok:
-                print("fleet-sync: WARN — push still failing after retries; next run will retry.")
+            staged = [l for l in git(["status", "--porcelain", "fleet"]).splitlines() if l.strip()]
+            if staged:
+                deleted = len([l for l in git(["diff", "--cached", "--name-only", "--diff-filter=D"]).splitlines() if l])
+                if deleted > MAX_DELETE and os.environ.get("SUTANDO_FORCE_SYNC") != "1":
+                    git(["reset", "-q"], check=False)
+                    print(f"fleet-sync: ABORT — push would delete {deleted} files (>{MAX_DELETE}). Set SUTANDO_FORCE_SYNC=1 to override.")
+                    return 1
+                what = f"push [{', '.join(pushed)}]" if pushed else "manifest/config update"
+                git(["commit", "-m", f"fleet-sync: {node} {what}"], check=False)
+                # Bounded rebase-retry: the private repo has up to 4 writers
+                # (each node's sync-memory.sh + this engine). Non-fast-forward
+                # rejections are normal under contention — pull-rebase and retry.
+                pushed_ok = False
+                for attempt in range(6):
+                    git(["pull", "--rebase", "--autostash"], check=False)
+                    r = subprocess.run(["git", "-C", str(SYNC_DIR), "push"],
+                                       capture_output=True, text=True)
+                    if r.returncode == 0:
+                        pushed_ok = True
+                        break
+                    time.sleep(1 + attempt)  # small backoff
+                if not pushed_ok:
+                    print("fleet-sync: WARN — push still failing after retries; next run will retry.")
 
         # PULL: items this node does NOT own → expand(local). Guarded, because
         # dst is unrecoverable local state (see rsync_pull).
