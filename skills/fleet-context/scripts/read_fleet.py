@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fleet-context READER (ingest/awareness half).
 
-Merges ALL nodes' per-node logs (`<memory>/fleet/context-*.md`) into one
+Merges ALL nodes' per-node logs (`<memory>/fleet-context-*.md`) into one
 time-ordered view of recent fleet activity. Run at session start / on demand
 so this node knows what its peers (Maverick, Goose, …) have been doing without
 waiting to be told. The durable copies arrive via the memory-sync repo
@@ -21,13 +21,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 LINE = re.compile(r"^\[(?P<node>\S+)\s+(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z)\]\s+(?P<rest>.*)$")
+REPO = Path(__file__).resolve().parents[3]  # skills/fleet-context/scripts/<file> → repo root
 
 
 def memory_dir() -> Path:
+    """Node-portable memory dir — slug derived from the repo path (see fleet_relay)."""
     env = os.environ.get("SUTANDO_MEMORY_DIR")
     if env:
         return Path(os.path.expanduser(env))
-    return Path.home() / ".claude" / "projects" / "-Users-abhi-sutando" / "memory"
+    slug = str(REPO).replace("/", "-")
+    return Path.home() / ".claude" / "projects" / slug / "memory"
 
 
 def main() -> int:

@@ -6,18 +6,18 @@ node just did / learned — near-instantly via a #bot2bot post, durably via a
 per-node append-only log that rides the existing memory-sync repo.
 
 Locked spec (Goose<>Maverick, 2026-06-10, owner Viper):
-  - PER-NODE files: this node only ever writes its own
-    `<memory>/fleet/context-<Node>.md`; each node reads ALL of them on ingest
+  - PER-NODE files: this node only ever writes its own FLAT top-level file
+    `<memory>/fleet-context-<Node>.md`; each node reads ALL of them on ingest
     → zero shared-file writes → zero git-rebase conflicts (same lesson as the
     memory-sync race).
-  - LOCATION = the memory dir (`$SUTANDO_MEMORY_DIR`, default
-    `~/.claude/projects/-Users-abhi-sutando/memory`). VERIFIED this is what
-    sync-memory.sh actually propagates: its `rsync -a "$MEM_SRC/" …` is
-    RECURSIVE, so `memory/fleet/` syncs cross-node. (The workspace `notes/`
-    dir is NOT synced — sync-memory uses the *repo* notes path — and the repo
-    `notes/` is git-tracked, so neither is a safe home. memory/fleet/ syncs
-    AND pollutes neither the repo nor the loaded context, since only MEMORY.md
-    is auto-loaded, not subdirs.)
+  - LOCATION = a FLAT `*.md` in the memory dir — NOT a subdir. There are two
+    sync-memory.sh variants: the repo `scripts/sync-memory.sh` globs top-level
+    `memory/*.md` ONLY; the local-install rsyncs `-a`. A subdir (`memory/fleet/`)
+    silently dies under the glob script, and the workspace/repo `notes/` paths
+    aren't safe (not synced / git-tracked). A flat `<memory>/fleet-context-*.md`
+    rides the top-level `*.md` loop under BOTH scripts, and never pollutes the
+    loaded context (only MEMORY.md is auto-loaded). The memory dir itself is
+    node-portable — see memory_dir(), slug derived from the repo path.
   - Append-only, `[<Node> <ISO-UTC>]` line prefixes.
   - Two entry kinds:
       context: this node accepted a non-trivial task from the owner
@@ -50,10 +50,18 @@ def resolve_workspace() -> Path:
 
 
 def memory_dir() -> Path:
+    """Claude-projects memory dir, NODE-PORTABLE.
+
+    Derives the projects slug from the repo path so this resolves correctly on
+    every node — Maverick (`/Users/abhi/sutando` → `-Users-abhi-sutando`) AND
+    Goose (`/Users/abhi-mini/sutando` → `-Users-abhi-mini-sutando`). Hardcoding
+    one node's slug would silently write to a dead dir on the other → no sync
+    (Goose red-team). `$SUTANDO_MEMORY_DIR` still overrides everything."""
     env = os.environ.get("SUTANDO_MEMORY_DIR")
     if env:
         return Path(os.path.expanduser(env))
-    return Path.home() / ".claude" / "projects" / "-Users-abhi-sutando" / "memory"
+    slug = str(REPO).replace("/", "-")
+    return Path.home() / ".claude" / "projects" / slug / "memory"
 
 
 def node_name(ws: Path) -> str:
