@@ -40,9 +40,10 @@ def main() -> int:
         elif tok == "--since-hours" and i + 1 < len(a):
             since_hours = float(a[i + 1])
 
-    fleet_dir = memory_dir() / "fleet"
+    # Flat top-level per-node files `<memory>/fleet-context-<Node>.md` (see
+    # fleet_relay.py for why not a subdir — it must ride the synced top-level glob).
     entries = []  # (ts, node, line)
-    for f in sorted(fleet_dir.glob("context-*.md")):
+    for f in sorted(memory_dir().glob("fleet-context-*.md")):
         try:
             for raw in f.read_text().splitlines():
                 m = LINE.match(raw.strip())

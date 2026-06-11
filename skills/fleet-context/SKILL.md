@@ -8,20 +8,25 @@ description: Share task-context and owner preferences across the Maverick/Goose 
 Keeps every node in the fleet on the same page about the owner's (Viper's) tasks,
 choices, and preferences. Two layers:
 
-1. **Durable** — each node appends to its OWN log `<memory>/fleet/context-<Node>.md`
-   (Maverick→context-Maverick.md, Goose→context-Goose.md). Each node writes ONLY
-   its own file → zero shared-file git conflicts. Each node READS all of them.
-   These sync via the private memory repo (~5 min cadence).
+1. **Durable** — each node appends to its OWN TOP-LEVEL file
+   `<memory>/fleet-context-<Node>.md` (Maverick→fleet-context-Maverick.md,
+   Goose→fleet-context-Goose.md). Each node writes ONLY its own file → zero
+   shared-file git conflicts. Each node READS all of them. These sync via the
+   private memory repo (~5 min cadence).
 2. **Live** — the relay also posts a `context:`/`pref:` line to **#bot2bot**, which
    the other node ingests instantly via the peer pipeline. Awareness is
    near-instant; the synced file is the durable backstop.
 
-> **Why `<memory>/fleet/` and not `notes/`?** Verified against sync-memory.sh:
-> its `rsync -a "$MEM_SRC/"` is RECURSIVE, so `memory/fleet/` propagates
-> cross-node. The workspace `notes/` dir is NOT synced (sync uses the *repo*
-> notes path), and the repo `notes/` is git-tracked (would pollute `git status`).
-> `memory/fleet/` syncs AND pollutes neither the repo nor the loaded context
-> (only MEMORY.md is auto-loaded, not subdirs).
+> **Why a FLAT top-level `<memory>/*.md` file, not a subdir or `notes/`?** There
+> are two sync-memory.sh variants in play: the repo `scripts/sync-memory.sh`
+> globs **top-level `memory/*.md` only**, while the local-install
+> `~/.sutando-memory-sync/scripts/sync-memory.sh` rsyncs `-a`. A subdir
+> (`memory/fleet/…`) silently fails under the glob script; the workspace `notes/`
+> dir isn't synced at all (sync uses the *repo* notes path) and the repo `notes/`
+> is git-tracked (would pollute `git status`). A flat `<memory>/fleet-context-*.md`
+> rides the top-level `*.md` loop that's synced every memory file — proven, works
+> under BOTH scripts, and `*.md`-in-a-subdir-free so it never pollutes context
+> (only MEMORY.md is auto-loaded). Credit: caught in Goose's red-team back.
 
 ## When to RELAY (post your own context)
 

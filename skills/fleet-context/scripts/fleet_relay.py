@@ -104,10 +104,14 @@ def main() -> int:
     node = node_name(ws)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
-    # 1) Durable: append to THIS node's own log (never another node's).
-    fleet_dir = memory_dir() / "fleet"
-    fleet_dir.mkdir(parents=True, exist_ok=True)
-    log = fleet_dir / f"context-{node}.md"
+    # 1) Durable: append to THIS node's own TOP-LEVEL memory .md (never a peer's).
+    # `<memory>/fleet-context-<Node>.md` is FLAT (no subdir) on purpose: it's the
+    # only location that syncs under BOTH sync-memory.sh variants in play — the
+    # repo script globs top-level `*.md` only, the local-install script rsyncs -a.
+    # A subdir (memory/fleet/) would silently fail under the glob script.
+    mem = memory_dir()
+    mem.mkdir(parents=True, exist_ok=True)
+    log = mem / f"fleet-context-{node}.md"
     if not log.exists():
         log.write_text(f"# Fleet context — {node}\n\nAppend-only. One entry per line. Synced via the memory repo.\n\n")
     with log.open("a") as fh:
