@@ -12,7 +12,8 @@ migration — a one-time fix, not a sustaining channel. This engine makes it
 durable.
 
 Design:
-  * Channel = the existing PRIVATE memory repo (~/.sutando-memory-sync, the
+  * Channel = the existing PRIVATE memory repo (resolved per-node — see
+    _resolve_sync_dir; legacy ~/.sutando-memory-sync or post-#762 ~/.sutando/memory-sync, the
     same repo sync-memory.sh uses) under a distinct top-level `fleet/`
     namespace. NOT the public repo; NOT sync-memory's `machine-<host>/`
     backup namespace (that's one-way disaster-recovery only).
@@ -45,11 +46,28 @@ from pathlib import Path
 HOME = Path.home()
 REPO_DIR = Path(__file__).resolve().parents[3]  # skills/fleet-sync/scripts/<f> → repo root
 WORKSPACE = Path(os.environ.get("SUTANDO_WORKSPACE", str(HOME / ".sutando" / "workspace"))).expanduser()
-# Default must match where sync-memory.sh actually clones the repo on every
-# node: `$HOME/.sutando-memory-sync` (hyphenated, NOT ~/.sutando/memory-sync).
-# The old default never existed on disk, so the engine failed at startup on any
-# node without the SUTANDO_MEMORY_SYNC_DIR override. Override still honored.
-SYNC_DIR = Path(os.environ.get("SUTANDO_MEMORY_SYNC_DIR", str(HOME / ".sutando-memory-sync"))).expanduser()
+def _resolve_sync_dir() -> Path:
+    """Locate the private memory-sync repo, path-agnostic across the fleet.
+
+    Nodes are on DIFFERENT clone paths depending on when they were set up:
+      * post-#762 migration: ~/.sutando/memory-sync   (e.g. Goose)
+      * legacy (pre-#762):   ~/.sutando-memory-sync    (e.g. Maverick)
+    Both point at the same remote (amkunte/sutando-memory); only the local
+    clone dir differs. A single hardcoded default can't serve both — the
+    original ~/.sutando/memory-sync default broke Maverick, and naively
+    hardcoding the hyphenated path would break Goose. So probe both and use
+    whichever exists (preferring the post-#762 path), mirroring how
+    sync-memory.sh resolves its own clone. SUTANDO_MEMORY_SYNC_DIR overrides.
+    """
+    env = os.environ.get("SUTANDO_MEMORY_SYNC_DIR")
+    if env:
+        return Path(env).expanduser()
+    new = HOME / ".sutando" / "memory-sync"   # post-#762
+    legacy = HOME / ".sutando-memory-sync"    # legacy
+    return new if new.exists() else (legacy if legacy.exists() else new)
+
+
+SYNC_DIR = _resolve_sync_dir()
 FLEET_DIR = SYNC_DIR / "fleet"
 MANIFEST = FLEET_DIR / "manifest.json"
 DATA_DIR = FLEET_DIR / "data"
