@@ -16,11 +16,20 @@ is never re-run, and a missed one is recovered on the next pass.
 Output (stdout): one `CATCHUP <name>` line per delivery to run now, else
 nothing. Exit 0 always (never break the loop).
 
+Multi-node gate: a node that should NOT deliver dailies (e.g. a roaming node
+when the home-base node owns the briefing/drip) sets
+`SKIP_SCHEDULED_DELIVERIES=1` (env or .env file). When set, main() returns
+silently — no CATCHUP lines — so its proactive loop never fires the hardcoded
+JOBS below. Mirrors the SKIP_PHONE flag. Without this, removing a job from
+crons.json is insufficient: the JOBS list here is hardcoded and fires
+independent of crons.json, double-delivering across nodes.
+
 Sentinels (written by the delivery paths, NOT here):
   <workspace>/state/<key>-delivered-<YYYY-MM-DD>.sentinel
 """
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +39,25 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 STATE_DIR = WORKSPACE / "state"
+REPO_DIR = Path(__file__).resolve().parent.parent  # src/ -> repo root
+
+
+def _node_skips_deliveries() -> bool:
+    """True if this node is gated OUT of daily scheduled deliveries.
+
+    Home-base/roaming split (Goose runs dailies; Maverick roams): a node sets
+    `SKIP_SCHEDULED_DELIVERIES=1` to opt out of the morning briefing / Siemens
+    drip so only one node delivers. Without this, a roaming node's proactive
+    loop still fires the hardcoded JOBS below (independent of crons.json),
+    double-delivering. Mirrors the SKIP_PHONE flag pattern (env OR .env file).
+    """
+    if os.environ.get("SKIP_SCHEDULED_DELIVERIES") == "1":
+        return True
+    try:
+        env_content = (REPO_DIR / ".env").read_text()
+    except OSError:
+        return False
+    return "SKIP_SCHEDULED_DELIVERIES=1" in env_content
 
 # Daily deliveries to guard. `until` (YYYY-MM-DD, inclusive) marks a job that
 # expires — after it, the job is skipped (and the loop should drop its cron).
@@ -56,6 +84,11 @@ JOBS = [
 
 
 def main() -> None:
+    if _node_skips_deliveries():
+        # This node opts out of daily deliveries (another node owns them).
+        # Silent + exit 0 so the proactive loop sees "nothing overdue".
+        return
+
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     to_run = []
