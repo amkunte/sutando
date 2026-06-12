@@ -44,7 +44,11 @@ from typing import Iterable
 
 import subprocess
 
-import anthropic
+# NOTE: `anthropic` is imported lazily inside run() — it's an optional dep only
+# needed once the opt-in gate passes. Importing it at module top made the
+# nightly cron crash with ModuleNotFoundError on nodes that don't mirror the
+# vault (gate unset), instead of the intended clean no-op. The judge_pair type
+# hint stays valid because `from __future__ import annotations` defers it.
 
 DEFAULT_MODEL = os.environ.get("SUTANDO_DREAM_MODEL", "claude-opus-4-7")
 MAX_TOKENS = 1024
@@ -267,6 +271,8 @@ def run(vault: Path, model: str, dry_run: bool = False) -> int:
         return 0
     pairs = candidate_pairs(notes)
     print(f"[dream] {len(notes)} eligible notes, {len(pairs)} candidate pairs, model={model}", flush=True)
+
+    import anthropic  # lazy: only needed past the opt-in gate (see top-of-file note)
 
     client = anthropic.Anthropic()
     # accumulators per-note: stem -> {tier_label: [(other_stem, rationale)]}
