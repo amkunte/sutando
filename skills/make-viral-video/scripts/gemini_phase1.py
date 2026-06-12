@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -110,17 +111,38 @@ def call_gemini(prompt: str, key: str) -> str:
         },
     }).encode()
     url = API.format(model=MODEL, key=key)
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:  # surface API errors verbatim
-        sys.exit(f"gemini_phase1: Gemini API HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}")
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"gemini_phase1: Gemini call failed: {e}")
+    # Retry transient failures (429 rate-limit; 5xx incl. the 503 "high demand"
+    # gemini-2.5-flash throws under load) with exponential backoff. Without this
+    # a single transient spike kills the whole build. Non-429 4xx is a real
+    # error -> fail fast, don't retry.
+    data = None
+    for attempt in range(5):
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = json.loads(r.read())
+            break
+        except urllib.error.HTTPError as e:
+            transient = e.code == 429 or 500 <= e.code < 600
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if transient and attempt < 4:
+                wait = 2 ** attempt
+                print(f"gemini_phase1: HTTP {e.code} (transient) — retry {attempt+1}/4 in {wait}s",
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            sys.exit(f"gemini_phase1: Gemini API HTTP {e.code}: {detail}")
+        except urllib.error.URLError as e:  # network blip — retry
+            if attempt < 4:
+                wait = 2 ** attempt
+                print(f"gemini_phase1: network error ({e.reason}) — retry {attempt+1}/4 in {wait}s",
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            sys.exit(f"gemini_phase1: Gemini call failed after retries: {e}")
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError):
         sys.exit(f"gemini_phase1: unexpected Gemini response: {json.dumps(data)[:500]}")
 
 
