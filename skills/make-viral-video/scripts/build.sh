@@ -18,6 +18,8 @@ SKILL_DIR="$REPO/skills/make-viral-video"
 
 TOPIC=""
 SOURCE_URL=""
+SOURCE_FILE=""
+CARDS_ONLY=0
 TARGET_DURATION=45
 TTS_PROVIDER="GEMINI"
 OUT_DIR=""
@@ -26,12 +28,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --topic) TOPIC="$2"; shift 2 ;;
     --source) SOURCE_URL="$2"; shift 2 ;;
+    --source-file) SOURCE_FILE="$2"; shift 2 ;;
+    --cards-only) CARDS_ONLY=1; shift ;;
     --target-duration) TARGET_DURATION="$2"; shift 2 ;;
     --tts-provider) TTS_PROVIDER="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     -h|--help)
       cat <<EOF
-Usage: $0 --topic "X" --source "URL" [--target-duration 45] [--tts-provider GEMINI|OPENAI] [--out-dir state/viral-{ts}]
+Usage: $0 --topic "X" (--source "URL" | --source-file PATH) [--cards-only] [--target-duration 45] [--tts-provider GEMINI|OPENAI] [--out-dir state/viral-{ts}]
+
+  --source URL        primary source URL (codex/Gemini fetches it)
+  --source-file PATH  local md/text source read directly (no fetch). Wins if both given.
+  --cards-only        all-generated-card render via Gemini Phase-1 (no OpenAI, no asset fetch)
 EOF
       exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
@@ -39,7 +47,9 @@ EOF
 done
 
 [[ -n "$TOPIC" ]] || { echo "ERROR: --topic required" >&2; exit 2; }
-[[ -n "$SOURCE_URL" ]] || { echo "ERROR: --source required" >&2; exit 2; }
+# Require at least one source; --source-file wins if both supplied.
+[[ -n "$SOURCE_URL" || -n "$SOURCE_FILE" ]] || { echo "ERROR: need --source URL or --source-file PATH" >&2; exit 2; }
+[[ -z "$SOURCE_FILE" || -f "$SOURCE_FILE" ]] || { echo "ERROR: --source-file not found: $SOURCE_FILE" >&2; exit 2; }
 
 [[ -n "$OUT_DIR" ]] || OUT_DIR="$REPO/state/viral-$(date +%s)"
 mkdir -p "$OUT_DIR/artifacts" "$OUT_DIR/fetched_assets" "$OUT_DIR/frames"
@@ -72,24 +82,49 @@ fi
 # Phase 1: Codex script + asset manifest generation
 # ----------------------------------------------------------------
 echo ""
-echo "--- Phase 1: codex script generation ---"
+if [[ $CARDS_ONLY -eq 1 ]]; then
+  # Cards-only: Gemini generates the script (no OpenAI), no asset fetch.
+  echo "--- Phase 1: Gemini script generation (cards-only, no OpenAI) ---"
+  # render.py TTS + gemini_phase1.py both need GEMINI_API_KEY; source .env if absent.
+  if [[ -z "${GEMINI_API_KEY:-}" && -f "$REPO/.env" ]]; then
+    set -a; source "$REPO/.env"; set +a
+  fi
+  GP_ARGS=(--topic "$TOPIC" --target-duration "$TARGET_DURATION" --out-dir "$OUT_DIR")
+  if [[ -n "$SOURCE_FILE" ]]; then
+    GP_ARGS+=(--source-file "$SOURCE_FILE")   # path passed, contents read in-script (no sed-inline)
+  else
+    GP_ARGS+=(--source-url "$SOURCE_URL")
+  fi
+  python3 "$SKILL_DIR/scripts/gemini_phase1.py" "${GP_ARGS[@]}"
+  echo "[Phase 1] Gemini script done (cards-only; empty asset manifest)"
+else
+  echo "--- Phase 1: codex script generation ---"
 
-PROMPT_TEMPLATE="$SKILL_DIR/scripts/codex-prompt.md"
-[[ -f "$PROMPT_TEMPLATE" ]] || { echo "ERROR: prompt template missing at $PROMPT_TEMPLATE" >&2; exit 1; }
+  PROMPT_TEMPLATE="$SKILL_DIR/scripts/codex-prompt.md"
+  [[ -f "$PROMPT_TEMPLATE" ]] || { echo "ERROR: prompt template missing at $PROMPT_TEMPLATE" >&2; exit 1; }
 
-# Substitute variables into the template, write to tmp file
-PROMPT_FILE="$OUT_DIR/codex-prompt.txt"
-sed -e "s|{{TOPIC}}|$TOPIC|g" \
-    -e "s|{{SOURCE_URL}}|$SOURCE_URL|g" \
-    -e "s|{{TARGET_DURATION_S}}|$TARGET_DURATION|g" \
-    -e "s|{{ASSET_DIR}}|$OUT_DIR/fetched_assets/|g" \
-    -e "s|{{OUTPUT_DIR}}|$OUT_DIR/artifacts/|g" \
-    "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
+  # Substitute variables into the template, write to tmp file
+  PROMPT_FILE="$OUT_DIR/codex-prompt.txt"
+  sed -e "s|{{TOPIC}}|$TOPIC|g" \
+      -e "s|{{SOURCE_URL}}|$SOURCE_URL|g" \
+      -e "s|{{TARGET_DURATION_S}}|$TARGET_DURATION|g" \
+      -e "s|{{ASSET_DIR}}|$OUT_DIR/fetched_assets/|g" \
+      -e "s|{{OUTPUT_DIR}}|$OUT_DIR/artifacts/|g" \
+      "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
 
-# Run codex /goal exec (codex sandbox can fetch URLs + write files; needs network access)
-# Per `feedback_codex_nested_quotes_hang_stdin.md`: pass via "$(cat /tmp/file)" not raw -- arg
-codex exec --sandbox workspace-write -o "$OUT_DIR/artifacts/codex-output.txt" -- "$(cat "$PROMPT_FILE")"
-echo "[Phase 1] codex done; output at $OUT_DIR/artifacts/codex-output.txt"
+  # Run codex /goal exec (codex sandbox can fetch URLs + write files; needs network access)
+  # Per `feedback_codex_nested_quotes_hang_stdin.md`: pass via "$(cat /tmp/file)" not raw -- arg
+  codex exec --sandbox workspace-write -o "$OUT_DIR/artifacts/codex-output.txt" -- "$(cat "$PROMPT_FILE")"
+  echo "[Phase 1] codex done; output at $OUT_DIR/artifacts/codex-output.txt"
+fi
+
+# Asset pipeline (Phase 1.5–2.5) is SKIPPED in cards-only mode: there are no
+# fetched assets to preload/validate/promote, and the <1-asset gate would
+# otherwise hard-abort a perfectly valid all-generated-card video.
+if [[ $CARDS_ONLY -eq 1 ]]; then
+  VALIDATION_LOG="$OUT_DIR/validation.jsonl"; : > "$VALIDATION_LOG"
+  echo "[Phase 1.5–2.5] skipped (cards-only: all generated cards, no fetched assets)"
+else
 
 # ----------------------------------------------------------------
 # Phase 1.5: Cache preload after codex writes manifest
@@ -143,6 +178,8 @@ fi
 # of any topic that share asset URLs will see cache hits at Phase 0.5/1.5.
 promoted=$(python3 "$SKILL_DIR/scripts/asset_cache.py" promote "$OUT_DIR" 2>&1)
 echo "[Phase 2.5] $promoted"
+
+fi  # end asset-pipeline (skipped in cards-only)
 
 # ----------------------------------------------------------------
 # Phase 3+5: Frame composition + TTS + ffmpeg encode
