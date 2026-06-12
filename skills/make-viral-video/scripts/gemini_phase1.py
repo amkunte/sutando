@@ -140,6 +140,16 @@ def call_gemini(prompt: str, key: str) -> str:
                 time.sleep(wait)
                 continue
             sys.exit(f"gemini_phase1: Gemini call failed after retries: {e}")
+        except Exception as e:  # noqa: BLE001 — malformed JSON / socket.timeout
+            # mid-read etc.: retry (often transient), then exit cleanly — never a
+            # bare traceback (Goose cold-review of PR #119).
+            if attempt < 4:
+                wait = 2 ** attempt
+                print(f"gemini_phase1: {type(e).__name__} ({e}) — retry {attempt+1}/4 in {wait}s",
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            sys.exit(f"gemini_phase1: Gemini call failed after retries: {type(e).__name__}: {e}")
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError):
