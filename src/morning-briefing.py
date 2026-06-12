@@ -277,7 +277,22 @@ def get_daily_insight() -> str | None:
     return None
 
 
-def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight=None) -> str:
+def get_wire_episode() -> str | None:
+    """New SutandoWIRE episode line for the briefing (or None). Never raises.
+
+    Reuses src/wire_briefing.py — a clean no-op when YOUTUBE_API_KEY is absent.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from wire_briefing import briefing_line  # type: ignore
+
+        line = briefing_line()
+        return line or None
+    except Exception:
+        return None
+
+
+def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight=None, wire=None) -> str:
     now = datetime.now()
     hour = now.hour
     if hour < 12:
@@ -325,6 +340,10 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         issues_str = "; ".join(health_issues[:2])
         parts.append(f"System note: {issues_str}.")
 
+    # New SutandoWIRE episode (already a fully-formed 📺 line with URL)
+    if wire:
+        parts.append(wire)
+
     # Daily insight (closing thought) — take first sentence, skip if it's just raw data
     if insight:
         first_sentence = insight.split('.')[0].strip()
@@ -371,8 +390,11 @@ def main():
     health_issues = get_health_issues()
     print(f"  health issues: {len(health_issues)}")
 
+    wire = get_wire_episode()
+    print(f"  wire: {'new episode' if wire else 'none'}")
+
     # Synthesize
-    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)
+    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight, wire)
 
     # Write voice result
     ts = int(time.time() * 1000)
