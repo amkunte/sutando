@@ -79,33 +79,49 @@ def latest_episode() -> dict | None:
     (including a missing API key).
     """
     playlist_id = os.environ.get("WIRE_PLAYLIST_ID", DEFAULT_PLAYLIST)
-    try:
-        data = _api_get(
-            "playlistItems",
-            {"part": "snippet,contentDetails", "playlistId": playlist_id, "maxResults": 50},
-        )
-    except Exception:
-        return None
-    if not data:
-        return None
-
     videos: list[dict] = []
-    for item in data.get("items", []):
-        cd = item.get("contentDetails", {})
-        sn = item.get("snippet", {})
-        vid = cd.get("videoId")
-        title = (sn.get("title") or "").strip()
-        if not vid or title in ("Private video", "Deleted video"):
-            continue
-        published = cd.get("videoPublishedAt") or sn.get("publishedAt") or ""
-        videos.append(
-            {
-                "videoId": vid,
-                "title": title,
-                "publishedAt": published,
-                "url": f"https://youtu.be/{vid}",
+    # Paginate the whole playlist: playlistItems returns in *playlist order*
+    # (curated WIRE playlist is oldest-first), so the newest episode can sit on
+    # a later page once the list exceeds maxResults. Fetching every page and
+    # sorting by publishedAt is the only way to reliably find the newest. The
+    # page cap (10 * 50 = 500 items) is a runaway guard, far above any real size.
+    page_token: str | None = None
+    try:
+        for _ in range(10):
+            params = {
+                "part": "snippet,contentDetails",
+                "playlistId": playlist_id,
+                "maxResults": 50,
             }
-        )
+            if page_token:
+                params["pageToken"] = page_token
+            data = _api_get("playlistItems", params)
+            if not data:
+                break
+            for item in data.get("items", []):
+                cd = item.get("contentDetails", {})
+                sn = item.get("snippet", {})
+                vid = cd.get("videoId")
+                title = (sn.get("title") or "").strip()
+                if not vid or title in ("Private video", "Deleted video"):
+                    continue
+                published = cd.get("videoPublishedAt") or sn.get("publishedAt") or ""
+                videos.append(
+                    {
+                        "videoId": vid,
+                        "title": title,
+                        "publishedAt": published,
+                        "url": f"https://youtu.be/{vid}",
+                    }
+                )
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception:
+        # Partial pages could omit the true newest (later page) -> a stale
+        # "newest" would mis-announce. Safer to no-op on any error, matching the
+        # never-break-the-briefing contract.
+        return None
     if not videos:
         return None
     videos.sort(key=lambda v: v["publishedAt"], reverse=True)
