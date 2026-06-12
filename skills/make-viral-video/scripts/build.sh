@@ -50,6 +50,11 @@ done
 # Require at least one source; --source-file wins if both supplied.
 [[ -n "$SOURCE_URL" || -n "$SOURCE_FILE" ]] || { echo "ERROR: need --source URL or --source-file PATH" >&2; exit 2; }
 [[ -z "$SOURCE_FILE" || -f "$SOURCE_FILE" ]] || { echo "ERROR: --source-file not found: $SOURCE_FILE" >&2; exit 2; }
+# --source-file is only wired into the cards-only Gemini Phase-1. The codex
+# path reads $SOURCE_URL via sed, so --source-file WITHOUT --cards-only would
+# pass the require-check yet feed codex an empty source -> silent garbage.
+# Fail fast (Goose cold-review of PR #119).
+[[ -z "$SOURCE_FILE" || $CARDS_ONLY -eq 1 ]] || { echo "ERROR: --source-file requires --cards-only (codex path has no file-source; use --source URL for codex)" >&2; exit 2; }
 
 [[ -n "$OUT_DIR" ]] || OUT_DIR="$REPO/state/viral-$(date +%s)"
 mkdir -p "$OUT_DIR/artifacts" "$OUT_DIR/fetched_assets" "$OUT_DIR/frames"
