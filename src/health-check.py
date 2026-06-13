@@ -1089,24 +1089,28 @@ def run_all_checks() -> list[dict]:
             checks.append({"name": name, "status": "ok", "detail": "probe failed transiently — assuming alive"})
             continue
 
+        # For discord-bridge, a co-hosted Charlie bridge (PR #104) legitimately
+        # runs a 2nd discord-bridge.py against a non-default channels dir. Drop
+        # those co-host PIDs UP FRONT — before the down/duplicate checks — so a
+        # co-host can neither mask the PRIMARY being down nor inflate the
+        # duplicate count. Previously the filter only ran inside the len>1
+        # branch, so when the primary had crashed and ONLY Charlie's co-host was
+        # left, the single surviving PID was treated as the primary and health
+        # reported "running" — masking a 19-min Maverick discord-bridge outage
+        # (2026-06-12) that --fix would otherwise have auto-restarted.
+        if name == "discord-bridge" and pids:
+            pids = [p for p in pids if not _is_cohost_discord_bridge(p)]
+
         if not pids:
             checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
             continue
 
-        # Check 1: Multiple processes (zombie/duplicate). For discord-bridge,
-        # a co-hosted Charlie bridge (PR #104) legitimately runs a 2nd
-        # discord-bridge.py against a non-default channels dir — exclude those
-        # so the warn only fires on a real PRIMARY-bridge duplicate.
-        primary_pids = pids
-        if name == "discord-bridge" and len(pids) > 1:
-            primary_pids = [p for p in pids if not _is_cohost_discord_bridge(p)]
-        if len(primary_pids) > 1:
-            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(primary_pids)} PIDs: {','.join(primary_pids)})"})
+        # Check 1: Multiple processes (zombie/duplicate). Co-host PIDs are
+        # already excluded above, so any remaining surplus is a real duplicate
+        # of the PRIMARY bridge.
+        if len(pids) > 1:
+            checks.append({"name": name, "status": "warn", "detail": f"multiple processes ({len(pids)} PIDs: {','.join(pids)})"})
             continue
-        # Co-hosts present but exactly one primary → healthy; continue checks
-        # against the primary pid (drop co-host pids from downstream logic).
-        if primary_pids:
-            pids = primary_pids
 
         # Check 2: Log file freshness — prefer logs/ (where startup.sh writes)
         # and fall back to src/ for legacy. The src/ default was silently a
