@@ -409,6 +409,26 @@ else
   echo "  ~ sms bridge (TWILIO_* env missing — optional)"
 fi
 
+# True if a PRIMARY (non-co-host) discord-bridge is already running. A
+# co-hosted bridge (e.g. Charlie, PR #104) sets SUTANDO_DISCORD_CHANNELS_DIR
+# to a non-default channels dir; we must NOT count it as "the bridge is up",
+# or a bare `pgrep -f discord-bridge` skips launching the primary just because
+# a co-host is running — which masked a Maverick discord-bridge outage at boot
+# (2026-06-12, mirrors health-check fix in this PR). Fails safe: if a pid's env
+# can't be read it's treated as the primary (don't double-launch; the
+# single_instance flock is the ultimate dedupe backstop either way).
+_primary_discord_bridge_running() {
+  local default_dir="$HOME/.claude/channels/discord"
+  local pid cdir
+  for pid in $(pgrep -f "discord-bridge\.py" 2>/dev/null); do
+    cdir=$(ps eww "$pid" 2>/dev/null | grep -o 'SUTANDO_DISCORD_CHANNELS_DIR=[^ ]*' | head -1 | cut -d= -f2-)
+    if [ -z "$cdir" ] || [ "${cdir%/}" = "${default_dir%/}" ]; then
+      return 0  # found a primary (or unreadable env → assume primary)
+    fi
+  done
+  return 1  # only co-hosts (or nothing) running → primary is NOT up
+}
+
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
 if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" "$HOME/.claude/channels/discord/.env" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
@@ -420,7 +440,7 @@ if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" 
   done
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
-  elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
+  elif ! _primary_discord_bridge_running; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
     echo "  ✓ discord bridge"
