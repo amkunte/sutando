@@ -99,7 +99,8 @@ When you accept a non-trivial commitment from the user via **chat** (direct text
 **How:**
 ```bash
 local _ts="$(date +%s)"
-cat > "tasks/task-chat-${_ts}.txt" << EOF
+WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"   # session cwd is the repo; the watcher/dashboard read $WS/tasks
+cat > "$WS/tasks/task-chat-${_ts}.txt" << EOF
 id: task-chat-${_ts}
 timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 task: <concise description of what you're doing>
@@ -116,7 +117,8 @@ EOF
 **When done:**
 Write a result file using the same task ID:
 ```bash
-cat > "results/task-chat-${_ts}.txt" << EOF
+WS="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"   # the bridge polls $WS/results, not the repo cwd
+cat > "$WS/results/task-chat-${_ts}.txt" << EOF
 <result summary>
 EOF
 ```
@@ -246,7 +248,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - **Voice agent** writes tasks to `tasks/task-{ts}.txt`
 - **Telegram bridge** (`src/telegram-bridge.py`) writes tasks from Telegram messages (text + photos + files + voice notes)
 - **Discord bridge** (`src/discord-bridge.py`) writes tasks from Discord DMs and channel @mentions (+ file attachments)
-- This session reads and executes them, writes results to `results/task-{ts}.txt`
+- This session reads and executes them, writes results to `results/task-{ts}.txt` — **write to the absolute workspace path `"${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/results/task-{ts}.txt"`, not a bare `results/…`.** The bridges/watcher/dashboard poll `resolve_workspace()/results` (= `$SUTANDO_WORKSPACE/results`); the session cwd is the repo, so a bare relative write lands in `<repo>/results/` where no consumer looks — the same cwd-trap as `state/core-status.json` (see **Work Status**). A misfiled reply silently never delivers and never archives its task. (Same applies to `tasks/` and `results/proactive-{ts}.txt`.)
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
 - To send files in replies, include `[file: /path/to/file]` in the result text
