@@ -3864,10 +3864,26 @@ async def poll_proactive():
                                         fpath = os.path.expanduser(fpath.strip())
                                         if _is_path_sendable(fpath):
                                             await _target_ch.send(file=discord.File(fpath))
+                                            print(
+                                                f"  [proactive channel-redirect] sent file: {fpath}",
+                                                flush=True,
+                                            )
                                         elif not os.path.isfile(fpath):
                                             print(
                                                 f"  [proactive channel-redirect] file marker, "
                                                 f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                        else:
+                                            # Exists but outside the send-allowlist. Mirror the
+                                            # task-result path (:3538): surface a visible notice
+                                            # + a loud log instead of silently dropping it (the
+                                            # silent drop made an N100FP delivery look failed,
+                                            # 2026-06-12).
+                                            await _target_ch.send(f"(file not allowed: {fpath})")
+                                            print(
+                                                f"  [proactive channel-redirect] REJECTED file "
+                                                f"(not in allowlist): {fpath}",
                                                 flush=True,
                                             )
                                     try:
