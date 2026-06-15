@@ -197,7 +197,7 @@ def render_hook_frame(text: str, hero_path: Optional[Path], out_path: Path):
     base.save(out_path, "PNG")
 
 
-def render_support_frame(hero_path: Path, caption: str, out_path: Path,
+def render_support_frame(hero_path: Optional[Path], caption: str, out_path: Path,
                           crop_seed: int = 0, badge: str = ""):
     """Hero image with crop variation + caption strip + optional name badge.
 
@@ -207,6 +207,38 @@ def render_support_frame(hero_path: Path, caption: str, out_path: Path,
     who joined mid-scroll. Free-text — caller controls the wording.
     """
     from PIL import Image, ImageDraw
+    # Cards-only mode: no fetched image for this beat -> render a clean
+    # stat-card (text centered on brand background with an accent rule),
+    # instead of the image+caption-strip layout. Keeps the all-generated-card
+    # path (no external assets) viable. Hook/closer frames already handle a
+    # None background; this brings SUPPORT into line.
+    if hero_path is None:
+        base = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
+        d = ImageDraw.Draw(base)
+        cap_font = get_font(46)
+        lines = wrap_text(caption.strip(), 38)
+        line_h = 60
+        total_h = len(lines) * line_h
+        y = (CANVAS_H - total_h) // 2
+        # short accent rule above the text block
+        d.rectangle([(CANVAS_W // 2 - 90, y - 46), (CANVAS_W // 2 + 90, y - 38)], fill=ACCENT)
+        for line in lines:
+            bbox = d.textbbox((0, 0), line, font=cap_font)
+            x = (CANVAS_W - (bbox[2] - bbox[0])) // 2
+            for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+                d.text((x + dx, y + dy), line, fill=(0, 0, 0), font=cap_font)
+            d.text((x, y), line, fill=TEXT, font=cap_font)
+            y += line_h
+        if badge:
+            bf = get_font(28)
+            bt = badge.upper()
+            bb = d.textbbox((0, 0), bt, font=bf)
+            cw, ch = bb[2] - bb[0] + 36, bb[3] - bb[1] + 30
+            d.rectangle([(40, 40), (40 + cw, 40 + ch)], fill=ACCENT)
+            d.text((58, 52), bt, fill=TEXT, font=bf)
+        base.save(out_path, "PNG")
+        return
+
     bg = hero_bg(hero_path, dim_alpha=70).convert("RGB")
     overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -640,7 +672,9 @@ def main():
                                   crop_seed=i, badge=badge)
             video_source.append(None)
         else:
-            render_closer_frame(fact, None, frames_dir / f"frame_{frame_idx:03d}.png")
+            # Cards-only (no fetched asset): render a distinct stat-card so
+            # SUPPORT beats don't all look like the closer.
+            render_support_frame(None, fact, frames_dir / f"frame_{frame_idx:03d}.png", crop_seed=i)
             video_source.append(None)
         durations.append(0.0)
         frame_words.append(len(fact.split()))
