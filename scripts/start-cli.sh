@@ -36,6 +36,26 @@ if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   MODEL_ARGS=(--model "$SUTANDO_CORE_MODEL")
 fi
 
+# Route the core's API traffic through the local credential-proxy (port 7846)
+# when it's up, so quota tracking (state/quota-state.json) stays fresh.
+# startup.sh already exports ANTHROPIC_BASE_URL for the services IT launches,
+# but the CORE is (re)started via THIS script — by launchd's com.sutando.core
+# and Sutando.app's Restart Core menu, NEITHER of which sources startup.sh.
+# Without this, every launchd/app-driven restart silently bypasses the proxy
+# and quota-state.json freezes (observed 2026-06-12: a launchd-restarted core
+# left the 5h window stuck at a past reset time for hours).
+#
+# Use an `env VAR=val` PREFIX on the claude command, not a bare `export`:
+# `tmux new-session` gives the child the tmux SERVER's env snapshot, not this
+# script's, so an export wouldn't reliably reach claude if the server already
+# exists. The prefix sets it on the spawned process directly. Gate on the proxy
+# actually listening — never route through a dead proxy (claude couldn't reach
+# the API). The ${arr[@]+...} guard keeps the empty array safe on bash 3.2.
+PROXY_ENV=()
+if lsof -i :7846 > /dev/null 2>&1; then
+  PROXY_ENV=(env ANTHROPIC_BASE_URL=http://localhost:7846)
+fi
+
 # --restart: kill any existing session before starting fresh. Without this,
 # the script's "already running → attach" path returns and the old session
 # keeps running.
@@ -81,7 +101,7 @@ fi
 if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
-  exec claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+  exec ${PROXY_ENV[@]+"${PROXY_ENV[@]}"} claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     -- "/schedule-crons"
 fi
 
@@ -119,11 +139,11 @@ tmux -S "$TMUX_SOCKET" bind -n WheelDownPane send-keys -M 2>/dev/null || true
 #     start detached so we don't hang, server keeps running.
 if [ -t 1 ]; then
   exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" \
-    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${PROXY_ENV[@]+"${PROXY_ENV[@]}"} claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     -- "/schedule-crons"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
-    claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
+    ${PROXY_ENV[@]+"${PROXY_ENV[@]}"} claude --name "$SESSION" ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} --remote-control "Sutando" --dangerously-skip-permissions --add-dir "$HOME" \
     -- "/schedule-crons"
   echo "Started $SESSION detached. Attach via Open Core CLI in menu bar, or:"
   echo "  tmux -S $TMUX_SOCKET attach -t $SESSION"
