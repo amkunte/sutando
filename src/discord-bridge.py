@@ -2203,6 +2203,10 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# Sentinel for defensive pops from pending_replies — distinguishes a
+# concurrently-removed key (skip) from a stored None (never happens in normal
+# flow, but the distinction keeps the guard unambiguous). See poll_results.
+_POP_MISSING = object()
 # Track source message id per pending task so the result-sender can default
 # reply_to_id to the triggering message (visually threads the reply). Lives
 # in memory only — crash-recovery isn't critical; missing entry just means
@@ -3551,7 +3555,17 @@ async def poll_results():
             if result_file.exists():
                 import re
                 reply_text = result_file.read_text().strip()
-                channel = pending_replies.pop(task_id)
+                # Defensive pop: the key snapshotted at the top of this loop
+                # can be removed by a concurrent coroutine (the expiry sweep
+                # below, recovery merge) during an `await` in an EARLIER
+                # iteration's send. A bare `pop(task_id)` then raises KeyError
+                # and crashes the whole bridge — observed 2026-06-12 (Maverick
+                # discord-bridge down ~19 min on `KeyError: task-...`). Use a
+                # sentinel so a genuinely-already-handled task is skipped, while
+                # still distinguishing it from a (never-occurring) stored None.
+                channel = pending_replies.pop(task_id, _POP_MISSING)
+                if channel is _POP_MISSING:
+                    continue
                 # Capture anchor BEFORE pop so the auto-thread block below
                 # can use it. The previous version popped+forgot, leaving
                 # `pending_reply_anchors.get(task_id)` at line ~2810 always
