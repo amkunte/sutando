@@ -4622,13 +4622,17 @@ function renderParcelRadarHtml(rawJson: string): string {
 // as a presence signal — same gap as PR #14 fixed in agent-api.py.
 function writeOwnerActivity(channel: string, summary: string): void {
 	try {
-		mkdirSync('state', { recursive: true });
+		mkdirSync(join(WORKSPACE_DIR, 'state'), { recursive: true });
 		const payload = {
 			ts: Math.floor(Date.now() / 1000),
 			channel,
 			summary: (summary || '').slice(0, 80),
 		};
-		const finalPath = 'state/last-owner-activity.json';
+		// Absolute workspace path: the server's cwd is the repo, so a bare
+		// 'state/...' write lands in <repo>/state/ where the proactive-loop's
+		// presence check (skip rule b) never looks — it reads $WS/state. Mirrors
+		// the Python refs' STATE_DIR (= resolve_workspace()/state).
+		const finalPath = join(WORKSPACE_DIR, 'state', 'last-owner-activity.json');
 		const tmpPath = finalPath + '.tmp';
 		writeFileSync(tmpPath, JSON.stringify(payload));
 		renameSync(tmpPath, finalPath);
