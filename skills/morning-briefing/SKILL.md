@@ -32,6 +32,8 @@ Collect from each source (skip any that aren't configured):
 
 7. **Friction check** — Run `python3 src/friction-detector.py --stdout-only`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
 
+8. **SutandoWIRE** — Run `python3 src/wire_briefing.py`. If it prints a line (it only does so when a NEW WIRE episode has appeared since the last briefing), include that line verbatim — it's already a fully-formed `📺 New SutandoWIRE: <title> — <url>`. Silent output = no new episode; skip the line. The script is a clean no-op without `YOUTUBE_API_KEY` (env or vault) and tracks last-seen in `state/wire-briefing.json`, so each episode is announced exactly once across both briefing paths.
+
 > **Why `--stdout-only`:** these scripts default to writing `results/insight-*.txt` / `results/friction-*.txt`, which the Telegram/Discord bridge polls and delivers as SEPARATE DMs — fragmenting the briefing into 3 messages. `--stdout-only` prints the content (for you to fold inline here) without writing a deliverable file, so the owner gets ONE consolidated briefing. Do NOT remove the flag.
 
 ## How to deliver
