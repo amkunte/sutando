@@ -359,10 +359,17 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
 
 
 def main():
-    # Check sentinel — don't repeat if already run today
+    # Check sentinel — don't repeat if already run today.
+    # Cross-check BOTH names: this script writes `morning-briefing-<date>`, but the
+    # `/morning-briefing` skill and src/scheduled-catchup.py key off
+    # `briefing-delivered-<date>`. If we only checked our own name, a day the skill
+    # path delivered (via proactive-loop catchup) wouldn't stop this cron, and a day
+    # this script delivered wouldn't stop catchup — either way the owner gets the
+    # briefing twice. Honor whichever path ran first.
     today = datetime.now().strftime("%Y-%m-%d")
     sentinel = STATE_DIR / f"morning-briefing-{today}.sentinel"
-    if sentinel.exists() and "--force" not in sys.argv:
+    skill_sentinel = STATE_DIR / f"briefing-delivered-{today}.sentinel"
+    if (sentinel.exists() or skill_sentinel.exists()) and "--force" not in sys.argv:
         print(f"Morning briefing already delivered today ({today}). Use --force to re-run.")
         return
 
@@ -403,9 +410,13 @@ def main():
     result_file.write_text(narrative)
     print(f"  → {result_file.name}")
 
-    # Mark as done today
+    # Mark as done today. Write BOTH sentinel names so the `/morning-briefing` skill
+    # path and src/scheduled-catchup.py (which both check `briefing-delivered-<date>`)
+    # see this delivery and don't re-fire the briefing through the channel path.
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    sentinel.write_text(datetime.now().isoformat())
+    stamp = datetime.now().isoformat()
+    sentinel.write_text(stamp)
+    skill_sentinel.write_text(stamp)
 
     print(f"\nBriefing delivered:\n{narrative}")
 
