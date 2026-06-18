@@ -67,8 +67,14 @@ JOBS = [
     {
         "name": "morning-briefing",
         "key": "briefing",
-        "hour": 6, "minute": 0,
-        "window_hours": 8,        # recover until ~14:00
+        # MUST track the morning-briefing cron time in crons.json (currently
+        # 06:57). The catch-up slot is a *backstop*: it should only treat the
+        # briefing as overdue AFTER the normal cron would have fired. When this
+        # was 06:00 (57 min ahead of the cron), catch-up false-positived every
+        # day in the 06:00–06:57 window, triggering an early/duplicate delivery
+        # (observed 2026-06-18). If you change the cron minute, change this too.
+        "hour": 6, "minute": 57,
+        "window_hours": 8,        # recover until ~14:57
         "until": None,
         "run_hint": "/morning-briefing",
     },
