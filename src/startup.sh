@@ -523,7 +523,10 @@ _primary_discord_bridge_running() {
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
 if [ -f "$HOME/.claude/channels/discord/.env" ] && grep -q "DISCORD_BOT_TOKEN=" "$HOME/.claude/channels/discord/.env" 2>/dev/null; then
   PYTHON_WITH_DISCORD=""
-  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  # Include /usr/bin/python3 (CommandLineTools): on some hosts discord.py is
+  # only installed there, never in the Homebrew python — omitting it left the
+  # bridge un-launchable at boot (Goose, 2026-06-20).
+  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3 /usr/bin/python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
       PYTHON_WITH_DISCORD="$_p"
       break
@@ -547,7 +550,7 @@ fi
 # fresh-install miniconda env doesn't silently miss slack_bolt.
 if [ -f "$HOME/.claude/channels/slack/.env" ] && grep -q "SLACK_BOT_TOKEN=" "$HOME/.claude/channels/slack/.env" 2>/dev/null; then
   PYTHON_WITH_SLACK=""
-  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3 /usr/bin/python3; do
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
       PYTHON_WITH_SLACK="$_p"
       break
