@@ -17,7 +17,10 @@ import sys
 import urllib.request
 from pathlib import Path
 
-_TOK_FILE = Path.home() / ".claude" / "channels" / "discord" / ".env"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import claude_home_path  # noqa: E402  canonical ~/.claude/ resolver (no hand-rolled paths)
+
+_TOK_FILE = claude_home_path("channels", "discord", ".env")
 _UA = "DiscordBot (https://github.com/amkunte/sutando, 1.0)"
 
 

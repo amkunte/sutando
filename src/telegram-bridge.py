@@ -1002,7 +1002,6 @@ def main():
             parsed = parse_markers(reply_text)
             if any(a.kind == "skip" for a in parsed.actions):
                 print(f"  Skipped (marker): {task_id}", flush=True)
-                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                 pending_replies.pop(task_id, None)
                 _save_pending_replies(pending_replies)
                 _clear_progress(task_id)  # remove any progress placeholder + tier tracking
@@ -1014,14 +1013,27 @@ def main():
 
             delivery_attempts[task_id] = delivery_attempts.get(task_id, 0) + 1
             try:
-                ok = send_reply(chat_id, reply_text, task_id=task_id)
+                # Use parsed.body — all markers stripped — so [channel:]/[file:]
+                # never leak as literal text in the DM (#1381). Attachments come
+                # from parsed.actions below, not from re-scanning the body.
+                ok = send_reply(chat_id, parsed.body, task_id=task_id)
+                for action in parsed.actions:
+                    if action.kind == "attach":
+                        fpath = action.value.strip()
+                        if _is_path_sendable(fpath):
+                            send_file(chat_id, fpath)
+                            print(f"  Sent file: {fpath}", flush=True)
+                        elif os.path.isfile(fpath):
+                            api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
+                            print(f"  BLOCKED file: {fpath}")
+                        else:
+                            print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
             except Exception as e:
                 print(f"[Telegram] Reply error for {task_id}: {e}", flush=True)
                 ok = False
 
             if ok:
-                print(f"  Replied to {chat_id}: {reply_text[:80]}...", flush=True)
-                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
+                print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
                 pending_replies.pop(task_id, None)
                 _save_pending_replies(pending_replies)
                 delivery_attempts.pop(task_id, None)

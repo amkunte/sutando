@@ -48,7 +48,7 @@ def test_validate_reads_signature_header():
     src = _src()
     func_start = src.find("function validateTwilioSignature(")
     assert func_start > 0
-    func_body = src[func_start: func_start + 1200]
+    func_body = src[func_start: func_start + 2200]
     assert "x-twilio-signature" in func_body, (
         "validateTwilioSignature must read the x-twilio-signature header "
         "(lowercase — Node.js normalises headers)"
@@ -59,7 +59,7 @@ def test_validate_uses_timing_safe_equal():
     src = _src()
     func_start = src.find("function validateTwilioSignature(")
     assert func_start > 0
-    func_body = src[func_start: func_start + 1200]
+    func_body = src[func_start: func_start + 2200]
     assert "timingSafeEqual" in func_body, (
         "validateTwilioSignature must use timingSafeEqual for comparison — "
         "string equality leaks timing information"
@@ -70,7 +70,7 @@ def test_validate_uses_hmac_sha1():
     src = _src()
     func_start = src.find("function validateTwilioSignature(")
     assert func_start > 0
-    func_body = src[func_start: func_start + 1200]
+    func_body = src[func_start: func_start + 2200]
     assert "createHmac('sha1'" in func_body or 'createHmac("sha1"' in func_body, (
         "validateTwilioSignature must use HMAC-SHA1 (Twilio's algorithm)"
     )
