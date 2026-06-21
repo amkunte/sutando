@@ -67,8 +67,8 @@ JOBS = [
     {
         "name": "morning-briefing",
         "key": "briefing",
-        "hour": 6, "minute": 0,
-        "window_hours": 8,        # recover until ~14:00
+        "hour": 6, "minute": 57,  # MUST match crons.json cron "57 6 * * *"; a 06:00 slot false-flags the briefing as overdue every day in the 06:00–06:57 window before the real cron fires (Goose, 2026-06-21)
+        "window_hours": 8,        # recover until ~15:00
         "until": None,
         "run_hint": "/morning-briefing",
     },
