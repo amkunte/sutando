@@ -51,6 +51,13 @@ def _post(url: str, payload: dict, headers: dict) -> bool:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers={
             "Content-Type": "application/json",
+            # Discord sits behind Cloudflare, which bans the default
+            # `Python-urllib/x.y` UA with HTTP 403 / error code 1010 — so every
+            # Discord notify silently failed (observed 2026-06-22). A real UA
+            # passes; Discord additionally *requires* the `DiscordBot (...)`
+            # format for bot REST calls. Slack/Telegram ignore it. Callers may
+            # override via `headers`.
+            "User-Agent": "DiscordBot (https://github.com/sonichi/sutando, 1.0)",
             **headers,
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
