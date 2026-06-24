@@ -1,0 +1,41 @@
+{
+  "_comment": "Frontier-scan source list. GitHub repos are pulled deterministically by fetch_sources.py (releases + tags). Sources without a stable repo (kind=web) are left to the agent's WebSearch step in scan-prompt.md. Add/remove freely — owner-tunable.",
+  "sources": [
+    {
+      "name": "Claude Agent SDK (Python)",
+      "kind": "github",
+      "repo": "anthropics/claude-agent-sdk-python",
+      "why_track": "Anthropic's own agent framework — new primitives here are directly adoptable by Sutando."
+    },
+    {
+      "name": "Claude Agent SDK (TypeScript)",
+      "kind": "github",
+      "repo": "anthropics/claude-agent-sdk-typescript",
+      "why_track": "TS side of the Agent SDK — Sutando's core is TS, so these land closest to home."
+    },
+    {
+      "name": "Letta (MemGPT)",
+      "kind": "github",
+      "repo": "letta-ai/letta",
+      "why_track": "Long-term agent memory architecture — relevant to Sutando's memory + fleet-context work."
+    },
+    {
+      "name": "OpenAI Swarm",
+      "kind": "github",
+      "repo": "openai/swarm",
+      "why_track": "Lightweight multi-agent handoff patterns — maps onto the Maverick/Goose/Charlie fleet."
+    },
+    {
+      "name": "Nous Research / Hermes",
+      "kind": "github",
+      "repo": "NousResearch/Hermes-Function-Calling",
+      "why_track": "Hermes 'Jeepa' auto-skill loop inspired skill-synth; watch for new agent/skill tooling."
+    },
+    {
+      "name": "OpenClaw",
+      "kind": "github",
+      "repo": "openclaw/openclaw",
+      "why_track": "Owner-flagged agentic runtime (calendar-versioned). Ships features that map straight onto Sutando: durable task orchestration (TaskFlow), richer Telegram delivery, Skill Workshop, auto fast-mode. Repo confirmed 2026-06-24."
+    }
+  ]
+}

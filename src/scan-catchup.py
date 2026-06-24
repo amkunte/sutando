@@ -68,6 +68,13 @@ SCANS = [
         "hint": "Run the Cirrus SR22T deal-hunter per ~/.claude/skills/karts-air/scan-prompt.md; "
                 "post #deals only on new/changed airframes, else silent.",
     },
+    {
+        "name": "frontier-scan",
+        "state": REPO_DIR / "skills/frontier-scan/state/seen.json",
+        "cadence_hours": 168,  # weekly
+        "hint": "Run the Frontier Scan per skills/frontier-scan/scan-prompt.md; "
+                "post #skills-dev only on a new capability delta, else silent.",
+    },
 ]
 
 GRACE = 1.5  # flag only after 1.5x cadence elapsed (absorbs one missed tick)
