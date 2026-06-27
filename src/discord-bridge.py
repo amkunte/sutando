@@ -3182,7 +3182,11 @@ async def _handle_discord_message(message, force=False):
     _notify_py = _claude_config / "skills/task-progress/scripts/notify.py"
     _transcribe_py = _claude_config / "skills/audio-transcribe/scripts/transcribe.py"
     discord_skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness feature (reconstruct before interpreting) and
+    # must NOT be gated on unrelated skills (task-progress / audio-transcribe) being
+    # installed — emit for every owner task. notify/transcribe steps stay conditional
+    # within. (Mirrors telegram-bridge; ungated 2026-06-25 per owner.)
+    if access_tier == "owner":
         channel_id_str = str(message.channel.id)
         has_audio = "[File attached:" in attachment_note and any(
             attachment_note.lower().find(ext) != -1
@@ -3190,6 +3194,21 @@ async def _handle_discord_message(message, force=False):
         )
         lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        # Context-first: a terse or threaded reply ("no", "continue", a pronoun)
+        # loses its referent when interpreted against a stale/compacted session
+        # context. Reconstruct from the durable channel BEFORE interpreting —
+        # keyed on the message not being self-contained (the agent's own judgment,
+        # not a parent_message_id gate), following the reply chain back, no
+        # arbitrary message count. Root-cause fix 2026-06-25.
+        lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained (terse, a reply, '
+            f'or refers to something not stated here), reconstruct the relevant context '
+            f'BEFORE interpreting — `python3 src/discord-read.py {channel_id_str}` — and '
+            f'read the thread (everyone\'s messages including your own prior replies) back '
+            f'until it stands on its own, then answer from the reconstructed thread, not '
+            f'from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_cmd = (
                 f"python3 {_notify_py}"
