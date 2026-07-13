@@ -21,6 +21,7 @@ from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import personal_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -190,9 +191,14 @@ def get_reminders() -> list[str]:
         if r.returncode != 0:
             return []
         items = []
+        # reminders.py prints the human-readable sentinel "No reminders."
+        # (exit 0) when the due-today list is empty — skip it so the empty
+        # state doesn't get counted as a single reminder and rendered as
+        # "Reminders due: No reminders.".
+        empty_sentinels = {"no reminders.", "no reminders"}
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
+            if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
         return items[:5]
     except (subprocess.TimeoutExpired, OSError):
@@ -223,7 +229,7 @@ def get_overnight_discord() -> list[str]:
 
 def get_pending_questions() -> list[str]:
     """Return unanswered questions from pending-questions.md."""
-    pq = WORKSPACE / "pending-questions.md"
+    pq = personal_path("pending-questions.md", WORKSPACE)
     if not pq.exists():
         return []
     content = pq.read_text()
@@ -232,13 +238,25 @@ def get_pending_questions() -> list[str]:
     # this cut the briefing speaks every resolved entry as still-pending.
     # No-op when there is no such divider.
     content = re.split(r'^#\s+Resolved\b', content, maxsplit=1, flags=re.MULTILINE)[0]
+    # Organizer/section-shell headers (e.g. "## FRESH — 2026-07-05 [wu-air]",
+    # "## ACTIVE — ...", "## SURFACED — ...") group questions but are not
+    # themselves questions — skip them so the briefing's "top item" is a real
+    # question, not a date-label. Also skip anything already marked resolved
+    # inline (the "# Resolved" divider above is a no-op for files that use
+    # per-item "[RESOLVED]" markers instead).
+    org_header = re.compile(
+        r'^(FRESH|ACTIVE|HELD|TRIAGE|SURFACED|RESOLVED|ANSWERED)\b', re.IGNORECASE
+    )
     questions = []
     for section in re.split(r'^## ', content, flags=re.MULTILINE)[1:]:
         title = section.partition('\n')[0].strip()
         # Strip leading date prefix like "[2026-05-27] "
         title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title)
-        if title:
-            questions.append(title[:60])
+        if not title:
+            continue
+        if 'RESOLVED' in title.upper() or org_header.match(title):
+            continue
+        questions.append(title[:60])
     return questions
 
 

@@ -55,8 +55,11 @@ tests/*
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.txt
 !tests/_helpers/
 !tests/_helpers/*.ts
+!tests/fixtures/
+!tests/fixtures/*.json
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
@@ -99,6 +102,18 @@ voice-state.json
 # Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid
 
+# Per-clone Sutando config overrides — workspace path, vault remote, etc.
+# Tracked defaults live in sutando.config.json; .local.json carries the
+# machine-specific overrides (different workspace location, different vault
+# remote per host) and must never be committed.
+sutando.config.local.json
+
+# In-repo workspace (M0 default). Everything user-runtime — tasks/, results/,
+# state/, notes/, build_log.md, etc. — lives under workspace/ and must never
+# be committed. .gitkeep is the exception so the directory ships in fresh
+# clones for a zero-config first run.
+workspace/*
+!workspace/.gitkeep
 # AG2 onboarding summary — private (invite codes + ids)
 ag2-onboarding.txt
 
@@ -115,3 +130,10 @@ skills/tv-price-watcher/
 
 # Playwright MCP cache (created by mcp__playwright tools)
 .playwright-mcp/
+
+# coverage-gate artifacts (scripts/coverage-gate.sh)
+.coverage
+.coverage.*
+coverage.xml
+diff-cover.md
+coverage-summary.md

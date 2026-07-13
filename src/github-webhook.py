@@ -159,9 +159,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
             task_content = (
                 f"id: {task_id}\n"
                 f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                f"task: {safe_task}\n"
                 f"source: github\n"
+                f"interaction_type: system_event\n"
                 f"access_tier: other\n"
+                f"task: {safe_task}\n"
             )
             TASKS_DIR.mkdir(exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)

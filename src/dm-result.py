@@ -9,12 +9,12 @@ Checks http://localhost:8080/sse-status for voiceConnected.
 If voice is connected, does nothing (voice agent will speak the result).
 If voice is disconnected, sends the result to the owner's Discord DM.
 
-Requires DISCORD_BOT_TOKEN in .env (or in ~/.claude/channels/discord/.env)
+Requires DISCORD_BOT_TOKEN in .env (or in $CLAUDE_CONFIG_DIR/channels/discord/.env)
 and the Discord bridge running.
 
 Owner resolution:
     1. $SUTANDO_DM_OWNER_ID env var (explicit override).
-    2. First non-bot user in ~/.claude/channels/discord/access.json → allowFrom.
+    2. First non-bot user in $CLAUDE_CONFIG_DIR/channels/discord/access.json → allowFrom.
 The bot's own user ID is discovered via Discord's GET /users/@me so that
 multi-owner allowFrom lists still resolve to the human.
 
@@ -33,10 +33,11 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import claude_home_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 import discord_config  # noqa: E402  — workspace-local Sutando discord config (#1147)
 REPO = resolve_workspace()
-ACCESS_JSON = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+ACCESS_JSON = claude_home_path("channels", "discord", "access.json")
 SSE_STATUS_URL = "http://localhost:8080/sse-status"
 
 # Path allowlist for `[file: ...]` markers — sourced from
@@ -54,9 +55,9 @@ from send_allowlist import (  # noqa: E402
     SEND_ALLOWED_PREFIXES as _SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,
 )
+from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; was a 4th private copy)
 
 
-_FENCE_LINE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`~][^`~]*)?\s*$")
 
 
 # Mirror of discord-bridge.py's `_FILE_MARKER_RE` — agent-emitted file
@@ -84,90 +85,14 @@ def _split_file_markers(text: str) -> tuple[str, list[str]]:
     return clean_text, files
 
 
-def _is_fence_open_line(line: str):
-    """Return the fence opener string if `line` is a real Markdown fence line, else None."""
-    if not _FENCE_LINE.match(line):
-        return None
-    return line.strip()
-
-
 def _chunk_for_discord(text: str, max_len: int = 1900):
-    """Yield Discord-safe chunks <= max_len, preserving Markdown code fences.
+    """Alias for the shared fence-aware chunker (Result Router S3).
 
-    Mirrors src/discord-bridge.py:_chunk_for_discord. Tracks the exact fence
-    opener (so language tag and fence-token kind are preserved across chunk
-    boundaries) and uses anchored fence-line detection so inline backticks
-    in code/prose don't toggle state.
+    Was a private mirror of discord-bridge's copy; now delegates to
+    src/message_chunking.py:chunk_message so this REST-fallback delivery
+    path shares the exact same fence-preservation logic.
     """
-    if not text:
-        return
-    fence_opener = None
-    buf = []
-    buf_len = 0
-
-    def fence_closer(opener):
-        return opener[0] * 3 if opener else "```"
-
-    def flush():
-        nonlocal buf, buf_len
-        if not buf:
-            return None
-        chunk = "\n".join(buf)
-        if fence_opener:
-            chunk = chunk + "\n" + fence_closer(fence_opener)
-        buf = []
-        buf_len = 0
-        return chunk
-
-    for line in text.split("\n"):
-        opener_on_line = _is_fence_open_line(line)
-        line_overhead = len(line) + 1
-        reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
-
-        if buf_len + line_overhead + reserve > max_len and buf:
-            chunk = flush()
-            if chunk is not None:
-                yield chunk
-            if fence_opener:
-                buf.append(fence_opener)
-                buf_len = len(fence_opener) + 1
-
-        if line_overhead + reserve > max_len:
-            remaining = line
-            while len(remaining) + 1 + reserve > max_len - buf_len:
-                take = max_len - reserve - buf_len - 1
-                if take <= 0:
-                    chunk = flush()
-                    if chunk is not None:
-                        yield chunk
-                    if fence_opener:
-                        buf.append(fence_opener)
-                        buf_len = len(fence_opener) + 1
-                    take = max_len - reserve - buf_len - 1
-                buf.append(remaining[:take])
-                buf_len += take + 1
-                remaining = remaining[take:]
-                chunk = flush()
-                if chunk is not None:
-                    yield chunk
-                if fence_opener:
-                    buf.append(fence_opener)
-                    buf_len = len(fence_opener) + 1
-            buf.append(remaining)
-            buf_len += len(remaining) + 1
-        else:
-            buf.append(line)
-            buf_len += line_overhead
-
-        if opener_on_line is not None:
-            if fence_opener is None:
-                fence_opener = opener_on_line
-            else:
-                fence_opener = None
-
-    chunk = flush()
-    if chunk is not None:
-        yield chunk
+    yield from chunk_message(text, max_len)
 
 
 def voice_connected() -> bool:
@@ -183,7 +108,7 @@ def voice_connected() -> bool:
 def _load_token() -> str:
     """Read DISCORD_BOT_TOKEN from the first env file that has it."""
     for env_path in [
-        Path.home() / ".claude" / "channels" / "discord" / ".env",
+        claude_home_path("channels", "discord", ".env"),
         REPO / ".env",
     ]:
         if not env_path.exists():

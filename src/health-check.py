@@ -38,7 +38,7 @@ except ImportError:  # non-POSIX (e.g. Windows) — the lock degrades to a no-op
 
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
-from util_paths import shared_personal_path  # noqa: E402
+from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -52,10 +52,20 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 
 def _default_memory_dir() -> str:
-    """Auto-detect Claude Code memory dir from repo path."""
+    """Claude Code memory dir under the workspace claude-home.
+
+    Mirrors how Claude Code itself resolves memory: <claude-home>/projects/
+    <slug>/memory. Pre-#1454 this hardcoded ~/.claude/projects/<slug>/memory,
+    which ignored the workspace-scoped CLAUDE_CONFIG_DIR — so on a migrated
+    install the probe read an empty/stale ~/.claude path instead of the
+    workspace memory dir (where Claude Code actually writes and the vault
+    syncs), which forced a SUTANDO_MEMORY_DIR override to compensate.
+    claude_home_path() honors CLAUDE_CONFIG_DIR, falling back to ~/.claude
+    only when it is unset (preserving the old path for ad-hoc launches).
+    """
     repo = Path(__file__).parent.parent.resolve()
     slug = str(repo).replace("/", "-")
-    return str(Path.home() / ".claude" / "projects" / slug / "memory")
+    return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
@@ -63,13 +73,41 @@ MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 # Checks
 # ---------------------------------------------------------------------------
 
-def check_port(port: int, name: str) -> dict:
-    """Check if a port is listening."""
+def check_port(port: int, name: str, probe: bool = False) -> dict:
+    """Check if a port is listening, optionally probing for a live response.
+
+    A wedged server can keep its listen socket open while never answering
+    (2026-06-10: voice-agent accepted TCP for 26h with a dead event loop, so
+    the dashboard's WS connect hung forever). With probe=True, send a minimal
+    HTTP GET and require *any* response bytes — a healthy HTTP server replies
+    with a status line and a healthy WS server replies 400/426 to a plain GET,
+    while a wedged one sends nothing.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(2)
             result = s.connect_ex(("127.0.0.1", port))
             up = result == 0
+            if up and probe:
+                try:
+                    # 10s: dashboard.py takes ~3.5s to first byte (collects
+                    # data via subprocesses before responding). Wedged servers
+                    # never send anything, so the verdict is still decisive.
+                    s.settimeout(10)
+                    # Probe an unknown path, NOT "/": dashboard's "/" collects
+                    # data including a health-check.py subprocess — probing it
+                    # from health-check recursed (probe → render → health-check
+                    # → probe …) and amplified into a request storm. A 404 is
+                    # still response bytes, which is all liveness needs.
+                    s.sendall(f"GET /__liveness_probe__ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
+                    if not s.recv(1):
+                        raise TimeoutError("no response bytes")
+                except Exception:
+                    return {
+                        "name": name,
+                        "status": "wedged",
+                        "detail": f"port {port} listening but unresponsive — restart needed",
+                    }
         return {"name": name, "status": "ok" if up else "down", "detail": f"port {port}"}
     except Exception as e:
         return {"name": name, "status": "error", "detail": str(e)}
@@ -148,7 +186,21 @@ def check_memory_sync() -> dict:
                 break
     if not repo_url:
         return {"name": name, "status": "warn", "detail": "SUTANDO_MEMORY_REPO not set — cross-machine sync disabled"}
-    # Memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
+    # Current model (sync-workspace.sh): the workspace ITSELF is a git repo with
+    # the vault as a remote — sync = git fetch/merge/push on the workspace, no
+    # separate clone dir. So the freshness signal is the workspace's own
+    # .git/FETCH_HEAD. Prefer this whenever the workspace is a git repo; the
+    # legacy ~/.sutando/memory-sync clone (sync-memory.sh, deprecated) often
+    # lingers on disk abandoned and would otherwise read as permanently stale.
+    ws_git_fetch = WORKSPACE_DIR / ".git" / "FETCH_HEAD"
+    if (WORKSPACE_DIR / ".git").exists():
+        if ws_git_fetch.exists():
+            age_h = (time.time() - ws_git_fetch.stat().st_mtime) / 3600
+            if age_h > 48:
+                return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
+            return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
+        return {"name": name, "status": "ok", "detail": "workspace git repo, never fetched"}
+    # Legacy memory-sync clone dir: PR #764 renamed legacy ~/.sutando-memory-sync/
     # → ~/.sutando/memory-sync/. Check new path first; fall back to legacy
     # for installs that haven't migrated yet (sync-memory.sh auto-migrates
     # on next run when env is unset).
@@ -167,6 +219,51 @@ def check_memory_sync() -> dict:
             return {"name": name, "status": "warn", "detail": f"last sync {age_h:.0f}h ago (stale)"}
         return {"name": name, "status": "ok", "detail": f"last sync {age_h:.1f}h ago"}
     return {"name": name, "status": "ok", "detail": "initialized, never fetched"}
+
+
+def check_host_subtrees() -> dict:
+    """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
+
+    Under the hosts/<hostname>/ convention each host writes only its own
+    subtree, so the newest file mtime in a subtree is that host's last sync. A
+    subtree not updated in SUTANDO_STALE_HOST_DAYS days means that host went
+    quiet (crashed, decommissioned, or sync broke) — surface it rather than
+    letting it silently rot (a gap in both the old machine-<host>/ model and the
+    new one until now). Read-only.
+    """
+    name = "host-subtrees"
+    hosts_dir = WORKSPACE_DIR / "hosts"
+    if not hosts_dir.is_dir():
+        return {"name": name, "status": "ok", "detail": "no hosts/ subtree yet"}
+    try:
+        stale_days = float(os.environ.get("SUTANDO_STALE_HOST_DAYS", "7"))
+    except ValueError:
+        stale_days = 7.0
+    subtrees = [d for d in sorted(hosts_dir.iterdir()) if d.is_dir()]
+    if not subtrees:
+        return {"name": name, "status": "ok", "detail": "hosts/ present, no host subtrees"}
+    now = time.time()
+    stale, fresh = [], 0
+    for d in subtrees:
+        newest = 0.0
+        for f in d.rglob("*"):
+            try:
+                if f.is_file():
+                    newest = max(newest, f.stat().st_mtime)
+            except OSError:
+                continue
+        if newest == 0.0:
+            continue  # empty subtree — nothing to age
+        age_d = (now - newest) / 86400
+        if age_d > stale_days:
+            stale.append(f"{d.name} ({age_d:.0f}d)")
+        else:
+            fresh += 1
+    if stale:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(stale)} host subtree(s) stale (>{stale_days:.0f}d): "
+                          f"{', '.join(stale)} — host stopped syncing?"}
+    return {"name": name, "status": "ok", "detail": f"{fresh} host subtree(s), all synced <{stale_days:.0f}d"}
 
 
 def check_tcc_documents_access() -> dict:
@@ -246,6 +343,36 @@ def fix_launchd(label: str) -> str:
     if result.returncode == 0:
         return f"bootstrapped {label}"
     return f"failed to restart {label}: {result.stderr.strip()}"
+
+
+def fix_screen_capture() -> str:
+    """Restart the screen-capture server (:7845), guarded like startup.sh.
+
+    Order matters: reap any existing listener first (a dead-perm or wedged
+    server holds the port and would block the new bind), then re-verify
+    Screen Recording with a real capture — an all-black denial PNG
+    compresses to ~43KB at 5K resolution, so <5000 bytes means the
+    permission is missing or stale. Starting a server without the perm
+    would recreate the stale-:7845 state startup.sh's PERM_OK gate exists
+    to prevent: every /capture answered with a black-PNG denial.
+    """
+    subprocess.run("/usr/sbin/lsof -ti:7845 | xargs kill 2>/dev/null", shell=True, capture_output=True)
+    probe = Path("/tmp/sutando-healthfix-permcheck.png")
+    subprocess.run(["/usr/sbin/screencapture", "-x", str(probe)], capture_output=True)
+    size = probe.stat().st_size if probe.exists() else 0
+    probe.unlink(missing_ok=True)
+    if size < 5000:
+        return ("not restarted — Screen Recording permission missing/stale; grant it in "
+                "System Settings → Privacy & Security, fully quit the terminal app, re-run startup.sh")
+    log_path = WORKSPACE_DIR / "logs" / "screen-capture.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen([sys.executable, str(REPO_DIR / "src" / "screen-capture-server.py")],
+                     stdout=open(str(log_path), "a"), stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    time.sleep(1.5)
+    after = check_port(7845, "screen-capture")
+    return "restarted on :7845" if after["status"] == "ok" else (
+        f"restart attempted but port check says {after['status']} — see {log_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +898,98 @@ def _extract_body(text: str, start: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Battery and memory health checks
+# -------------------------
+
+def check_battery() -> dict:
+    """Check power source and battery level (macOS only). Issue #1486."""
+    name = "battery"
+    warn_pct = int(os.environ.get("SUTANDO_BATTERY_WARN_PCT", "20"))
+    try:
+        result = subprocess.run(
+            ["pmset", "-g", "batt"],
+            capture_output=True, text=True, timeout=5
+        )
+        output = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {"name": name, "status": "ok", "detail": "pmset not available (not macOS or VM)"}
+
+    if "AC Power" in output:
+        # Plugged in — no concern, but extract percentage if available
+        import re
+        m = re.search(r'(\d+)%', output)
+        pct = int(m.group(1)) if m else None
+        detail = f"AC power" + (f", {pct}% charged" if pct is not None else "")
+        return {"name": name, "status": "ok", "detail": detail}
+
+    if "Battery Power" in output or "'Battery Power'" in output:
+        import re
+        m = re.search(r'(\d+)%', output)
+        pct = int(m.group(1)) if m else None
+        if pct is None:
+            return {"name": name, "status": "warn", "detail": "on battery — level unknown"}
+        if pct <= warn_pct:
+            return {"name": name, "status": "fail", "detail": f"on battery at {pct}% — critically low (threshold {warn_pct}%)"}
+        return {"name": name, "status": "warn", "detail": f"on battery at {pct}% — no AC power"}
+
+    return {"name": name, "status": "ok", "detail": "power state unknown"}
+
+def check_memory() -> dict:
+    """Warn/fail on real macOS memory pressure, not raw 'unused' pages. Issue #1485.
+
+    The original probe read `top`'s "PhysMem: ... N unused" figure and failed
+    when it dipped below a MB threshold. But macOS deliberately keeps unused
+    pages low — it spends free RAM on the file cache and compressed memory — so
+    "unused" routinely sits near zero on a perfectly healthy machine. That
+    produced recurring false FAILs (e.g. "82M free — critically low" while
+    `memory_pressure` reported 44% free and swap usage was 0), which in turn
+    spawned owner-facing health tasks for a non-issue.
+
+    OOM kills happen under sustained pressure with swap thrashing, so the real
+    OOM-proximity signals on macOS are (a) the kernel pressure level —
+    `kern.memorystatus_vm_pressure_level`: 1=normal, 2=warning, 4=critical —
+    and (b) how much swap is actually in use. Gate warn/fail on those.
+    """
+    name = "memory"
+    swap_warn_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_WARN_MB", "512"))
+    swap_fail_mb = int(os.environ.get("SUTANDO_MEMORY_SWAP_FAIL_MB", "2048"))
+    import re as _re
+
+    try:
+        level = int(subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True, timeout=5).stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return {"name": name, "status": "ok", "detail": "pressure level unavailable (non-macOS or VM)"}
+
+    # Swap actually in use is the strongest OOM-proximity signal.
+    swap_used_mb = 0.0
+    try:
+        swap_out = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True, text=True, timeout=5).stdout
+        sm = _re.search(r'used\s*=\s*([\d.]+)([MG])', swap_out)
+        if sm:
+            swap_used_mb = float(sm.group(1)) * (1024 if sm.group(2) == "G" else 1)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Swap-in-use is sticky on macOS: pages swapped out during a past pressure
+    # event stay counted until touched again, so high swap with a *normal*
+    # kernel pressure level is residue, not active thrash. Fail only when the
+    # kernel itself signals pressure; swap corroborates, it doesn't convict.
+    if level >= 4 or (level >= 2 and swap_used_mb >= swap_fail_mb):
+        return {"name": name, "status": "fail",
+                "detail": f"critical memory pressure (level {level}, swap {swap_used_mb:.0f}M in use)"}
+    if level >= 2:
+        return {"name": name, "status": "warn",
+                "detail": f"memory pressure elevated (level {level}, swap {swap_used_mb:.0f}M in use)"}
+    if swap_used_mb >= swap_warn_mb:
+        return {"name": name, "status": "warn",
+                "detail": f"swap {swap_used_mb:.0f}M in use but kernel pressure normal (level {level}) — likely residue from a past pressure event"}
+    return {"name": name, "status": "ok", "detail": f"pressure normal (level {level}, swap {swap_used_mb:.0f}M)"}
+
+
 # Stuck-loop / dead-watcher detection
 # ---------------------------------------------------------------------------
 # These two checks together catch the failure mode observed 2026-05-06 where
@@ -928,11 +1147,96 @@ def _is_cohost_discord_bridge(pid: str) -> bool:
     return m.group(1).rstrip("/") != default
 
 
+def sutando_app_hotkey_detail(workspace_dir) -> str:
+    """Detail string for a running sutando-app check.
+
+    Hotkey labels come from <workspace>/state/hotkeys.json, published by the
+    app when it registers them (single source of truth since #1920). A running
+    process alone doesn't prove hotkeys exist — app lineages without global
+    hotkey registration (e.g. the Electron shell) match the pgrep pattern but
+    register nothing, and the pre-#1920 hardcoded "(⌃C/⌃V/⌃M)" claim here had
+    already drifted from the real defaults and read as a false positive during
+    live debugging. Missing/malformed/empty file → honest "no hotkeys
+    published" rather than a guess.
+    """
+    try:
+        entries = json.loads((Path(workspace_dir) / "state" / "hotkeys.json").read_text())
+        labels = "/".join(e["label"] for e in entries if e.get("label"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        labels = ""
+    return f"running (hotkeys: {labels})" if labels else "running (no hotkeys published)"
+
+
+def _outermost_bundle(comm: str) -> Optional[Path]:
+    """Map an executable path to its OUTERMOST .app bundle, or None.
+
+    Electron helper processes live at
+    …/Sutando.app/Contents/Frameworks/Sutando Helper*.app/Contents/MacOS/…,
+    so split on the FIRST `.app/` to resolve them to the top-level bundle
+    rather than the nested helper bundle.
+    """
+    if ".app/" not in comm:
+        return None
+    return Path(comm.split(".app/", 1)[0] + ".app")
+
+
+def _is_electron_impostor(comm: str) -> bool:
+    """True if `comm` belongs to an Electron bundle squatting the Sutando name.
+
+    The desktop UI also installs as "Sutando.app", and its main binary lives
+    at the same …/Contents/MacOS/Sutando suffix the sutando-app pgrep pattern
+    matches — so the probe reported "running" while the actual Swift menu-bar
+    app (the contextual-chips writer + watcher-auto-restart owner) was dead
+    (#2038, 2026-07-09). Electron bundles are distinguishable on disk: they
+    ship Contents/Frameworks/Sutando Helper.app; the Swift app has no helper
+    frameworks.
+    """
+    bundle = _outermost_bundle(comm)
+    if bundle is None:
+        return False  # bare dev binary (src/Sutando/Sutando) — not a bundle
+    return (bundle / "Contents" / "Frameworks" / "Sutando Helper.app").exists()
+
+
+def _ps_comm(pid: str) -> str:
+    """Executable path (macOS) / name (linux) for a PID via ps; "" on error."""
+    return subprocess.run(
+        ["/bin/ps", "-o", "comm=", "-p", pid],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+
+
+def _filter_electron_impostor_pids(pids: list[str]) -> list[str]:
+    """Drop PIDs that belong to the Electron desktop app, keep the rest.
+
+    Fail-open per PID: if the ps lookup errors, keep the PID (pre-fix
+    behavior) rather than false-alarm "stopped".
+    """
+    kept = []
+    for pid in pids:
+        try:
+            if _is_electron_impostor(_ps_comm(pid)):
+                continue
+        except Exception:
+            pass
+        kept.append(pid)
+    return kept
+
+
+def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tuple[Optional[str], list[str]]:
+    """Post-process the sutando-app pgrep result: drop Electron impostor
+    PIDs, and demote "ok-running" to "ok-stopped" when nothing real remains."""
+    if pgrep_status == "ok-running" and pids:
+        pids = _filter_electron_impostor_pids(pids)
+        if not pids:
+            pgrep_status = "ok-stopped"
+    return pgrep_status, pids
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
     # Core services (required)
-    voice_check = check_port(9900, "voice-agent")
+    voice_check = check_port(9900, "voice-agent", probe=True)
     if voice_check["status"] == "ok":
         mark_stale_if_outdated(voice_check, REPO_DIR / "src" / "voice-agent.ts", "voice-agent.ts")
     checks.append(voice_check)
@@ -940,18 +1244,33 @@ def run_all_checks() -> list[dict]:
     checks.append(check_voice_transport(voice_check))
     checks.append(check_bodhi_dist())
 
-    web_check = check_port(8080, "web-client")
+    web_check = check_port(8080, "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
     checks.append(web_check)
 
     # Optional services (downgrade missing to warning, not failure)
     for port, name in [(7843, "agent-api"), (7844, "dashboard"), (7845, "screen-capture")]:
-        c = check_port(port, name)
-        if c["status"] != "ok":
+        c = check_port(port, name, probe=True)
+        if c["status"] == "down":
             c["status"] = "warn"
             c["detail"] = "not running (optional)"
+        # "wedged" is NOT downgraded: listening-but-dead is worse than down —
+        # startup.sh's lsof guard sees the port as occupied and won't restart it.
         checks.append(c)
+
+    # Credential proxy (port 7846) — the OAuth-injection + quota-header path
+    # (skills/quota-tracker/scripts/credential-proxy.ts). It was previously
+    # unmonitored, so a dead proxy (= broken auth/quota for proxy-routed cores)
+    # never surfaced on the dashboard. Plain TCP-listening check (probe=False):
+    # it's a forwarding proxy with no liveness endpoint, so an HTTP probe would
+    # be forwarded upstream and misread as "wedged". Optional (not every node
+    # routes through it) → down is a warning, not a failure.
+    proxy_check = check_port(7846, "credential-proxy", probe=False)
+    if proxy_check["status"] == "down":
+        proxy_check["status"] = "warn"
+        proxy_check["detail"] = "not running (optional)"
+    checks.append(proxy_check)
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -971,10 +1290,11 @@ def run_all_checks() -> list[dict]:
     else:
         checks.append({"name": "memory-dir", "status": "ok", "detail": "not yet created (normal for new installs)"})
 
-    # Notes — canonical home is shared private dir post-migration.
+    # Notes — canonical home is the resolved workspace post-migration.
     # Pass WORKSPACE_DIR (not REPO_DIR) so the check resolves to
-    # ~/.sutando/workspace/notes rather than <repo>/notes — the notes/
-    # .gitkeep was removed from the repo in #793's workspace migration.
+    # <workspace>/notes rather than <repo>/notes — the notes/.gitkeep was
+    # removed from the repo in #793's workspace migration. Post-v0.8
+    # (#1440) the workspace defaults to <repo>/workspace/.
     checks.append(check_directory(Path(shared_personal_path("notes", WORKSPACE_DIR)), "notes-dir"))
 
     # Notes split-brain: both <repo>/notes/ and <workspace>/notes/ with overlapping files (#1266)
@@ -989,6 +1309,9 @@ def run_all_checks() -> list[dict]:
 
     # Memory sync
     checks.append(check_memory_sync())
+
+    # Per-host subtree freshness (hosts/<host>/ stopped syncing?)
+    checks.append(check_host_subtrees())
 
     # Phone conversation server (optional — only check if Twilio configured and not skipped)
     env_path = REPO_DIR / ".env"
@@ -1051,7 +1374,7 @@ def run_all_checks() -> list[dict]:
     # Messaging bridges (optional — only check if configured and not skipped)
     skip_telegram = (env_path.exists() and "SKIP_TELEGRAM=1" in env_path.read_text()) or os.environ.get("SKIP_TELEGRAM") == "1"
     skip_sms = (env_path.exists() and "SKIP_SMS_BRIDGE=1" in env_path.read_text()) or os.environ.get("SKIP_SMS_BRIDGE") == "1"
-    channels_dir = Path.home() / ".claude" / "channels"
+    channels_dir = claude_home_path("channels")
     # sms-bridge is configured in workspace .env (TWILIO_*) rather than ~/.claude/channels/.
     # Configured = all three TWILIO_* vars present AND non-empty in .env.
     sms_configured = False
@@ -1312,8 +1635,15 @@ def run_all_checks() -> list[dict]:
             pgrep_status = "error"
             pgrep_err = f"{type(e).__name__}: {e}"[:120]
 
+        # Disqualify Electron impostors (see _resolve_menu_bar_pgrep).
+        pgrep_status, pids = _resolve_menu_bar_pgrep(pgrep_status, pids)
+
         if pgrep_status == "ok-running" and pids:
-            check = {"name": "sutando-app", "status": "ok", "detail": f"running (⌃C/⌃V/⌃M)"}
+            # pragma: no cover — reachable only when pgrep finds the macOS
+            # menu-bar app (never on ubuntu CI); detail derivation is covered
+            # at helper level in health-check-sutando-app-hotkeys.test.py.
+            check = {"name": "sutando-app", "status": "ok",  # pragma: no cover
+                     "detail": sutando_app_hotkey_detail(WORKSPACE_DIR)}
             # Staleness check is meaningful only in the dev workflow — the
             # .app binary and bundled main.swift share a build mtime, so a
             # comparison there is always equal. Skip when dev_bin missing.
@@ -1333,12 +1663,16 @@ def run_all_checks() -> list[dict]:
             # with the cause so it's debuggable, not a routine "app is down."
             checks.append({"name": "sutando-app", "status": "warn", "detail": f"detection failed (pgrep: {pgrep_err or 'unknown error'}) — actual app state unknown"})
 
+    # Battery and memory health checks
+
     # Stuck-loop / queue-pileup detection — consequence-level signals that
     # fire whether the watcher died, the proactive loop crashed mid-pass, or
     # both. Independent of which mechanism died.
     loop_stale_sec = int(os.environ.get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
     queue_age_sec = int(os.environ.get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
     queue_count = int(os.environ.get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
+    checks.append(check_battery())
+    checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
 
@@ -1442,6 +1776,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
         f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
         + "\n".join(bullet_lines) + "\n"
         f"source: health-check\n"
+        f"interaction_type: system_event\n"
         f"user_id: health-check\n"
         f"access_tier: owner\n"
         f"priority: low\n"
@@ -1558,7 +1893,7 @@ def _slack_token_from_env_file() -> str:
     the world-readable LaunchAgents plist. Returns "" if absent/unreadable.
 
     Order matters: the slack bridge's canonical token location is
-    ~/.claude/channels/slack/.env (startup.sh sources exactly that file before
+    $CLAUDE_CONFIG_DIR/channels/slack/.env (startup.sh sources exactly that file before
     launching the bridge — see src/startup.sh). The original implementation
     only checked $REPO/.env, where the token does NOT live on a standard
     install — so the watchdog DM silently no-op'd (creds=None) and the owner
@@ -1566,7 +1901,7 @@ def _slack_token_from_env_file() -> str:
     $REPO/.env for hosts that keep it there instead.
     """
     candidates = [
-        Path.home() / ".claude" / "channels" / "slack" / ".env",
+        claude_home_path("channels", "slack", ".env"),
         REPO_DIR / ".env",
     ]
     for env_path in candidates:
@@ -1588,13 +1923,13 @@ def _slack_owner_creds() -> "tuple[str, str] | None":
     Token from $SLACK_BOT_TOKEN (same one the slack bridge uses), falling back
     to the on-disk .env files (channel .env first, then $REPO/.env) for the
     minimal-env launchd path; owner from
-    ~/.claude/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
+    $CLAUDE_CONFIG_DIR/channels/slack/access.json (`tofuOwner`, else first `allowFrom`).
     Both must be present — otherwise there's no one to DM.
     """
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip() or _slack_token_from_env_file()
     if not token:
         return None
-    access = Path.home() / ".claude" / "channels" / "slack" / "access.json"
+    access = claude_home_path("channels", "slack", "access.json")
     try:
         data = json.loads(access.read_text())
     except Exception:
@@ -1720,7 +2055,7 @@ def notify_slack_for_failures(
 # makes it SELF-HEALING.
 #
 # Recovery action is the one mechanism we already own and trust:
-# `scripts/start-cli.sh --restart`. A restarted session starts fresh under the
+# `src/agent/claude/cli/start-cli.sh --restart`. A restarted session starts fresh under the
 # standard context boundary; because the /usage-credits enable persists
 # ACCOUNT-WIDE once a human sets it (and on Max/Team plans 1M is included with
 # no gate at all), the restarted core keeps 1M and re-clears the gate by
@@ -1840,17 +2175,44 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
     return (now - youngest_start) < seconds
 
 
+def _resolve_launch_env() -> dict:
+    """Environment for out-of-process core restarts (start-cli.sh --restart).
+
+    launchd's minimal PATH (``/usr/bin:/bin:/usr/sbin:/sbin``) cannot find the
+    tools start-cli.sh needs — homebrew ``tmux``, ``claude`` in ``~/.local/bin``,
+    or the Sutando.app-bundled ``node`` runtime — so the restart exits rc=127
+    (``node unavailable`` / ``exec: claude: not found``) and silently falls
+    through to the legacy fallback. Prepend all of them.
+
+    Extends the existing tmux-only PATH fix to node + claude. Incident
+    2026-07-10: the watchdog restart path was broken under launchd for ~70 min
+    (queue backlog) because every canonical restart hit rc=127. Same PATH-
+    narrowing class as _resolve_tmux_bin (2026-06-09), applied here.
+    """
+    env = dict(os.environ)
+    extra = [
+        "/opt/homebrew/bin",                        # homebrew (Apple Silicon) — tmux
+        "/usr/local/bin",                           # homebrew (Intel) / misc
+        str(Path.home() / ".local" / "bin"),        # `claude` install location
+    ]
+    # Sutando.app-bundled node runtime: sibling of the repo inside the app bundle
+    # (Contents/Resources/{repo,runtime}). Absent in a plain dev checkout → skipped.
+    bundled_bin = REPO_DIR.parent / "runtime" / "bin"
+    if bundled_bin.is_dir():  # pragma: no cover — only present inside the app bundle
+        extra.append(str(bundled_bin))
+    env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "/usr/bin:/bin")
+    return env
+
+
 def _default_core_restart(standard_context: bool) -> bool:
-    """Run scripts/start-cli.sh --restart out-of-process. When standard_context
-    is True, pin SUTANDO_CORE_MODEL=opus so the restarted core runs in the
-    standard 200K window (graceful degradation). Returns True if the restart
-    command exited 0."""
-    script = REPO_DIR / "scripts" / "start-cli.sh"
+    """Run src/agent/claude/cli/start-cli.sh --restart out-of-process. When
+    standard_context is True, pin SUTANDO_CORE_MODEL=opus so the restarted core
+    runs in the standard 200K window (graceful degradation). Returns True if the
+    restart command exited 0."""
+    script = REPO_DIR / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
     if not script.exists():
         return False
-    env = dict(os.environ)
-    # launchd's minimal PATH won't find homebrew tmux; start-cli.sh needs it.
-    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
+    env = _resolve_launch_env()  # pragma: no cover — real-subprocess restart path (integration, not unit)
     if standard_context:
         env["SUTANDO_CORE_MODEL"] = "opus"
     try:
@@ -2399,6 +2761,17 @@ def main():
                                      stdout=open("/tmp/web-client.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
                     print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+
+    # Screen-capture (:7845) is optional, so a down server is downgraded to
+    # warn and never enters `issues` — the fix loop above can't reach it. An
+    # owner running --fix still wants it back when the Screen Recording
+    # permission is in place, so dispatch off `checks` here. Runs even when
+    # `issues` is empty, hence outside the if/else above.
+    if do_fix:
+        sc = next((c for c in checks if c["name"] == "screen-capture" and c["status"] == "warn"
+                   and "not running" in (c.get("detail") or "")), None)
+        if sc:
+            print(f"  screen-capture: {fix_screen_capture()}")
 
     # Emit task on the RESIDUAL failure set when --fix ran (per PR #640 v2
     # review). The no-fix path emits earlier, before --quiet / --json early
