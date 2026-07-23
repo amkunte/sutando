@@ -2049,8 +2049,20 @@ def check_notes_symlink() -> "dict | None":
     silently reverting to a real dir, so edits stopped syncing while sync-memory
     only logged a WARN to cron output no one reads. Surface it as a health warn
     instead — name is not in _ON_DEMAND_WARN, so --notify-discord posts the
-    transition to #health."""
+    transition to #health.
+
+    Scoped to the legacy sync-memory.sh architecture — see the vault-sync skip
+    below."""
     ws_notes = Path(shared_personal_path("notes", WORKSPACE_DIR))
+    # Under sync-workspace.sh the workspace IS a git repo with the vault as its
+    # remote, and notes/ is a tracked real dir — the symlink-into-memory-sync
+    # model is gone. Warning here would be a false positive, and worse, this
+    # check's remediation (rm -rf + ln -s) would UNDO the migration and strand
+    # notes/ outside the tracked tree. `.sutando-vault/ws-id` is the init
+    # sentinel sync-workspace.sh itself trusts (_assert_sync_initialized), so
+    # its presence proves notes/ is legitimately a real dir.
+    if (Path(WORKSPACE_DIR) / ".sutando-vault" / "ws-id").exists():
+        return None
     # On a public-repo-checkout WORKSPACE, notes/ is legitimately a real dir —
     # the symlink architecture only applies to the ~/.sutando/workspace home
     # (mirrors sync-memory.sh's repo-checkout skip + split-brain's same-path guard).
