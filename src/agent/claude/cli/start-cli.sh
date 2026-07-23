@@ -47,6 +47,19 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1)
 if lsof -i :7846 > /dev/null 2>&1; then
   export ANTHROPIC_BASE_URL=http://localhost:7846
   CORE_ENV_ARGS+=(-e ANTHROPIC_BASE_URL=http://localhost:7846)
+  # The core runs under a namespaced CLAUDE_CONFIG_DIR whose keychain has no
+  # OAuth login of its own (the onboarding-seed deliberately does NOT copy
+  # credentials — auth is the proxy's job). But Claude Code refuses to send ANY
+  # request when it believes it's unauthenticated ("Not logged in · run /login"),
+  # so it never reaches the proxy. Give it a PLACEHOLDER key so it flips to
+  # authenticated (API-billing) mode and actually sends requests; the
+  # credential-proxy then strips this placeholder and injects the real Max OAuth
+  # token from the keychain (see skills/quota-tracker/scripts/credential-proxy.ts).
+  # This is what keeps the headless core working across config-dir changes
+  # (regressed post-#1454, when the core moved off ~/.claude to the namespaced dir).
+  # NOT a real secret — it is discarded at the proxy and never sent upstream.
+  export ANTHROPIC_API_KEY="sk-ant-sutando-core-proxy-placeholder"
+  CORE_ENV_ARGS+=(-e ANTHROPIC_API_KEY=sk-ant-sutando-core-proxy-placeholder)
 fi
 
 # Optional working-directory override for the core `claude` process.
@@ -127,7 +140,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # terminal-server Core CLI pane, and src/startup.sh all exec this script),
     # so seeding here covers every path.
     if command -v python3 > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _apikey="${ANTHROPIC_API_KEY:-}" python3 - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -152,6 +165,36 @@ if cfg.get("hasCompletedOnboarding") is not True:
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
+# Custom-API-key approval seed. When the core routes through the credential
+# proxy we set a PLACEHOLDER ANTHROPIC_API_KEY (see the proxy block above) so
+# Claude Code flips to authenticated mode and actually sends requests. But a
+# non-empty ANTHROPIC_API_KEY makes Claude Code raise a one-time "Detected a
+# custom API key — use it?" dialog, which the detached/no-TTY core cannot
+# answer → it hangs there instead of running /schedule-crons. Claude Code keys
+# that approval on the LAST 20 CHARS of the key in
+# customApiKeyResponses.approved. Pre-approve our placeholder so the dialog is
+# skipped. Only seeds when the proxy set the key (env _apikey present).
+_apikey = os.environ.get("_apikey") or ""
+if _apikey:
+    key_id = _apikey[-20:]
+    resp = cfg.get("customApiKeyResponses")
+    if not isinstance(resp, dict):
+        resp = cfg["customApiKeyResponses"] = {}
+    approved = resp.get("approved")
+    if not isinstance(approved, list):
+        approved = resp["approved"] = []
+    rejected = resp.get("rejected")
+    if not isinstance(rejected, list):
+        rejected = resp["rejected"] = []
+    if key_id not in approved:
+        approved.append(key_id)
+        changed = True
+    # A prior detached launch that hung on the dialog may have recorded a
+    # rejection (the default highlight is "No"). Rejected takes precedence over
+    # approved, so it must be cleared or the placeholder key stays refused.
+    if key_id in rejected:
+        resp["rejected"] = [k for k in rejected if k != key_id]
+        changed = True
 # Trust-seed for the explicitly-configured working dir. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
 # scoped config lacks it for a custom cwd, so the detached core would hang on

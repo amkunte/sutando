@@ -313,11 +313,19 @@ const server = createServer((req, res) => {
 		delete headers['keep-alive'];
 		delete headers['transfer-encoding'];
 
-		// Inject OAuth token for auth requests
-		if (headers['authorization']) {
-			delete headers['authorization'];
-			headers['authorization'] = `Bearer ${oauthToken}`;
-		}
+		// Inject the Max OAuth token UNCONDITIONALLY — the proxy is the single
+		// source of auth on localhost. Strip whatever the client sent (a
+		// namespaced-CLAUDE_CONFIG_DIR core has no login of its own and sends
+		// only a placeholder `x-api-key`; other callers may send a stale
+		// Bearer) and replace it with the real, freshly-refreshed keychain
+		// token. This decouples auth from the core's config-dir login state, so
+		// a config-dir namespacing change (post-#1454) can't leave the core
+		// "Not logged in" again. Previously this only *swapped* a pre-existing
+		// `authorization` header, so a client that sent none (or only
+		// `x-api-key`) reached upstream unauthenticated → 401.
+		delete headers['x-api-key'];
+		delete headers['authorization'];
+		headers['authorization'] = `Bearer ${oauthToken}`;
 
 		let timedOut = false;
 
