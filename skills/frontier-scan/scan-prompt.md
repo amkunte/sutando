@@ -13,6 +13,19 @@ skill's own state lives in `skills/frontier-scan/state/`.
 python3 skills/frontier-scan/scripts/fetch_sources.py
 ```
 
+> **⚠️ This run is destructive to the delta — never run it just to "preview."**
+> `fetch_sources.py` records every returned `new_items[]` into `state/seen.json` and
+> advances `last_scan` *on the same run that prints them*. So the items are surfaced
+> exactly once: if you run it standalone to gauge whether there's signal (e.g. mid a
+> cron burst) and don't carry through to Step 3–4 delivery, those items are now marked
+> seen and the next run reports `0 new` — the delta is silently consumed and never
+> reaches #skills-dev. Run it **only** as the real Step 1 of a full scan you intend to
+> deliver. If you already burned a delta this way, recover the release bodies straight
+> from GitHub (`gh api repos/<slug>/releases/tags/<tag>`, or `/releases` for a
+> pre-release) — `seen.json` stores only keys+timestamps, not bodies — and hand-deliver.
+> (Learned 2026-07-23: a gauge-run during a cron avalanche consumed the OpenClaw
+> 2026.7.1/7.2 delta; recovered via `gh api` and hand-posted.)
+
 This reads `sources.json`, pulls the latest GitHub releases/tags for each tracked
 repo, diffs against `state/seen.json`, advances `last_scan`, and prints JSON:
 - `new_items[]` — GitHub releases/tags not seen before (each has source, title, tag, url, published, body, why_track)
