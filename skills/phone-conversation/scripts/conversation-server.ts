@@ -53,30 +53,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
-import { hostname } from 'node:os';
 import { resolveWorkspace, statusReadPath } from '../../../src/workspace_default.js';
 
-// Personal-asset path resolver — twin of util_paths.py / voice-agent.ts:personalPath.
-// Reads $SUTANDO_MEMORY_DIR (canonical post-#870), honors legacy $SUTANDO_PRIVATE_DIR
-// as a fallback with a one-release deprecation warning on every read.
-function personalPath(filename: string): string {
-	let privateRoot = process.env.SUTANDO_MEMORY_DIR;
-	if (!privateRoot && process.env.SUTANDO_PRIVATE_DIR) {
-		console.warn(
-			'[conversation-server] DEPRECATION: SUTANDO_PRIVATE_DIR is the old name ' +
-				'for the memory dir; set SUTANDO_MEMORY_DIR instead (this alias will ' +
-				'be removed in the next release). See #870.',
-		);
-		privateRoot = process.env.SUTANDO_PRIVATE_DIR;
-	}
-	if (privateRoot) {
-		const root = privateRoot.replace(/^~/, process.env.HOME || '');
-		const host = hostname().split('.')[0];
-		const candidate = join(root, `machine-${host}`, filename);
-		if (existsSync(candidate)) return candidate;
-	}
-	return filename;
-}
 import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
 import { VoiceSession, type ToolDefinition, type MainAgent } from 'bodhi-realtime-agent';
@@ -149,26 +127,10 @@ function archivePhoneFile(srcPath: string, kind: 'tasks' | 'results', taskId: st
 }
 
 const TASK_POLL_INTERVAL_MS = 500;
-const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
 const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
 
-// Build a date-context string injected into the system prompt at session-open
-// so Gemini resolves date-relative phrases ("tomorrow", "this Friday") against
-// the owner's local clock, not UTC or server-local. Without this, US-Pacific
-// owners get an off-by-one whenever a call lands after ~5pm PT (UTC midnight
-// rollover): the model says "tomorrow = May 28" when owner-local says May 27.
-// See sonichi/sutando#1243.
-function ownerLocalDateContext(now: Date = new Date()): string {
-	const tz = OWNER_TZ;
-	const today = now.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
-	const dayName = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long' });
-	const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
-	const tomorrow = new Date(now.getTime() + 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
-	const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
-	return `Owner-local time: ${dayName}, ${today}, ${timeStr} (${tz}). Tomorrow = ${tomorrow}. Yesterday = ${yesterday}. When the owner says "today", "tomorrow", "yesterday", "this week", etc., resolve against THESE owner-local dates — never against UTC or server-local time. Pass absolute YYYY-MM-DD values to tools (not relative phrases).`;
-}
 
 // Model configuration — text/STT model still env-driven; the native-audio
 // model + googleSearch grounding are per-user config: data, not code, so they
@@ -206,24 +168,6 @@ function normalizePhone(num: string): string {
 	return digits.length === 10 ? '1' + digits : digits;
 }
 
-/** Read recent conversation context, relabeled to avoid identity confusion.
- *  Reads the text conversation.log directly — it is the primary truth for
- *  per-turn content. The sqlite mirror is a best-effort parallel write and
- *  may lag, so it must not be authoritative here. */
-function getSafeContext(lines = 5): string {
-	try {
-		const logPath = join(WORKSPACE_DIR, 'logs', 'conversation.log');
-		if (!existsSync(logPath)) return '';
-		const entries = readFileSync(logPath, 'utf-8').trim().split('\n').slice(-lines);
-		return entries.map(line => {
-			const [, role, text] = line.split('|', 3);
-			if (!role || !text) return '';
-			if (role === 'user') return `Owner said: ${text}`;
-			if (role === 'assistant') return `You (Sutando) replied: ${text}`;
-			return '';
-		}).filter(Boolean).join('\n');
-	} catch { return ''; }
-}
 
 
 const VERIFIED_CALLERS_RAW = (process.env.VERIFIED_CALLERS ?? '').split(',').map(s => s.trim()).filter(Boolean);
@@ -253,6 +197,40 @@ mkdirSync(TASKS_DIR, { recursive: true });
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
+const _ZWSP = '​';
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (34 keys) — injection-guard-sweep
+// asserts this regex covers every py key. Synced on the 2026-07-13 main merge.
+const _CONF_HEADER_RE = new RegExp(
+	'^(?:id|timestamp|task|source|access_tier|user_id|channel_id|priority|' +
+	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
+	'sender_name|room_name|parent_message_id|reminder|author_name|author_id|' +
+	'chat_id|thread_ts|reply_to_event|reply_to_me|callSid|caller|from|' +
+	'call_sid|hint|instructions|transcript|content_modalities|media_form|' +
+	'attachments|platform_card)\\s*:',
+	'i',
+);
+const _CONF_FENCE_RE = /^={3,}/;
+// Fold every str.splitlines() separator to '\n' so the guard's line-set
+// matches the reader's (else \v \f \x1c-\x1e \x85 LS PS smuggle a forged line).
+const _CONF_LINE_SEP_RE = /\r\n|[\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/g;
+/**
+ * Defang caller-supplied text before embedding in a task file.
+ * Mirrors src/task_body_guard.py:confine_user_content() and
+ * src/task-bridge.ts:confineUserContent().
+ */
+function confineUserContent(text: string): string {
+	if (!text) return text;
+	const normalized = text.replace(_CONF_LINE_SEP_RE, '\n');
+	return normalized.split('\n').map(line => {
+		const probe = line.trimStart();
+		if ((_CONF_HEADER_RE.test(probe) || _CONF_FENCE_RE.test(probe)) && !line.startsWith(_ZWSP)) {
+			return _ZWSP + line;
+		}
+		return line;
+	}).join('\n');
+}
 const google = createGoogleGenerativeAI({ apiKey: GEMINI_API_KEY });
 
 // --- Audio conversion (inbound + outbound audio chains) ---
@@ -439,7 +417,9 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	// `media_form: live_stream` — interaction-model 4D step 1.5 (scope A): the
 	// phone plane is a live real-time session, same as web voice. Additive
 	// provenance/observability stamp; media frames stay out-of-band.
-	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${callSession.callerNumber || 'unknown'}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${taskDescription}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${fullTranscript}\n`;
+	// User-controlled fields (caller, task, transcript) stay wrapped in
+	// confineUserContent() from #1806 — main's version dropped the wrapping.
+	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${confineUserContent(callSession.callerNumber || 'unknown')}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
 	writeFileSync(taskPath, content);
 
 	// Poll for result in background, inject when ready — don't block Gemini
@@ -962,7 +942,7 @@ async function createCallSession(params: {
 					sessionAny.handleClientConnected();
 					// Fallback: unmute after max(10s, 2s per turn) in case turn detection fails
 					const fallbackMs = Math.max(10000, turnCountBeforeDisconnect * 2000);
-					const fallbackTimer = setTimeout(() => {
+					setTimeout(() => {
 						if (isReplaying) {
 							console.log(`${ts()} [Phone] replay suppression fallback (${fallbackMs}ms)`);
 							isReplaying = false;
@@ -1200,7 +1180,7 @@ function cleanupCall(callSid: string): void {
 			// lifecycle, not by a caller utterance during the live session.
 			`interaction_type: system_event`,
 			`callSid: ${callSid}`,
-			`caller: ${session.callerNumber || 'unknown'}`,
+			`caller: ${confineUserContent(session.callerNumber || 'unknown')}`,
 			`access_tier: ${session.isOwner ? 'owner' : 'other'}`,
 			`task: Summarize this ${isMeeting ? 'meeting (ID: ' + session.meetingId + ')' : 'phone call'}.`,
 			`instructions:`,
@@ -1209,7 +1189,7 @@ function cleanupCall(callSid: string): void {
 			`  3. Send a concise version (3-5 bullet points) to the owner via Discord DM.`,
 			`  4. Write result to results/${summaryTaskId}.txt so voice agent can speak it`,
 			`transcript:`,
-			formatted,
+			confineUserContent(formatted),
 		];
 		const summaryContent = taskLines.join('\n') + '\n';
 		writeFileSync(join(TASKS_DIR, `${summaryTaskId}.txt`), summaryContent);

@@ -41,10 +41,14 @@ Stdlib only (urllib) — no new dependencies.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import os
+import uuid
 import re
+import signal
+import socket
 import sys
 import tempfile
 import time
@@ -52,6 +56,30 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
+# publishes AAAA records, but some hosts have IPv6 black-holed at the network
+# (the SYN is silently dropped, not refused). Python's getaddrinfo returns v6
+# first, so each fresh urllib connection — this bridge opens one per long-poll
+# AND one per outbound send, with no keep-alive — hangs on the dead v6 address
+# for the full TCP connect timeout (~26s observed) before falling back to v4,
+# which connects in <1s. That timeout is added to EVERY inbound message and
+# EVERY reply, so the owner sees ~26s each way and messages look dropped. We
+# filter getaddrinfo to A (v4) records for the gateway host so the dead v6 path
+# is never tried; we keep the original result when there is no v4 address, so a
+# genuinely v6-only destination still resolves. Opt out with
+# REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
+if os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1":
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo_prefer_v4(host, *args, **kwargs):
+        infos = _orig_getaddrinfo(host, *args, **kwargs)
+        if host and "ag2.space" in str(host):
+            v4 = [i for i in infos if i[0] == socket.AF_INET]
+            return v4 or infos
+        return infos
+
+    socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
@@ -61,6 +89,7 @@ from .task_archive import find_task_file
 from . import local_task_protocol
 from .result_markers import parse_markers
 from .send_allowlist import is_path_sendable
+from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
 TASKS_DIR = _task_dir()
 RESULTS_DIR = _result_dir()
@@ -77,6 +106,12 @@ INFLIGHT_FILE = _STATE / "remote-task-inflight.json"
 # (which resolves the room server-side). Separate file — the inflight ledger's
 # list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / "remote-task-rooms.json"
+# Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
+# which pings the broker). A local supervisor (e.g. the desktop app's
+# sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
+# guessing from tmux-window presence. Written on every poll outcome: connected
+# after a healthy round-trip, reconnecting in the backoff branches.
+GATEWAY_STATUS_FILE = _STATE / "gateway-status.json"
 
 # Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
 # rename still export the legacy names in their .env. Honor them as DEPRECATED
@@ -108,7 +143,12 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 HEARTBEAT_INTERVAL = 60
-_ack_disabled = False
+# When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
+# instead of hammering it — but only for this cooldown, then retry. A permanent
+# latch would mean a broker that GAINS the endpoint (e.g. a deploy) is never
+# picked up until the worker restarts; time-gating makes it self-healing.
+ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
+_ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
@@ -159,6 +199,86 @@ if LOCAL_TIER not in ("owner", "team", "other"):
     # "owner" (the `or "owner"` above — the explicit personal-agent model).
     LOCAL_TIER = "team"
 
+
+# ── per-sender tier map (owner-controlled, LOCAL) ────────────────────────────
+# LOCAL_TIER above is the gateway-wide default. A SHARED room can carry messages
+# from senders who are NOT the owner (e.g. a teammate invited into a project
+# room). To tier those correctly WITHOUT trusting the task's self-claimed tier,
+# the OWNER declares a per-sender map in a LOCAL, owner-owned file:
+#   $CLAUDE_CONFIG_DIR/channels/ag2space/access.json → {"tierMap": {"@user:hs": "team"}}
+# We key the lookup on the BROKER-attested `user_id` (Matrix sender the broker
+# writes into the task, not a task-body self-claim), so this stays a LOCAL trust
+# decision — same principle as LOCAL_TIER. Only listed senders are re-tiered;
+# everyone else keeps LOCAL_TIER, so an unknown sender can never ESCALATE (the
+# map only DOWN-tiers named senders; owner stays owner by being absent from it).
+# Hot: re-read on mtime change so the owner can add teammates without a restart.
+def _ag2space_access_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "channels", "ag2space", "access.json")
+
+
+_TIER_MAP_CACHE = {"mtime": None, "map": {}}
+
+
+def _load_tier_map():
+    """Return the owner's {sender_mxid: tier} map, mtime-cached.
+
+    Preserves the last-known-good map on a READ error (stat/open/parse failure)
+    rather than clearing to {}. Clearing would silently up-tier every previously
+    down-tiered sender back to LOCAL_TIER the moment access.json is mid-write,
+    corrupt, or transiently unreadable — a fail-OPEN that is especially bad on a
+    LOCAL_TIER=owner node (a teammate momentarily regains owner). Only a
+    SUCCESSFUL read of a changed file replaces the cache; a fixed file (new mtime)
+    is picked up on the next call. A genuine deletion keeps the last map until the
+    owner writes an empty tierMap or the process restarts (the safe, non-surprising
+    tradeoff — the map floor never drops on a transient fault)."""
+    path = _ag2space_access_path()
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        # Absent/unstattable → keep last-known-good (initially {} before any load).
+        return _TIER_MAP_CACHE["map"]
+    if mt == _TIER_MAP_CACHE["mtime"]:
+        return _TIER_MAP_CACHE["map"]
+    try:
+        with open(path) as f:
+            raw = (json.load(f) or {}).get("tierMap") or {}
+        tm = {}
+        for who, tier in raw.items():
+            t = str(tier).strip().lower()
+            if isinstance(who, str) and t in ("owner", "team", "other"):
+                tm[who.strip()] = t
+    except Exception:
+        # Malformed / mid-write → keep last-known-good; don't advance mtime so a
+        # later successful read of the fixed file is still picked up.
+        return _TIER_MAP_CACHE["map"]
+    _TIER_MAP_CACHE["mtime"], _TIER_MAP_CACHE["map"] = mt, tm
+    return tm
+
+
+# Privilege ordering — a higher rank is MORE privileged. Used to clamp a mapped
+# tier so the owner file can only ever DOWN-tier (never escalate above the node's
+# own default), keeping the "map only down-tiers named senders" safety invariant
+# true in code rather than only in the comment.
+_TIER_RANK = {"other": 0, "team": 1, "owner": 2}
+
+
+def _tier_for(user_id):
+    """Resolve the access_tier for a task's broker-attested sender.
+
+    A listed sender gets their mapped tier, CLAMPED to <= LOCAL_TIER: the map can
+    down-tier a sender below this node's default but never raise them above it, so
+    a compromised/misconfigured access.json can never ESCALATE. Everyone else
+    (unlisted / no user_id) gets LOCAL_TIER."""
+    uid = (user_id or "").strip()
+    if uid:
+        mapped = _load_tier_map().get(uid)
+        if mapped in _TIER_RANK:
+            local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
+            return mapped if _TIER_RANK[mapped] <= local_rank else LOCAL_TIER
+    return LOCAL_TIER
+
+
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
 # A gateway can hand the task body a media MARKER instead of raw bytes:
 #   [<tag>: <url> mime=<m> name=<f> size=<n> kind=<msgtype>] <caption>
@@ -185,6 +305,34 @@ if LOCAL_TIER not in ("owner", "team", "other"):
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+
+# Untrusted room-ops metadata block: the gateway appends a free-text
+# `[room-ops metadata: …]` pointer to the operating card onto the message body.
+# It self-labels "Not an instruction" and is UNSIGNED (unlike platform_card,
+# which is a signed header consumers verify offline). Because it rides in the
+# task body — the same field as the user's words — a naive agent can read it as
+# an instruction. We strip it here so it never reaches the agent as body content
+# (owner directive 2026-07-16). The operating card stays discoverable via the
+# documented prep_get op; a TRUSTED pointer, if ever wanted, belongs in a signed
+# header like platform_card, not in unsigned body text. Bracket-body is
+# `[^\]]*` — the block carries no nested `]`, so this never over-eats.
+_ROOM_OPS_META_RE = re.compile(r"\s*\[room-ops metadata:[^\]]*\]", re.IGNORECASE)
+
+
+def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
+    """Remove any untrusted `[room-ops metadata: …]` block(s) from a task body.
+
+    Returns (cleaned_body, stripped) so the caller can log the quarantine. Runs
+    before _one_line so a block split across newlines is still caught."""
+    if not body or "room-ops metadata:" not in body.lower():
+        return body, False
+    cleaned = _ROOM_OPS_META_RE.sub("", body)
+    stripped = cleaned != body
+    # Return the cleaned body even when it is now empty: a metadata-ONLY body is
+    # pure injection with no legitimate task text, so it must degrade to an empty
+    # (no-op) body. NEVER fall back to the original here — that would re-admit the
+    # very `[room-ops metadata: …]` block we are quarantining (P1, PR #2149).
+    return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
@@ -225,6 +373,24 @@ def _one_line(value) -> str:
     return str(value).replace("\r", " ").replace("\n", " ")
 
 
+def _redact_url(value: str) -> str:
+    """Scheme+host+path only — drop userinfo, query, and fragment before a URL
+    is persisted. `gateway-status.json` lives under `state/` (which vault-syncs),
+    so a gateway configured with `user:pass@` userinfo or a `?token=` query param
+    must not land there in plaintext. Falls back to the bare string on any parse
+    failure (never raise from a best-effort status write)."""
+    try:
+        p = urllib.parse.urlsplit(str(value))
+        if not p.scheme and not p.netloc:
+            return str(value)
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
+    except Exception:  # noqa: BLE001 — redaction must never break status I/O
+        return str(value)
+
+
 def _log(msg: str) -> None:
     print(f"[remote-gateway-bridge] {msg}", flush=True)
 
@@ -246,19 +412,44 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
         return json.loads(raw) if raw else {}
 
 
+def _http_error_body(e) -> str:
+    """Best-effort read of an HTTPError's response body, for content-sniffing a
+    per-task answer vs an endpoint-unsupported one. Never raises."""
+    try:
+        return (e.read() or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _post_task_ack(tid: str) -> bool:
     """Tell the gateway a task made it safely into the local queue."""
-    global _ack_disabled
-    if _ack_disabled or not _valid_tid(tid):
+    global _ack_disabled_until
+    if not _valid_tid(tid):
         return False
+    if _ack_disabled_until and time.time() < _ack_disabled_until:
+        return False  # gateway recently 404'd /ack — retry after the cooldown
     try:
         safe_tid = urllib.parse.quote(tid, safe="")
         _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": tid}, timeout=10)
+        _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            _ack_disabled = True
-            _log("gateway does not support task ack — continuing without")
+            # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
+            # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
+            # later, so a broker that deploys /ack afterward is picked up without a
+            # restart. But the DEPLOYED broker returns a PER-TASK
+            # 404 {"error":"not leased to you"} when THIS task's lease expired /
+            # was re-served / isn't ours — routine under churn. That must NOT
+            # disable acking for every OTHER task (one stale lease would blind the
+            # whole host's `received` state), so treat it as a single-task negative
+            # ack: skip this one, leave global acking enabled. (Per qingyun-001,
+            # broker-half author — the deployed 404 is per-task, not "no route".)
+            if e.code == 404 and "not leased" in _http_error_body(e).lower():
+                return False   # per-task lease gone — keep acking the rest
+            _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
+            _log(f"gateway does not support task ack — retrying in "
+                 f"{ACK_UNSUPPORTED_COOLDOWN}s")
             return False
         if e.code in (401, 403):
             raise
@@ -349,6 +540,47 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except (urllib.error.URLError, TimeoutError) as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
+
+
+def _emit_gateway_status(connected: bool, *, error: str | None = None,
+                         backoff_s: int = 0) -> None:
+    """Write `state/gateway-status.json` — the connection's own liveness, for a
+    local supervisor to render connected-vs-reconnecting.
+
+    Best-effort: a status-write failure MUST NOT disturb the poll loop, so all
+    errors are swallowed. `last_ok_ts` is preserved across reconnecting writes
+    (read back from the prior file) so a consumer can show "last connected N s
+    ago" while the link is down.
+    """
+    try:
+        last_ok = None
+        try:
+            with open(GATEWAY_STATUS_FILE) as f:
+                last_ok = (json.load(f) or {}).get("last_ok_ts")
+        except (FileNotFoundError, ValueError, OSError):
+            last_ok = None
+        now = int(time.time())
+        if connected:
+            last_ok = now
+        payload = {
+            "connected": bool(connected),
+            "ts": now,
+            "last_ok_ts": last_ok,
+            "backoff_s": int(backoff_s),
+            "error": _one_line(error) if error else None,
+            "gateway": _redact_url(URL),
+            "schema_version": 1,
+        }
+        GATEWAY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
+        # but a shared temp name collides if a second sparrow instance ever runs;
+        # a per-PID temp is collision-proof for the cost of one getpid().
+        tmp = GATEWAY_STATUS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, GATEWAY_STATUS_FILE)
+    except Exception:  # noqa: BLE001 — never let status I/O break the poll loop
+        pass
 
 
 def _marker_attr(attrs: str, key: str) -> str:
@@ -502,14 +734,67 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
 
 
-def _write_owner_activity(task: dict) -> None:
+# Fleet-agent directory cache — peer agents (in the broker's /v1/agents) are
+# NEVER the human owner, so their messages must not set owner-presence. Only the
+# PRESENCE gate consults this; task authority (_tier_for) is deliberately left
+# untouched, so peer-to-peer delegation keeps its access_tier (a peer agent still
+# resolves to owner tier on a tierMap-less node and can still act — the two
+# consumers of _tier_for are decoupled here on purpose).
+_FLEET_AGENTS_TTL_S = 300.0
+_fleet_agents_cache: dict = {"ts": 0.0, "ids": set()}
+
+
+def _fleet_agent_ids() -> set[str]:
+    """Broker-attested set of fleet agent mxids (from GET /v1/agents), cached
+    ~5 min. FAIL-OPEN: on any fetch/parse error keep (and return) the last good
+    set — never an empty set that would mistake a real peer for the owner. Before
+    the first successful fetch the set is empty, so behavior is exactly today's
+    (record) until the directory is known — presence must never SWALLOW genuine
+    owner activity, only decline to record a KNOWN peer."""
+    now = time.time()
+    if now - _fleet_agents_cache["ts"] < _FLEET_AGENTS_TTL_S and _fleet_agents_cache["ids"]:
+        return _fleet_agents_cache["ids"]
+    try:
+        resp = _req("GET", "/v1/agents")
+        ids = {a.get("id") for a in (resp.get("agents") or []) if isinstance(a, dict) and a.get("id")}
+        if ids:
+            _fleet_agents_cache["ts"] = now
+            _fleet_agents_cache["ids"] = ids
+    except Exception:
+        pass  # keep the prior good set (fail-open)
+    return _fleet_agents_cache["ids"]
+
+
+def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
     """Record that the owner was active on this transport right now — but only
-    when THIS node grants gateway traffic owner tier (LOCAL_TIER, never the
-    gateway's own claim; the gateway is outside the trust boundary). Atomic write
-    via tmp+rename; same schema (`ts`, `channel`, `summary`) as
-    discord-bridge.write_owner_activity so the proactive-loop reader is
+    when THIS node resolves the SENDER to owner tier. Gated on the sender's
+    resolved tier, NOT the gateway-wide LOCAL_TIER: in a shared room a
+    down-tiered teammate (tierMap[...] = "team"/"other") must not overwrite
+    `state/last-owner-activity.json`, or their message would poison owner-presence
+    routing (the proactive-loop's "owner active N min ago" signal + the core-
+    supervisor escalation target). `sender_tier` is passed in by `_write_task` so
+    the task tier and this gate share a SINGLE resolution (no divergence, no
+    double tierMap read); a direct caller can omit it and we resolve here. For an
+    unlisted sender `_tier_for` returns LOCAL_TIER, so the single-owner case is
+    unchanged. Never trusts the gateway's own claim (it is outside the trust
+    boundary) — only the broker-attested user_id keyed against the owner's LOCAL
+    tierMap. Atomic write via per-PID tmp + os.replace (this file has four
+    concurrent writers; #2222); same schema (`ts`, `channel`, `summary`)
+    as discord-bridge.write_owner_activity so the proactive-loop reader is
     transport-agnostic. Best-effort — never blocks task intake."""
-    if LOCAL_TIER != "owner":
+    if sender_tier is None:
+        sender_tier = _tier_for(task.get("user_id"))
+    if sender_tier != "owner":
+        return
+    # A peer FLEET agent resolves to owner tier on a tierMap-less node (LOCAL_TIER
+    # fallthrough), but it is never the HUMAN owner — recording its post as
+    # owner-presence poisons the proactive-loop's engagement signal and the
+    # core-supervisor escalation target. Gate PRESENCE ONLY here; the task's
+    # access_tier (the other _tier_for consumer) stays owner so peer delegation
+    # is unaffected. Broker-attested user_id only — the /v1/agents directory is
+    # the authoritative peer set (the human owner is not in it).
+    _uid = (task.get("user_id") or "").strip()
+    if _uid and _uid in _fleet_agent_ids():
         return
     try:
         OWNER_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -522,9 +807,23 @@ def _write_owner_activity(task: dict) -> None:
             "channel": task.get("source") or PROVIDER,
             "summary": body[:80],
         }
-        tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
+        # Propagate the routable room id so the core-supervisor relay can escalate
+        # BACK into the AG2Space room the owner was last active in (resolve_active_
+        # target requires both `channel` and `channel_id`; without this it degrades
+        # to macOS-only for the gateway surface). Only when present — keeps the
+        # discord-bridge schema compatible for non-message activity.
+        _cid = str(task.get("channel_id") or "").strip()
+        if _cid:
+            payload["channel_id"] = _cid
+        # Per-PID staging: last-owner-activity.json is written by FOUR processes
+        # (this sparrow bridge + slack/discord/telegram). A shared ".json.tmp"
+        # name lets two concurrent writers truncate and interleave the same temp
+        # file, so the rename can publish torn JSON to the proactive loop's
+        # presence check. A per-PID temp is never shared; os.replace is an atomic
+        # overwrite — last writer wins, cleanly. (sonichi/sutando#2222)
+        tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"owner-activity write failed: {e}")
 
@@ -582,9 +881,16 @@ def _write_task(task: dict) -> str | None:
                 it = "message"
             lines.append(f"interaction_type: {it}")
         elif f == "task" and task.get("task") not in (None, ""):
+            # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
+            # reaches the agent as body content (owner directive 2026-07-16) —
+            # see _strip_room_ops_meta. Runs first so the stripped body is what
+            # media-resolution and the header write both see.
+            _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
+            if _stripped_meta:
+                _log(f"stripped untrusted room-ops metadata from {tid} body")
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
-            _fetched = _maybe_fetch_media(str(task["task"]), _media_refs)
+            _fetched = _maybe_fetch_media(_raw_task, _media_refs)
             lines.append(f"task: {_one_line(_fetched)}")
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
@@ -615,15 +921,22 @@ def _write_task(task: dict) -> str | None:
     # consumer in skills/agent-room-ops/verify_platform_card.py.)
     # access_tier is a LOCAL decision and written LAST so it wins even under a
     # last-occurrence parser; every other field is newline-stripped so none can
-    # forge an earlier one either.
-    lines.append(f"access_tier: {LOCAL_TIER}")
+    # forge an earlier one either. Resolved per broker-attested sender via the
+    # owner's tierMap (LOCAL file), falling back to LOCAL_TIER for unlisted
+    # senders — so a named teammate can be down-tiered without trusting the task.
+    # Resolve ONCE and reuse for both the task tier AND the owner-activity gate
+    # below, so the two decisions can never diverge (a single source of truth,
+    # no double read of the tierMap).
+    sender_tier = _tier_for(task.get("user_id"))
+    lines.append(f"access_tier: {sender_tier}")
     tmp = dest.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
     _log(f"queued {tid}")
     _record_task_room(tid, str(task.get("channel_id") or ""))
-    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate.
-    _write_owner_activity(task)
+    # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
+    # only for owner-tier senders (same resolved tier as the task above).
+    _write_owner_activity(task, sender_tier)
     return tid
 
 
@@ -643,9 +956,11 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
     """Atomically persist the task→room map. Best-effort (never blocks the loop)."""
     try:
         TASK_ROOMS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = TASK_ROOMS_FILE.with_suffix(".json.tmp")
+        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
+        # second sparrow instance ever runs. os.replace is atomic overwrite.
+        tmp = TASK_ROOMS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(rooms, sort_keys=True))
-        tmp.rename(TASK_ROOMS_FILE)
+        os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"task-rooms persist failed ({e}) — continuing")
 
@@ -734,9 +1049,11 @@ def _save_inflight(inflight: set[str]) -> None:
     """Atomically persist the in-flight set. Best-effort (never blocks the loop)."""
     try:
         INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = INFLIGHT_FILE.with_suffix(".json.tmp")
+        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
+        # second sparrow instance ever runs. os.replace is atomic overwrite.
+        tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(sorted(inflight)))
-        tmp.rename(INFLIGHT_FILE)
+        os.replace(tmp, INFLIGHT_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"inflight persist failed ({e}) — continuing")
 
@@ -846,16 +1163,93 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     return gone - confirmed
 
 
+# ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────
+# Exactly one gateway-bridge may poll a given workspace's relay bearer. A second
+# one — an orphaned bridge from a prior install (ppid 1, outlived its parent), or
+# a simultaneous respawn — would double-deliver every task. Acquire a per-
+# (workspace, role) lock before polling; if a LIVE bridge already holds it, exit
+# without polling. The lock is held + heartbeated so a crashed/stale holder is
+# reaped (freshness like state/cores/<host>.alive). FAIL-OPEN by design: any
+# lock-layer error → poll anyway (a lock bug must never silence task delivery;
+# the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
+# SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
+_LOCK_ROLE = "gateway-bridge"
+_LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
+
+
+def _lock_on() -> bool:
+    return os.environ.get("SUTANDO_BRIDGE_LOCK", "1") != "0"
+
+
+def _release_singleton() -> None:
+    if not _lock_on():
+        return
+    try:
+        _ws_release(_LOCK_ROLE, _LOCK_WS)
+    except Exception:
+        pass
+
+
+def _heartbeat_singleton() -> bool:
+    """Refresh the poller lock. Returns False ONLY when we have definitively LOST
+    ownership — a replacement reaped our lock after we were deemed stale (the
+    stale-takeover race). The caller MUST stop polling on False, or the reaped
+    process and the new owner both pull the same relay bearer (the dual-poll this
+    slice closes). Fail-open on everything else (lock disabled / heartbeat error
+    → True) so a lock bug never wedges task delivery."""
+    if not _lock_on():
+        return True
+    try:
+        return bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
+    except Exception:
+        return True
+
+
+def _acquire_singleton() -> bool:
+    """True → we hold the poller lock (or it is disabled / errored → fail-open).
+    False → a live bridge already owns this workspace and the caller must NOT poll."""
+    if not _lock_on():
+        return True
+    try:
+        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS)
+    except Exception as e:  # fail-open — never wedge task delivery on a lock bug
+        _log(f"singleton: acquire error ({e}) — proceeding without lock")
+        return True
+    if r.status == "deferred":
+        h = r.holder or {}
+        _log(f"singleton: another live gateway-bridge owns this workspace "
+             f"(host={h.get('host')} pid={h.get('pid')}) — exiting to avoid dual-poll")
+        return False
+    atexit.register(_release_singleton)
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, lambda *_a: sys.exit(0))
+        except Exception:
+            pass  # non-main-thread or platform without the signal — atexit still covers exit
+    _log(f"singleton: acquired workspace poller lock ({r.status})")
+    return True
+
+
 def main() -> None:
     if not URL or not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (and REMOTE_TASK_URL if your token is a bare secret).")
+    if not _acquire_singleton():
+        return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
     inflight: set[str] = _load_inflight()
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     backoff = 1
+    _emit_gateway_status(False, error="starting — not yet connected")
     while True:
         try:
+            if not _heartbeat_singleton():
+                # Lost the poller lock (reaped after being deemed stale). Stop
+                # polling immediately so we don't dual-poll the relay bearer with
+                # the process that took over. atexit release is a no-op (not ours).
+                _log("singleton: lost workspace poller lock (reaped after stale takeover) "
+                     "— exiting to avoid dual-poll")
+                return
             _post_heartbeat(inflight)
             resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
             added = False
@@ -877,16 +1271,21 @@ def main() -> None:
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
+            _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
+                _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except (urllib.error.URLError, TimeoutError) as e:
             _log(f"poll network error: {e} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {e} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
 
 

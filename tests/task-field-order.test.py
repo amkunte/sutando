@@ -67,9 +67,19 @@ def test_telegram_bridge_task_field_last():
 
 def test_discord_bridge_task_field_last():
     src = _src("src/discord-bridge.py")
-    block_start = src.find("task_file.write_text(")
-    assert block_start > 0, "discord-bridge: could not find write_text call"
-    block = src[block_start: block_start + 800]
+    # The 2026-07-23 upstream merge refactored this writer: the task-content
+    # f-string moved out of an inline `task_file.write_text(...)` and into
+    # `_build_task_content()`, which `_write_task_file()` invokes inside its
+    # try (so a build failure is logged rather than raised). Anchor on the
+    # builder; fall back to the legacy inline form so this guard still works
+    # against a pre-refactor writer.
+    block_start = src.find("def _build_task_content")
+    if block_start < 0:
+        block_start = src.find("task_file.write_text(")
+    assert block_start > 0, "discord-bridge: could not find task-content builder"
+    # Wider window than the other writers: the builder carries a docstring and
+    # the collaborator/rulebook preamble before the f-string proper.
+    block = src[block_start: block_start + 1800]
     _assert_task_last(
         block,
         ["source: discord", "access_tier:", "priority:"],
@@ -83,9 +93,16 @@ def test_discord_bridge_task_field_last():
 
 def test_slack_bridge_task_field_last():
     src = _src("src/slack-bridge.py")
-    block_start = src.find("task_file.write_text(")
-    assert block_start > 0, "slack-bridge: could not find write_text call"
-    block = src[block_start: block_start + 600]
+    # The 2026-07-23 upstream merge routed the write through
+    # `_write_routed_task(task_file, task_content, ...)`, so the first
+    # `task_file.write_text(` in this file is now that generic helper writing an
+    # already-built string — not the f-string we need to inspect. Anchor on the
+    # header literal itself, which is stable across both shapes.
+    block_start = src.find('f"source: slack')
+    if block_start < 0:
+        block_start = src.find("task_file.write_text(")
+    assert block_start > 0, "slack-bridge: could not find task-content builder"
+    block = src[block_start: block_start + 1200]
     _assert_task_last(
         block,
         ["source: slack", "access_tier:", "priority:"],
