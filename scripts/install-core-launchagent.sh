@@ -41,7 +41,10 @@ set -euo pipefail
 LABEL="com.sutando.core"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
-WORKSPACE="${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}"
+# Resolve the workspace via the canonical helper (M0/#1440) — NOT the legacy
+# ${SUTANDO_WORKSPACE:-~/.sutando/workspace} default, which points at the
+# pre-migration workspace and sends launchd-core logs to the wrong tree.
+WORKSPACE="$(bash "${REPO}/scripts/sutando-config.sh" workspace 2>/dev/null || echo "${HOME}/sutando/workspace")"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
 DOMAIN="gui/$(id -u)"
 
@@ -91,14 +94,12 @@ cat > "$PLIST" <<PLIST_EOF
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${REPO}/scripts/start-cli.sh</string>
+    <string>${REPO}/src/agent/claude/cli/start-cli.sh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>${LAUNCH_PATH}</string>
-    <key>SUTANDO_WORKSPACE</key>
-    <string>${WORKSPACE}</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>${REPO}</string>
