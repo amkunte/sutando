@@ -207,29 +207,6 @@ def check_port(port: int, name: str, probe: bool = False) -> dict:
         return {"name": name, "status": "error", "detail": str(e)}
 
 
-def check_credential_proxy() -> dict:
-    """Check the quota-tracking credential proxy (port 7846).
-
-    The proxy man-in-the-middles the core's Anthropic API traffic to read the
-    rate-limit headers that feed quota-state.json. It only matters when the core
-    is routed through it (ANTHROPIC_BASE_URL=http://localhost:7846) — but when it
-    IS routed, a dead proxy means the core can't reach the API at all, so this
-    must auto-restart fast. `warn` (not `down`): a missing proxy degrades quota
-    visibility but the core still works on a direct connection; --fix relaunches
-    it. Skipped entirely when the proxy was never set up (no credential-proxy.ts).
-    """
-    proxy_ts = Path.home() / ".claude" / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
-    if not proxy_ts.exists():
-        return None  # quota-tracker not installed on this node → not applicable
-    c = check_port(7846, "credential-proxy")
-    if c["status"] == "ok":
-        c["detail"] = "port 7846 (quota tracking)"
-    else:
-        c["status"] = "warn"
-        c["detail"] = "down — quota tracking off (CRITICAL if core routed via ANTHROPIC_BASE_URL)"
-    return c
-
-
 def check_launchd(label: str) -> dict:
     """Check if a launchd job is loaded and running."""
     try:
@@ -2276,11 +2253,20 @@ def run_all_checks() -> list[dict]:
     # it's a forwarding proxy with no liveness endpoint, so an HTTP probe would
     # be forwarded upstream and misread as "wedged". Optional (not every node
     # routes through it) → down is a warning, not a failure.
+    # Skip entirely when quota-tracker was never installed on this node —
+    # otherwise every such host carries a permanent "not running (optional)"
+    # warn for a proxy it is not meant to run (grafted from the local
+    # check_credential_proxy(), which this call replaced in the 2026-07-23
+    # upstream merge; that function emitted a SECOND identical row).
+    _proxy_ts = Path.home() / ".claude" / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
     proxy_check = check_port(7846, "credential-proxy", probe=False)
     if proxy_check["status"] == "down":
         proxy_check["status"] = "warn"
         proxy_check["detail"] = "not running (optional)"
-    checks.append(proxy_check)
+    elif proxy_check["status"] == "ok":
+        proxy_check["detail"] = "port 7846 (quota tracking)"
+    if _proxy_ts.exists() or proxy_check["status"] == "ok":
+        checks.append(proxy_check)
 
     # Quota telemetry — only meaningful when the proxy is actually up.
     checks.append(check_quota_telemetry(proxy_check["status"]))
@@ -2718,10 +2704,6 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_skill_symlinks())
     checks.append(check_disk_space())
-
-    proxy_check = check_credential_proxy()
-    if proxy_check is not None:
-        checks.append(proxy_check)
 
     return checks
 
