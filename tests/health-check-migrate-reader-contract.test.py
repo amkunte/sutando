@@ -116,7 +116,14 @@ class TestCheckMigrateReaderContract(unittest.TestCase):
     # Case D2: unexpected exception from the subprocess layer -> error
     # ------------------------------------------------------------------
     def test_unexpected_exception_reports_error(self):
-        fake_repo = Path(self.tmp.name) / "repo_exc"
+        # self.tmp is a Path, so `.name` is just the BASENAME — Path(basename)
+        # is relative and resolved against the cwd, so this case built its
+        # fixture in the repo root while tearDown removed the real temp dir,
+        # leaking an hc-mrc-* directory into the checkout on every run. (The
+        # `.name` idiom belongs to tempfile.TemporaryDirectory, where it IS the
+        # full path.) Every sibling case uses `self.tmp / ...`; this was the
+        # lone outlier.
+        fake_repo = self.tmp / "repo_exc"
         tests_dir = fake_repo / "tests"
         tests_dir.mkdir(parents=True)
         (tests_dir / "migrate-reader-contract.test.py").write_text("print('never runs')")
