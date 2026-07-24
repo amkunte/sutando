@@ -116,7 +116,14 @@ def _run_all_checks_with_slack_log(log_contents: str) -> "dict | None":
         (tmpws / "logs" / "slack-bridge.log").write_text(log_contents)
         channel_dir = Path(tmphome) / "channels" / "slack"
         channel_dir.mkdir(parents=True)
-        (channel_dir / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
+        # >= 30 chars: this fork treats a shorter *_TOKEN as an obvious
+        # placeholder and reports the bridge "not configured", so a short
+        # fixture makes these cases silently exercise the placeholder path
+        # instead of the log-content path they are named for (same fix as
+        # tests/health-check-bridge-skip.test.py). See the 30-char floor in
+        # health-check.py — 2026-05-13 / PR #11.
+        (channel_dir / ".env").write_text(
+            "SLACK_BOT_TOKEN=xoxb-0000000000-0000000000-abcdefghijklmnopqrstuvwx\n")
 
         _orig_chp = hc.claude_home_path
 
