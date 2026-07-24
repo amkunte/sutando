@@ -222,7 +222,12 @@ def compose_state(pane, base_health, gateway_alive):
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
     if base_health == "needs_login":
         return "logged-out", _BASE_TO_STATE["needs_login"][1], None, None
-    if not gateway_alive:
+    # Only escalate to gateway-down when the relay is actually configured to run.
+    # On a Sutando-only host with no relay token, startup.sh deliberately never
+    # launches the gateway, so its absence is EXPECTED — not degraded. Without the
+    # gateway_configured() gate the supervisor pinned every such host at
+    # gateway-down, surfacing a standing (false) health-check warning.
+    if not gateway_alive and gateway_configured():
         return "gateway-down", "core up but relay gateway not running", None, None
     state, detail = _BASE_TO_STATE.get(base_health, _BASE_TO_STATE["unknown"])
     if state == "hung":
@@ -306,6 +311,30 @@ def gateway_alive(app_data, state_dir=None):
     if app_data:
         return _pgrep(os.path.join(app_data, "engine", "runtime", "python"))
     return _pgrep("remote-gateway-bridge")
+
+
+def gateway_configured():
+    """Whether the relay gateway is even configured to run on this host.
+
+    Mirrors startup.sh's own gate (it launches remote-gateway-bridge ONLY when a
+    relay token is present): an env token, or a REMOTE_TASK_TOKEN / AG2_REMOTE_TOKEN
+    line in channels/ag2space/.env under the resolved claude-home. On a host with
+    no relay configured the gateway is *meant* to be absent, so "not running" is
+    expected rather than degraded — the caller uses this to suppress a spurious
+    gateway-down escalation (which otherwise stands as a permanent health warning).
+    """
+    if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
+        return True
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude")
+    env_path = os.path.join(home, "channels", "ag2space", ".env")
+    try:
+        with open(env_path) as fh:
+            return any(
+                ln.lstrip().startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
+                for ln in fh)
+    except OSError:
+        return False
 
 
 def capture(socket, session):
