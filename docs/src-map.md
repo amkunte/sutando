@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-165 modules indexed.
+170 modules indexed.
 
 ## `src/`
 
@@ -39,6 +39,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
+- **`discord_post.py`** — Post a message to a Discord channel via the bot token.
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -84,7 +85,9 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`result_router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
+- **`scan-catchup.py`** — Self-healing catch-up for skill scans (durable, 2026-06-20).
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
+- **`scheduled-catchup.py`** — Self-healing catch-up for daily scheduled deliveries (Option A, 2026-06-01).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
@@ -95,6 +98,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
+- **`sms-bridge.py`** — SMS reply bridge — polls tasks/ for inbound SMS tasks (source=twilio_sms) and polls results/ for matching reply files, then sends each result back to the original sender via the Twilio REST API.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
@@ -127,6 +131,7 @@ and re-run `python3 scripts/gen-src-map.py`.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
+- **`wire_briefing.py`** — SutandoWIRE → daily-briefing hook.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_lock.py`** — Atomic per-workspace role lock for sutando singleton enforcement (MC1).
