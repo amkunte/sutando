@@ -95,19 +95,24 @@ class PrivateMachineDirTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertIsNone(_private_machine_dir())
 
+    # These two are about WHICH env var drives the memory-dir root; the host
+    # suffix is incidental. Pin the label so they don't depend on how this
+    # machine happens to be named — previously they derived the expected suffix
+    # from the short hostname, which disagrees with _host_label()'s tier-2
+    # scutil LocalHostName on any host whose Bonjour name differs in case.
     def test_new_var_drives_machine_dir(self):
         os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
-        host = socket.gethostname().split(".")[0]
+        os.environ["SUTANDO_HOST_LABEL"] = "Pinned-Host"
         with redirect_stderr(io.StringIO()):
             p = _private_machine_dir()
-        self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
+        self.assertEqual(p, Path("/tmp/memdir/machine-Pinned-Host"))
 
     def test_legacy_var_drives_machine_dir(self):
         os.environ["SUTANDO_PRIVATE_DIR"] = "/tmp/legacy-dir"
-        host = socket.gethostname().split(".")[0]
+        os.environ["SUTANDO_HOST_LABEL"] = "Pinned-Host"
         with redirect_stderr(io.StringIO()):
             p = _private_machine_dir()
-        self.assertEqual(p, Path(f"/tmp/legacy-dir/machine-{host}"))
+        self.assertEqual(p, Path("/tmp/legacy-dir/machine-Pinned-Host"))
 
 
 class HostLabelTests(unittest.TestCase):
@@ -126,20 +131,65 @@ class HostLabelTests(unittest.TestCase):
             p = _private_machine_dir()
         self.assertEqual(p, Path("/tmp/memdir/machine-my-stable-mac"))
 
+    # _host_label() precedence is env -> scutil LocalHostName -> short hostname.
+    # Clearing the env only drops tier 1, so these cases previously landed on
+    # tier 2 and compared LocalHostName against the short hostname — a
+    # guaranteed failure on any host where those differ, which is exactly the
+    # DHCP-drift scenario the label machinery exists for. Force tier 3 the way
+    # a non-macOS host reaches it: make the scutil probe unavailable.
+    @staticmethod
+    def _no_scutil():
+        import util_paths
+        real = util_paths.subprocess.run
+
+        def _patched(cmd, *a, **kw):
+            if cmd and "scutil" in cmd[0]:
+                raise FileNotFoundError("scutil unavailable (simulated non-macOS)")
+            return real(cmd, *a, **kw)
+        util_paths.subprocess.run = _patched
+        return util_paths, real
+
     def test_hostname_used_when_label_unset(self):
         os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
         host = socket.gethostname().split(".")[0]
-        with redirect_stderr(io.StringIO()):
-            p = _private_machine_dir()
+        mod, real = self._no_scutil()
+        try:
+            with redirect_stderr(io.StringIO()):
+                p = _private_machine_dir()
+        finally:
+            mod.subprocess.run = real
         self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
 
     def test_empty_label_falls_back_to_hostname(self):
         os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
         os.environ["SUTANDO_HOST_LABEL"] = ""
         host = socket.gethostname().split(".")[0]
+        mod, real = self._no_scutil()
+        try:
+            with redirect_stderr(io.StringIO()):
+                p = _private_machine_dir()
+        finally:
+            mod.subprocess.run = real
+        self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
+
+    def test_localhostname_preferred_over_hostname(self):
+        # Tier 2: with no label pinned and scutil available, the stable Bonjour
+        # name must win. Nothing asserted this before, and it is the guarantee
+        # that stops per-host dirs splitting under DHCP drift.
+        import util_paths
+        os.environ["SUTANDO_MEMORY_DIR"] = "/tmp/memdir"
+        try:
+            probe = util_paths.subprocess.run(
+                ["scutil", "--get", "LocalHostName"],
+                capture_output=True, text=True, timeout=5)
+        except OSError:
+            self.skipTest("scutil unavailable (non-macOS)")
+        lhn = (probe.stdout or "").strip()
+        if probe.returncode != 0 or not lhn:
+            self.skipTest("scutil returned no LocalHostName")
         with redirect_stderr(io.StringIO()):
             p = _private_machine_dir()
-        self.assertEqual(p, Path(f"/tmp/memdir/machine-{host}"))
+        self.assertEqual(p, Path(f"/tmp/memdir/machine-{lhn}"))
 
 
 class SharedPersonalPathTests(unittest.TestCase):
