@@ -320,7 +320,13 @@ Tasks arrive from multiple channels via the same file bridge:
 - **Voice agent** writes tasks to `tasks/task-{ts}.txt`
 - **Telegram bridge** (`src/telegram-bridge.py`) writes tasks from Telegram messages (text + photos + files + voice notes)
 - **Discord bridge** (`src/discord-bridge.py`) writes tasks from Discord DMs and channel @mentions (+ file attachments)
-- This session reads and executes them, writes results to `results/task-{ts}.txt` — **write to the absolute workspace path `"${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/results/task-{ts}.txt"`, not a bare `results/…`.** The bridges/watcher/dashboard poll `resolve_workspace()/results` (= `$SUTANDO_WORKSPACE/results`); the session cwd is the repo, so a bare relative write lands in `<repo>/results/` where no consumer looks — the same cwd-trap as `state/core-status.json` (see **Work Status**). A misfiled reply silently never delivers and never archives its task. (Same applies to `tasks/` and `results/proactive-{ts}.txt`.)
+- This session reads and executes them, writes results to `results/task-{ts}.txt` — **resolve the workspace first and write to the absolute path, not a bare `results/…`:**
+  ```bash
+  WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+  echo "$reply" > "$WORKSPACE/results/task-{ts}.txt"
+  ```
+  The bridges/watcher/dashboard poll `resolve_workspace()/results`; the session cwd is the repo, so a bare relative write lands in `<repo>/results/` where no consumer looks — the same cwd-trap as `state/core-status.json` (see **Work Status**). A misfiled reply silently never delivers and never archives its task. (Same applies to `tasks/` and `results/proactive-{ts}.txt`.)
+  **Do NOT use `"${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"`** — that was this line's earlier wording and it is now actively wrong. `$SUTANDO_WORKSPACE` is no longer honored (v0.8 / #1440, stated above), so on a migrated host it is unset and the expression falls back to the **legacy** `~/.sutando/workspace/` while the bridges poll `<repo>/workspace/`. Following it literally causes the exact silent misfile this bullet warns about.
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
 - To send files in replies, include `[file: /path/to/file]` in the result text
