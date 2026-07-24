@@ -130,7 +130,14 @@ with patch.object(hc, "check_port", side_effect=_stub_port), \
 with tempfile.TemporaryDirectory() as _home:
     _ch = Path(_home) / "channels" / "slack"
     _ch.mkdir(parents=True)
-    (_ch / ".env").write_text("SLACK_BOT_TOKEN=xoxb-test\n")
+    # Token must be >= 30 chars: this fork treats a short *_TOKEN value as an
+    # obvious placeholder and reports the bridge "not configured" rather than
+    # looping on one that physically cannot authenticate (2026-05-13 incident,
+    # PR #11 — a 15-char placeholder DISCORD_BOT_TOKEN sat in the channels dir
+    # for 4 days and health-check kept trying to restart the bridge). The
+    # original fixture used "xoxb-test" (9 chars), so this case silently
+    # exercised the placeholder path instead of the SKIP_SLACK path it names.
+    (_ch / ".env").write_text("SLACK_BOT_TOKEN=xoxb-0000000000-0000000000-abcdefghijklmnopqrstuvwx\n")
     _orig_chp = hc.claude_home_path
 
     def _fake_chp(*sub):
