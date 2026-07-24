@@ -2305,7 +2305,15 @@ def run_all_checks() -> list[dict]:
     # warn for a proxy it is not meant to run (grafted from the local
     # check_credential_proxy(), which this call replaced in the 2026-07-23
     # upstream merge; that function emitted a SECOND identical row).
-    _proxy_ts = Path.home() / ".claude" / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
+    # Resolve via claude_home_path(), not ~/.claude: post-#1454 the skills dir
+    # lives under the workspace. The legacy path still resolved only because
+    # ~/.claude/skills/quota-tracker happens to symlink to the same repo dir —
+    # i.e. it worked by accident, and `sutando-migrate.sh commit
+    # --delete-source` (already prompted for by the legacy-state nag) would
+    # break it. Both uses fail SILENTLY: this one gates whether the
+    # credential-proxy row is reported at all, and the --fix path below
+    # relaunches the proxy from the same path.
+    _proxy_ts = Path(claude_home_path()) / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
     proxy_check = check_port(7846, "credential-proxy", probe=False)
     if proxy_check["status"] == "down":
         proxy_check["status"] = "warn"
@@ -3795,7 +3803,7 @@ def main():
                     # This is the periodic backstop; for sub-second crash recovery
                     # when the core is routed through the proxy, supervise it via
                     # launchd KeepAlive instead (see scripts/install-credential-proxy-launchagent.sh).
-                    proxy_ts = Path.home() / ".claude" / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
+                    proxy_ts = Path(claude_home_path()) / "skills" / "quota-tracker" / "scripts" / "credential-proxy.ts"
                     subprocess.Popen(["npx", "tsx", str(proxy_ts)],
                                      stdout=open("/tmp/credential-proxy.log", "a"),
                                      stderr=subprocess.STDOUT, start_new_session=True)
