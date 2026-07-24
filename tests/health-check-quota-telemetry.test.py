@@ -80,15 +80,71 @@ class TestQuotaTelemetryCheck(unittest.TestCase):
         self.assertEqual(r["status"], "ok")
         self.assertIn("present", r["detail"])
 
-    def test_old_quota_state_does_not_warn(self):
+    def test_old_quota_state_with_no_live_core_does_not_warn(self):
         """Deliberate: a quiet core legitimately writes nothing for a long
-        time. An age threshold would fire on healthy idle hosts, so absence —
-        not staleness — is the signal. Pin it so nobody 'improves' this into
-        a flaky check later."""
+        time, so age ALONE must never warn — that would fire on healthy idle
+        hosts. Pin it so nobody 'improves' this into a flaky check later.
+
+        Refined 2026-07-23: the pin is specifically "stale + no live core ->
+        ok". Staleness is now consulted, but only in combination with the core
+        heartbeat (see the live-core test below) — which is what makes it a
+        real signal instead of the flaky one this test was written to prevent.
+        """
         self._write_quota(mtime_age_sec=60 * 60 * 24 * 3)
         r = self.hc.check_quota_telemetry("ok")
         self.assertEqual(r["status"], "ok")
         self.assertIn("4320m ago", r["detail"])
+
+    def _beat(self, age_sec: float = 0.0) -> Path:
+        """Write a core heartbeat, as src/core_heartbeat.py does every 30s."""
+        cores = self.ws / "state" / "cores"
+        cores.mkdir(parents=True, exist_ok=True)
+        p = cores / "testhost.alive"
+        p.write_text('{"host": "testhost"}')
+        if age_sec:
+            past = time.time() - age_sec
+            os.utime(p, (past, past))
+        return p
+
+    def test_stale_quota_state_with_live_core_warns(self):
+        """The second, subtler half of the same bug — and the one that actually
+        bit on 2026-07-23.
+
+        Absence only catches a host that NEVER routed through the proxy. A host
+        that routed once and then restarted without ANTHROPIC_BASE_URL keeps
+        quota-state.json forever, so presence stays true while the data goes
+        dead. On Goose the file sat 4h stale (its 5h window had already reset)
+        while this check said `ok` and read-quota.py said "STALE" off the SAME
+        file. The loop budgeted every pass against that dead record.
+
+        A live heartbeat means the core is making API calls; the proxy rewrites
+        this file on every upstream response. So live core + stale file cannot
+        be idleness — it is broken wiring.
+        """
+        self._write_quota(mtime_age_sec=60 * 60 * 4)
+        self._beat()
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("ANTHROPIC_BASE_URL", r["detail"])
+        self.assertIn("240m stale", r["detail"])
+
+    def test_fresh_quota_state_with_live_core_is_ok(self):
+        """The healthy routed host — the common case. Must stay quiet, or the
+        warning is worthless."""
+        self._write_quota()
+        self._beat()
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok")
+
+    def test_stale_quota_state_with_dead_heartbeat_does_not_warn(self):
+        """A heartbeat file that exists but is old means the core is gone, not
+        that wiring is broken — no API calls are being made, so nothing should
+        be updating quota state. Guards the boundary from the other side: it is
+        heartbeat *freshness* that discriminates, not mere file presence."""
+        self._write_quota(mtime_age_sec=60 * 60 * 4)
+        self._beat(age_sec=60 * 60)
+        r = self.hc.check_quota_telemetry("ok")
+        self.assertEqual(r["status"], "ok")
 
     def test_stat_failure_still_reports_present(self):
         """`exists()` true but `stat()` raising is rare (file removed mid-check,

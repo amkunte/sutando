@@ -54,6 +54,12 @@ from sutando_config import resolve_core_runtime  # noqa: E402
 # pre-#736 and skills/self-diagnose pre-#769.
 WORKSPACE_DIR = resolve_workspace()
 
+# Age past which quota-state.json is considered stale by check_quota_telemetry.
+# Mirrors read-quota.py's own `stale = age_s > 30 * 60` ON PURPOSE: the two read
+# the same file, and when they used different rules they reported opposite
+# verdicts about it (see check_quota_telemetry). Keep the two in sync.
+_QUOTA_STALE_MIN = 30
+
 # Sentinel key in the failure-alert dedup state files (health-last-alerted /
 # -notified / -slacked .json) that stores the most-recently-alerted
 # failure-set hash, distinct from the per-hash timestamp entries used for
@@ -1200,11 +1206,27 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     Deliberately narrow to stay quiet in the legitimate cases:
       - proxy not up          -> silent. Not every host routes through it,
                                  and its own check already says so.
-      - file present          -> ok, with its age. NOT stale-checked: a quiet
-                                 core legitimately writes nothing for a long
-                                 time, so an age threshold would fire on
-                                 healthy idle hosts. Absence is the signal
-                                 that actually distinguishes broken wiring.
+      - file present + no live core -> ok, with its age. A quiet core
+                                 legitimately writes nothing for a long time,
+                                 so a bare age threshold would fire on healthy
+                                 idle hosts.
+      - file present + LIVE core, but stale -> warn. See below.
+
+    Absence alone is NOT sufficient, which this check originally assumed. It
+    only catches a host that NEVER routed through the proxy; a host that routed
+    once and then stopped keeps the file forever, so presence stays true while
+    the data goes dead. Observed 2026-07-23 on Goose: quota-state.json 4h old,
+    proxy `ok`, this check `ok`, and `read-quota.py` printing "⚠ STALE … proxy
+    not feeding it" off the SAME file — two readers disagreeing about one file.
+    The loop had been budgeting every pass off a record whose 5h window had
+    already reset, i.e. flying blind while every light was green.
+
+    The idle-host objection is answered by the core heartbeat rather than by
+    giving up on freshness: the proxy rewrites this file on EVERY upstream
+    response (per read-quota.py), and a live core emits a heartbeat every 30s
+    while making API calls. So live core + stale file cannot be idleness — it
+    is unambiguously broken wiring. Threshold mirrors read-quota.py's own
+    `stale = age_s > 30 * 60` so the two can never again disagree.
     """
     check = {"name": "quota-telemetry", "status": "ok"}
     if proxy_status != "ok":
@@ -1214,9 +1236,21 @@ def check_quota_telemetry(proxy_status: str) -> dict:
     if path.exists():
         try:
             age_min = int((time.time() - path.stat().st_mtime) / 60)
-            check["detail"] = f"quota state present (updated {age_min}m ago)"
         except OSError:
             check["detail"] = "quota state present"
+            return check
+        if age_min > _QUOTA_STALE_MIN and _any_core_alive():
+            check["status"] = "warn"
+            check["detail"] = (
+                f"credential proxy is up but quota-state.json is {age_min}m stale "
+                f"while a core is alive — the session is NOT routing through the "
+                f"proxy (ANTHROPIC_BASE_URL unset; exported by src/startup.sh and "
+                f"src/agent/claude/cli/start-cli.sh, neither of which a "
+                f"supervisor-launched core runs). Quota-based budgeting is reading "
+                f"a dead record on this host."
+            )
+            return check
+        check["detail"] = f"quota state present (updated {age_min}m ago)"
         return check
     check["status"] = "warn"
     check["detail"] = (
