@@ -89,7 +89,32 @@ core_claude_running() {
 # `-e` (CORE_ENV_ARGS) since tmux runs the command under the server's env, not
 # this shell's; also exported so the no-tmux `exec claude` fallback inherits it.
 # Gate on the proxy actually listening — never route through a dead proxy.
-if lsof -i :7846 > /dev/null 2>&1; then
+#
+# That gate used to be a single instantaneous lsof, which made it RACY.
+# startup.sh launches the proxy moments before it launches the core, but the
+# proxy is a tsx/node process needing ~20s of cold start before it BINDS 7846.
+# Observed 2026-07-23 on Goose: proxy process up 15:36:51, core launched
+# 15:37:12, port bound 15:37:13.806 — the lsof ran ~1.8s early, the gate failed,
+# and the core then ran 4h+ with quota telemetry frozen while every health check
+# stayed green (its 5h window sat at an already-past reset). Same end-state #123
+# fixed for launchd-restarted cores, reached by a different route: there the
+# variable was never set, here it was set-conditionally on a check that fired
+# too soon.
+#
+# Wait for the bind — but ONLY when a proxy process actually exists, so a host
+# that deliberately runs no proxy pays zero delay and still skips routing.
+_proxy_listening() { lsof -i :7846 > /dev/null 2>&1; }
+if ! _proxy_listening && pgrep -f "credential-proxy" > /dev/null 2>&1; then
+  echo "[start-cli] credential-proxy starting but not yet bound; waiting up to 30s for :7846"
+  for _ in $(seq 1 30); do
+    sleep 1
+    _proxy_listening && break
+  done
+  _proxy_listening \
+    && echo "[start-cli] credential-proxy bound; routing core through it" \
+    || echo "[start-cli] WARNING: credential-proxy never bound :7846 — core will bypass it and quota telemetry will stay frozen"
+fi
+if _proxy_listening; then
   export ANTHROPIC_BASE_URL=http://localhost:7846
   CORE_ENV_ARGS+=(-e ANTHROPIC_BASE_URL=http://localhost:7846)
   # The core runs under a namespaced CLAUDE_CONFIG_DIR whose keychain has no
