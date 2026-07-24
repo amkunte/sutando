@@ -60,9 +60,19 @@ RUN_MIGRATE() {
     SUTANDO_MIGRATE_SRC_B="$B" \
     SUTANDO_MIGRATE_SRC_C="$C" \
     SUTANDO_MIGRATE_DEST="$DEST" \
-        bash "$MIGRATE" "$@"
+        bash "$MIGRATE" --no-claude-import "$@"
     # Note: SUTANDO_MIGRATE_DEST is the proper test hook (workspace resolver
     # ignores $SUTANDO_WORKSPACE since #1440). --respect-env is not needed.
+    #
+    # --no-claude-import is applied to EVERY invocation, deliberately. The
+    # SUTANDO_MIGRATE_* hooks scope the workspace migration but NOT the
+    # post-commit `sutando-shell-setup.sh --import`, which rsyncs the real
+    # ~/.claude/projects/<slug>/ over the real workspace claude-home. Without
+    # this flag a "fully isolated" fixture test mutates live user memory — see
+    # tests/sutando-migrate-argparse.test.py, where exactly that silently
+    # reverted the owner's memory dir 3x on 2026-07-23. Putting it in the helper
+    # rather than at each call site means a new RUN_MIGRATE line cannot
+    # reintroduce the bug by forgetting it.
 }
 
 # Also add a stale task to source B for archive-routing assertion

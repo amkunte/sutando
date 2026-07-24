@@ -38,8 +38,17 @@ class TestSutandoMigrateArgparse(unittest.TestCase):
         )
         env.pop("SUTANDO_WORKSPACE", None)
 
+        # --no-claude-import is MANDATORY here, not optional tidiness. A commit
+        # run auto-invokes sutando-shell-setup.sh --import, which rsyncs the
+        # REAL ~/.claude/projects/<slug>/ over the REAL workspace claude-home.
+        # SUTANDO_MIGRATE_DEST/SRC_* do not scope that step, so this test — which
+        # looks fully isolated — silently reverted the owner's live memory dir to
+        # a frozen pre-migration snapshot on EVERY suite run (rsync -a, so even
+        # the mtimes came back as Jul-13). Observed 3x on 2026-07-23 and
+        # reproduced by bisect. sutando-migrate.sh's own docs name this flag as
+        # the opt-out "for tests"; this one just never passed it.
         proc = subprocess.run(
-            ["bash", str(MIGRATE), "--commit", "--source", "A"],
+            ["bash", str(MIGRATE), "--commit", "--source", "A", "--no-claude-import"],
             cwd=ROOT,
             env=env,
             text=True,
