@@ -35,6 +35,13 @@ def check(cond: bool, msg: str) -> None:
 
 
 orig_home = os.environ.get("HOME")
+# check_skill_symlinks resolves its destination via claude_home_path(), which
+# honors CLAUDE_CONFIG_DIR and only falls back to $HOME/.claude when it is
+# unset. Faking HOME alone therefore does NOT isolate this test on a migrated
+# host (where CLAUDE_CONFIG_DIR points into the workspace) — the check would
+# escape the fake home and inspect the REAL skills dir, which is exactly what
+# the module docstring promises never happens. Both must be redirected.
+orig_ccd = os.environ.get("CLAUDE_CONFIG_DIR")
 td = Path(tempfile.mkdtemp(prefix="skill-symlinks-live-"))
 try:
     fake_repo = td / "repo"
@@ -43,6 +50,7 @@ try:
     # Case A: skills/ dir missing -> ok/skipped
     fake_repo.mkdir()
     os.environ["HOME"] = str(fake_home)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(fake_home / ".claude")
     hc.REPO_DIR = fake_repo
     r = hc.check_skill_symlinks()
     check(r["status"] == "ok" and "skipped" in r["detail"], f"A: no skills/ dir -> skipped ({r['detail']})")
@@ -89,6 +97,10 @@ try:
 finally:
     if orig_home is not None:
         os.environ["HOME"] = orig_home
+    if orig_ccd is not None:
+        os.environ["CLAUDE_CONFIG_DIR"] = orig_ccd
+    else:
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
 if errors:
     print(f"FAILED: {errors} check(s) failed", file=sys.stderr)

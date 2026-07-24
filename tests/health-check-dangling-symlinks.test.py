@@ -51,9 +51,16 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.src.mkdir(parents=True)
         self.dst.mkdir(parents=True)
         self.hc.REPO_DIR = self.repo
-        # check_skill_symlinks hardcodes Path.home(); redirect it.
+        # check_skill_symlinks resolves its destination via claude_home_path(),
+        # so redirect THAT. It used to hardcode Path.home()/".claude"/"skills"
+        # and this harness patched Path.home to compensate — but the hardcoding
+        # was itself the bug (post-#1454 CLAUDE_CONFIG_DIR moves claude-home
+        # into the workspace, so the check was inspecting an abandoned
+        # ~/.claude/skills while skills/install.sh linked into the real one).
+        # Patching the resolver keeps the same temp layout and no longer pins
+        # the defect the check was fixed for.
         self._home = root / "home"
-        self.hc.Path.home = staticmethod(lambda: self._home)
+        self.hc.claude_home_path = staticmethod(lambda *a, **k: str(self._home / ".claude"))
 
     def tearDown(self):
         self._tmp.cleanup()

@@ -1693,22 +1693,35 @@ def check_disk_space() -> dict:
 
 
 def check_skill_symlinks() -> dict:
-    """Detect skills in the OSS repo checkout that are not symlinked into
-    ~/.claude/skills/. A missing symlink means Claude Code never loads the
+    """Detect skills in the OSS repo checkout that are not symlinked into the
+    claude-home skills dir. A missing symlink means Claude Code never loads the
     skill — it's silently invisible until manually linked (bug d920b18b).
 
-    Scans REPO_DIR/skills/ for directories and checks for a matching entry
-    in ~/.claude/skills/. Reports unlinked skills as 'warn'; in --fix mode,
+    Scans REPO_DIR/skills/ for directories and checks for a matching entry in
+    <claude-home>/skills/. Reports unlinked skills as 'warn'; in --fix mode,
     creates the missing symlinks automatically.
+
+    The destination is resolved via claude_home_path(), NOT hardcoded to
+    ~/.claude/skills. This is the same defect already fixed for the memory dir
+    in _default_memory_dir() (pre-#1454), which survived here two functions
+    away: post-migration, CLAUDE_CONFIG_DIR points at
+    <repo>/workspace/.claude-sutando, and skills/install.sh has always resolved
+    its target through `sutando-config.sh claude-home-path skills`. So this
+    check and the installer were inspecting DIFFERENT directories — measured on
+    Goose 2026-07-23: 71 entries in the abandoned ~/.claude/skills vs 68 in the
+    canonical dir that actually loads. It reported three dangling links that had
+    been dead upstream for weeks, while saying nothing at all about whether the
+    skills Claude Code really loads were linked — which is the only thing this
+    check exists to answer.
     """
     name = "skill-symlinks"
     skills_src = REPO_DIR / "skills"
-    skills_dst = Path.home() / ".claude" / "skills"
+    skills_dst = Path(claude_home_path()) / "skills"
 
     if not skills_src.exists():
         return {"name": name, "status": "ok", "detail": "skills/ dir not found — skipped"}
     if not skills_dst.exists():
-        return {"name": name, "status": "ok", "detail": "~/.claude/skills/ not found — skipped"}
+        return {"name": name, "status": "ok", "detail": f"{skills_dst} not found — skipped"}
 
     # A DANGLING symlink (entry present, target gone) is the case the original
     # condition let through: `exists()` follows the link and is False, but
