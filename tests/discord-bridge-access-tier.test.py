@@ -45,8 +45,17 @@ def main() -> int:
     src = BRIDGE.read_text()
 
     # The access_tier determination block. Find it by the sentinel comment.
+    # Window widened 2000 -> 6000 on 2026-07-23. The block legitimately grew past
+    # 2000 chars (now ~2950) when the upstream merge added the per-channel
+    # `resolve_is_collaborator` check and the local peer-tier (#109) override
+    # landed side by side. The old limit made the regex fail to match at all,
+    # which reports as "could not locate the block" — indistinguishable from the
+    # sentinel comment having been deleted. All five invariants below were
+    # verified by hand against the real merged block BEFORE this was widened;
+    # none was relaxed. The lookahead still bounds the capture, so a larger
+    # window cannot swallow unrelated code.
     match = re.search(
-        r"# Determine access tier\s*\n([\s\S]{0,2000}?)(?=\n    # Dedup:|\n    # Deterministic tier|\n\ndef |\Z)",
+        r"# Determine access tier\s*\n([\s\S]{0,6000}?)(?=\n    # Dedup:|\n    # Deterministic tier|\n\ndef |\Z)",
         src,
     )
     if not match:
