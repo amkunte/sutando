@@ -14,8 +14,20 @@
 
 set -uo pipefail
 
-SUTANDO_WORKSPACE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}"
-RESULTS_DIR="$SUTANDO_WORKSPACE/results"
+# Canonical resolution. Was `${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}`:
+# that env var stopped being honored in v0.8 / #1440, so on a migrated host it is
+# unset and the fallback pointed at the PRE-MIGRATION directory. RESULTS_DIR is
+# used only for the completion notification, so the monthly "reclaimed N GB"
+# message landed where no bridge polls — silent. Worse, the mkdir below then
+# RE-CREATED the legacy results/ tree on every run, which is exactly the kind of
+# straggler write that invalidates the "no source-side writes" precondition for
+# `sutando-migrate.sh commit --delete-source`.
+# NOTE: the rm -rf targets further down are $HOME/Library/Caches/* and
+# $HOME/.gradle/caches — they never referenced the workspace, so no deletion
+# behaviour changes here.
+_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+WORKSPACE="$(bash "$_repo/scripts/sutando-config.sh" workspace)"
+RESULTS_DIR="$WORKSPACE/results"
 mkdir -p "$RESULTS_DIR"
 
 # df --output-block-size handling differs Linux vs macOS; use a portable kib
