@@ -39,7 +39,14 @@ mode="${1:-all}"  # all | --diff
 
 # Patterns that signal direct workspace resolution.
 # Each pattern is a single ERE alternation we feed grep -E.
-PATTERN_ENV='(process\.env|process\.env\[)["'\'']?SUTANDO_WORKSPACE|os\.environ(\.get)?\(["'\'']SUTANDO_WORKSPACE|os\.getenv\(["'\'']SUTANDO_WORKSPACE'
+# Two forms were missed until 2026-07-23 and are now covered:
+#   • TS dot-access  `process.env.SUTANDO_WORKSPACE`  — the old pattern allowed an
+#     optional QUOTE after `process.env` but not a DOT, so the most idiomatic
+#     TypeScript form slipped through. skills/screen-companion/tools.ts:25 carried
+#     it and this lint reported the file clean.
+#   • py subscript   `os.environ["SUTANDO_WORKSPACE"]` — the old pattern required a
+#     paren, so bracket access slipped through.
+PATTERN_ENV='process\.env[.\[]["'\'']?SUTANDO_WORKSPACE|os\.environ(\.get\(|\[)["'\'']SUTANDO_WORKSPACE|os\.getenv\(["'\'']SUTANDO_WORKSPACE'
 PATTERN_HARDCODED_HOME='\.sutando/workspace'
 PATTERN_REPO_WALK='Path\(__file__\)\.resolve\(\)\.parent\.parent'
 
