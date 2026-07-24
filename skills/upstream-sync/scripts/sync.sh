@@ -19,8 +19,16 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
-WORKSPACE="${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}"
-WORKSPACE="${WORKSPACE/#\~/$HOME}"
+# Canonical resolution. Was `${SUTANDO_WORKSPACE:-${HOME}/.sutando/workspace}`:
+# that env var stopped being honored in v0.8 / #1440, so on a migrated host it is
+# unset and the fallback pointed at the PRE-MIGRATION directory. This script's
+# only user-visible output is notify() writing
+# results/proactive-upstream-sync-*.txt — so every sync notification was landing
+# where neither the bridges nor the cron's own "post it to #sutando-upstream"
+# step would ever look. Silent: upstream pulls would happen and never be
+# reported. Flagged by scripts/lint-workspace-resolution.sh, which exits 0 and
+# so never blocked it.
+WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace)"
 cd "$REPO_DIR"
 
 ts=$(date +%s)
