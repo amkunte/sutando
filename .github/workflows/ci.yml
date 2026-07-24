@@ -96,6 +96,9 @@ jobs:
           python3 packages/ag2-sparrow/tools/test_no_drift.py
           python3 skills/agent-room-ops/test_room_ops.py
           python3 skills/make-viral-video/scripts/test_source_tag.py
+          python3 skills/exec-approval/tests/exec-approval.test.py
+          python3 skills/finance-radar/tests/finance-radar.test.py
+          python3 skills/session-search/tests/session-search.test.py
 
       - name: Run tests
         run: npm test
