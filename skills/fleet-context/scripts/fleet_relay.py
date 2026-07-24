@@ -56,12 +56,39 @@ def memory_dir() -> Path:
     every node — Maverick (`/Users/abhi/sutando` → `-Users-abhi-sutando`) AND
     Goose (`/Users/abhi-mini/sutando` → `-Users-abhi-mini-sutando`). Hardcoding
     one node's slug would silently write to a dead dir on the other → no sync
-    (Goose red-team). `$SUTANDO_MEMORY_DIR` still overrides everything."""
+    (Goose red-team). `$SUTANDO_MEMORY_DIR` still overrides everything.
+
+    The BASE is resolved via claude_home_path(), not hardcoded to ~/.claude.
+    The node-portability fix above got the slug right but left the base stale,
+    and post-#1454 CLAUDE_CONFIG_DIR moves claude-home under the workspace — so
+    on a migrated host this returned a REAL BUT ABANDONED directory and every
+    relay write landed there. Measured on Goose 2026-07-23: two divergent
+    memory dirs, ~/.claude/... with 64 files frozen at Jul-13 09:33 vs the
+    canonical 65, and the legacy MEMORY.md was byte-identical (sha a7da42ec) to
+    the state three memory files mysteriously REVERTED to earlier that day.
+    Exactly the same failure this docstring already warns about — writing to a
+    dead dir — one level further up the path."""
     env = os.environ.get("SUTANDO_MEMORY_DIR")
     if env:
         return Path(os.path.expanduser(env))
     slug = str(REPO).replace("/", "-")
-    return Path.home() / ".claude" / "projects" / slug / "memory"
+    return _claude_home() / "projects" / slug / "memory"
+
+
+def _claude_home() -> Path:
+    """Claude-home base, preferring the repo's own resolver.
+
+    Layered so this keeps working when the skill is run standalone (no repo
+    src/ importable) and on a node that has not migrated: helper →
+    $CLAUDE_CONFIG_DIR → the historic ~/.claude default.
+    """
+    try:
+        sys.path.insert(0, str(REPO / "src"))
+        from util_paths import claude_home_path  # type: ignore
+        return Path(claude_home_path())
+    except Exception:
+        ccd = os.environ.get("CLAUDE_CONFIG_DIR")
+        return Path(os.path.expanduser(ccd)) if ccd else Path.home() / ".claude"
 
 
 def node_name(ws: Path) -> str:
