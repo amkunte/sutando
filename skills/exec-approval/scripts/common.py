@@ -39,11 +39,20 @@ _UA = "DiscordBot (https://github.com/amkunte/sutando, 1.0)"
 
 
 def resolve_workspace() -> Path:
-    """Mirror the core's resolution: $SUTANDO_WORKSPACE, else ~/.sutando/workspace."""
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    if env:
-        return Path(os.path.expanduser(env))
-    return Path.home() / ".sutando" / "workspace"
+    """Canonical workspace via the M0 helper `scripts/sutando-config.sh workspace`
+    (config.local.json → config.json → <repo>/workspace). `$SUTANDO_WORKSPACE`
+    is NO LONGER honored post-v0.8/#1440 — the helper ignores it (warn-only)
+    except under SUTANDO_TEST_MODE=1, which it honors for test isolation. We
+    shell out to the helper rather than import src/ so this safety-gate skill
+    stays independent of src/ python health (its stated design), while still
+    resolving through the ONE source of truth (no divergent copy)."""
+    import subprocess
+    repo = Path(__file__).resolve().parents[3]  # skills/exec-approval/scripts/<f> → repo
+    r = subprocess.run(
+        ["bash", str(repo / "scripts" / "sutando-config.sh"), "workspace"],
+        capture_output=True, text=True,
+    )
+    return Path(r.stdout.strip())
 
 
 def approvals_dir() -> Path:

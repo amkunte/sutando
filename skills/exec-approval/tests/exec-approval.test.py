@@ -28,6 +28,11 @@ def check(name, cond):
 
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="exec-approval-test-")
+    # Post-v0.8/#1440 the workspace resolver ignores $SUTANDO_WORKSPACE unless
+    # SUTANDO_TEST_MODE=1 is set — that's the sanctioned test-isolation hatch.
+    # common.resolve_workspace() shells out to scripts/sutando-config.sh, which
+    # honors this pair, redirecting state to the temp dir below.
+    os.environ["SUTANDO_TEST_MODE"] = "1"
     os.environ["SUTANDO_WORKSPACE"] = tmp
     # empty discord-config → no channel → posts become no-ops (warn only)
     (Path(tmp) / "state").mkdir(parents=True, exist_ok=True)

@@ -9,10 +9,17 @@ from pathlib import Path
 # --- workspace + repo roots -------------------------------------------------
 
 def resolve_workspace() -> Path:
-    ws = os.environ.get("SUTANDO_WORKSPACE", "")
-    if ws:
-        return Path(os.path.expanduser(ws))
-    return Path.home() / ".sutando" / "workspace"
+    """Canonical workspace via the M0 helper `scripts/sutando-config.sh workspace`
+    (config.local.json → config.json → <repo>/workspace). `$SUTANDO_WORKSPACE`
+    is no longer honored post-v0.8/#1440 — the helper ignores it (warn-only)
+    except under SUTANDO_TEST_MODE=1 for test isolation. Shelling out to the
+    helper resolves through the single source of truth (no divergent copy)."""
+    import subprocess
+    r = subprocess.run(
+        ["bash", str(repo_root() / "scripts" / "sutando-config.sh"), "workspace"],
+        capture_output=True, text=True,
+    )
+    return Path(r.stdout.strip())
 
 
 def repo_root() -> Path:

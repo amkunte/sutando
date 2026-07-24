@@ -20,12 +20,12 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { loadConfig, discoverConfigs, renderGoal } from './scripts/load-config.js';
 import { readSelection as defaultReadSelection, type SelectionResult } from './scripts/read-selection.js';
 import { registerVisionOnContributor, registerVisionFrameHook, callUpdateTools, callRestoreTools, captureSendFrame, getFullToolSurface } from '../../src/vision-tools.js';
+import { resolveWorkspace } from '../../src/workspace_default.js';
 
-function resolveWorkspace(): string {
-	const env = process.env.SUTANDO_WORKSPACE;
-	if (env) return env.replace(/^~/, process.env.HOME ?? '');
-	return join(process.env.HOME ?? '', '.sutando', 'workspace');
-}
+// Canonical workspace (config.local.json → config.json → <repo>/workspace).
+// $SUTANDO_WORKSPACE is no longer honored post-v0.8/#1440; the old local
+// resolver honored it + defaulted to the dead ~/.sutando/workspace. Now
+// resolved through the single source of truth (matches obsidian-vault/tools.ts).
 
 // Contributor for the screen-share-started system note. Tells Gemini the
 // screen-companion catalog is available AND names the configs the user can

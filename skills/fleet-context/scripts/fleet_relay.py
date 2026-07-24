@@ -45,8 +45,17 @@ REPO = Path(__file__).resolve().parents[3]  # skills/fleet-context/scripts/<file
 
 
 def resolve_workspace() -> Path:
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    return Path(os.path.expanduser(env)) if env else Path.home() / ".sutando" / "workspace"
+    """Canonical workspace via the M0 helper `scripts/sutando-config.sh workspace`
+    (config.local.json → config.json → <repo>/workspace). `$SUTANDO_WORKSPACE`
+    is no longer honored post-v0.8/#1440 — the helper ignores it (warn-only)
+    except under SUTANDO_TEST_MODE=1 for test isolation. Single source of truth
+    (no divergent copy)."""
+    import subprocess
+    r = subprocess.run(
+        ["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
+        capture_output=True, text=True,
+    )
+    return Path(r.stdout.strip())
 
 
 def memory_dir() -> Path:

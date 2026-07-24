@@ -37,6 +37,10 @@ def write_jsonl(path, records):
 
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="session-search-test-")
+    # Post-v0.8/#1440 the workspace resolver ignores $SUTANDO_WORKSPACE unless
+    # SUTANDO_TEST_MODE=1 is set — the sanctioned test-isolation hatch that
+    # scripts/sutando-config.sh (called by common.resolve_workspace) honors.
+    os.environ["SUTANDO_TEST_MODE"] = "1"
     os.environ["SUTANDO_WORKSPACE"] = tmp
     tdir = Path(tmp) / "transcripts"
     tdir.mkdir(parents=True, exist_ok=True)

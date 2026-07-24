@@ -20,10 +20,19 @@ _UA = "DiscordBot (https://github.com/amkunte/sutando, 1.0)"
 
 
 def resolve_workspace() -> Path:
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    if env:
-        return Path(os.path.expanduser(env))
-    return Path.home() / ".sutando" / "workspace"
+    """Canonical workspace via the M0 helper `scripts/sutando-config.sh workspace`
+    (config.local.json → config.json → <repo>/workspace). `$SUTANDO_WORKSPACE`
+    is no longer honored post-v0.8/#1440 — the helper ignores it (warn-only)
+    except under SUTANDO_TEST_MODE=1 for test isolation. Shelling out to the
+    helper keeps this skill stdlib-only/self-contained while resolving through
+    the single source of truth (no divergent copy)."""
+    import subprocess
+    repo = Path(__file__).resolve().parents[3]  # skills/finance-radar/scripts/<f> → repo
+    r = subprocess.run(
+        ["bash", str(repo / "scripts" / "sutando-config.sh"), "workspace"],
+        capture_output=True, text=True,
+    )
+    return Path(r.stdout.strip())
 
 
 def load_config() -> dict:

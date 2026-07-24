@@ -45,7 +45,19 @@ from pathlib import Path
 
 HOME = Path.home()
 REPO_DIR = Path(__file__).resolve().parents[3]  # skills/fleet-sync/scripts/<f> → repo root
-WORKSPACE = Path(os.environ.get("SUTANDO_WORKSPACE", str(HOME / ".sutando" / "workspace"))).expanduser()
+def _resolve_workspace() -> Path:
+    """Canonical workspace via the M0 helper `scripts/sutando-config.sh workspace`
+    (config.local.json → config.json → <repo>/workspace). `$SUTANDO_WORKSPACE`
+    is no longer honored post-v0.8/#1440 — the helper ignores it (warn-only)
+    except under SUTANDO_TEST_MODE=1. Single source of truth (no divergent copy)."""
+    r = subprocess.run(
+        ["bash", str(REPO_DIR / "scripts" / "sutando-config.sh"), "workspace"],
+        capture_output=True, text=True,
+    )
+    return Path(r.stdout.strip())
+
+
+WORKSPACE = _resolve_workspace()
 def _resolve_sync_dir() -> Path:
     """Locate the private memory-sync repo, path-agnostic across the fleet.
 

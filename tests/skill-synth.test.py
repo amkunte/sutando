@@ -47,6 +47,11 @@ def run():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _make_ws(tmp)
+        # Post-v0.8/#1440 the resolver ignores $SUTANDO_WORKSPACE unless
+        # SUTANDO_TEST_MODE=1 (the sanctioned test-isolation hatch honored by
+        # scripts/sutando-config.sh, which skill-synth's resolve_workspace shells
+        # out to). Without this the scan would resolve the real <repo>/workspace.
+        os.environ["SUTANDO_TEST_MODE"] = "1"
         os.environ["SUTANDO_WORKSPACE"] = str(tmp)
 
         scan = _load("scan")
