@@ -136,6 +136,15 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # scan-catchup only ever composes SKILL-LOCAL state
+    # (skills/<name>/state/*.json), which lives in the code checkout by design
+    # — skills are code, and their state sits beside them and is gitignored.
+    # It is not workspace runtime-state, so resolve_workspace() would be the
+    # WRONG resolver here: it would point the freshness check at a directory
+    # the scans never write to and silently disable the backstop that exists
+    # to stop scans dying quietly. Verified 2026-07-23 that the referenced
+    # files exist at the REPO_DIR paths and are current.
+    "src/scan-catchup.py",
     # The canonical resolver itself — names the strings literally and
     # IS the place where the fallback shapes legitimately live.
     "src/workspace_default.py",

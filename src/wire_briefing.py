@@ -34,13 +34,28 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
 DEFAULT_PLAYLIST = "PLoEaHbP1bU5FDWAyeLDL9J9i7Iblp3_m_"
 API_BASE = "https://www.googleapis.com/youtube/v3"
 
 
 def _workspace() -> Path:
-    ws = os.environ.get("SUTANDO_WORKSPACE")
-    return Path(ws).expanduser() if ws else Path.home() / ".sutando" / "workspace"
+    """Canonical workspace via the shared resolver.
+
+    Was: `os.environ.get("SUTANDO_WORKSPACE")` with a hand-rolled home-relative
+    fallback. `$SUTANDO_WORKSPACE` stopped being honored in v0.8 / #1440, so on
+    every migrated host it is unset and that fallback silently pointed at the
+    pre-migration location — this module kept reading and writing its state
+    there while the rest of the system had moved under the repo. The migration
+    copied the file forward, so both copies existed and looked identical; the
+    code simply never followed. Left alone, the migration's phase-2
+    `--delete-source` cleanup would have removed the copy this module actually
+    uses, resetting episode dedup and re-announcing old SutandoWIRE episodes in
+    the morning briefing.
+    """
+    return Path(resolve_workspace())
 
 
 def _state_path() -> Path:
