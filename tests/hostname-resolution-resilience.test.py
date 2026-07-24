@@ -58,10 +58,50 @@ class CoreHeartbeatHostnameTests(unittest.TestCase):
         )
 
     def test_hostname_fallback_matches_short_hostname(self):
-        # No label set → must equal the domain-stripped short hostname,
-        # i.e. byte-identical to the pre-fix behavior.
+        # Tier 3 of _host_label()'s precedence (env -> scutil LocalHostName ->
+        # short hostname). Clearing the env only drops tier 1, so on macOS this
+        # previously landed on tier 2 and compared LocalHostName ("Abhis-Mac-mini")
+        # against the short hostname ("abhis-mac-mini") — a guaranteed failure on
+        # any host whose Bonjour name is not byte-identical to its DHCP hostname,
+        # which is exactly the drift this file exists to guard. Force tier 3 by
+        # making the scutil probe fail, the way it does on Linux.
+        import util_paths
+        real_run = util_paths.subprocess.run
+
+        def _no_scutil(cmd, *a, **kw):
+            if cmd and "scutil" in cmd[0]:
+                raise FileNotFoundError("scutil unavailable (simulated non-macOS)")
+            return real_run(cmd, *a, **kw)
+
+        util_paths.subprocess.run = _no_scutil
+        try:
+            ch = _load_core_heartbeat()
+            self.assertEqual(ch._hostname(), socket.gethostname().split(".")[0])
+        finally:
+            util_paths.subprocess.run = real_run
+
+    def test_hostname_prefers_localhostname_over_dhcp_hostname(self):
+        # Tier 2: with no env pin and scutil available, the stable Bonjour name
+        # must win over the DHCP-assigned short hostname. This is the actual
+        # anti-drift guarantee (2026-06-22 incident); nothing asserted it before.
+        import util_paths
+        try:
+            probe = util_paths.subprocess.run(
+                ["scutil", "--get", "LocalHostName"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, Exception):
+            self.skipTest("scutil unavailable (non-macOS) — tier 2 not applicable")
+        local_host_name = (probe.stdout or "").strip()
+        if probe.returncode != 0 or not local_host_name:
+            self.skipTest("scutil returned no LocalHostName on this host")
         ch = _load_core_heartbeat()
-        self.assertEqual(ch._hostname(), socket.gethostname().split(".")[0])
+        self.assertEqual(
+            ch._hostname(), local_host_name,
+            "_hostname() must prefer the stable scutil LocalHostName over the "
+            "DHCP-drifting short hostname, or per-host paths split (two "
+            "hosts/<label>/ dirs, phantom state/cores/<label>.alive)",
+        )
 
 
 class AgentApiGethostbynameGuardTests(unittest.TestCase):
