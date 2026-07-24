@@ -25,12 +25,33 @@ REPO = Path(__file__).resolve().parents[3]  # skills/fleet-context/scripts/<file
 
 
 def memory_dir() -> Path:
-    """Node-portable memory dir — slug derived from the repo path (see fleet_relay)."""
-    env = os.environ.get("SUTANDO_MEMORY_DIR")
-    if env:
-        return Path(os.path.expanduser(env))
-    slug = str(REPO).replace("/", "-")
-    return Path.home() / ".claude" / "projects" / slug / "memory"
+    """Node-portable memory dir — IMPORTED from fleet_relay, not re-derived.
+
+    This was a verbatim copy of fleet_relay.memory_dir() whose docstring said
+    "see fleet_relay" — i.e. the two were meant to be identical and the coupling
+    was documented but not enforced. When fleet_relay's base was corrected to
+    resolve via claude_home_path(), this copy kept the old hardcoded ~/.claude
+    and the pair silently SPLIT: the writer wrote to the workspace claude-home
+    while the reader read the abandoned one, so relayed context would have read
+    back as empty. A duplicated resolver is a divergence waiting to happen; the
+    fix is one definition, not two matching ones.
+
+    Falls back to a local derivation only if fleet_relay is unimportable (the
+    script is runnable standalone), and that fallback resolves the base the same
+    way rather than hardcoding it.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from fleet_relay import memory_dir as _relay_memory_dir  # type: ignore
+        return _relay_memory_dir()
+    except Exception:
+        env = os.environ.get("SUTANDO_MEMORY_DIR")
+        if env:
+            return Path(os.path.expanduser(env))
+        ccd = os.environ.get("CLAUDE_CONFIG_DIR")
+        base = Path(os.path.expanduser(ccd)) if ccd else Path.home() / ".claude"
+        slug = str(REPO).replace("/", "-")
+        return base / "projects" / slug / "memory"
 
 
 def main() -> int:
