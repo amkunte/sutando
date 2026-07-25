@@ -78,7 +78,7 @@ def main() -> int:
         return 1
 
     print(f"  ok  {len(doc_owner)} fleet item(s) — SKILL.md owners match the manifest")
-    print(f"\nOK — fleet-sync SKILL.md owner table matches fleet/manifest.json")
+    print("\nOK — fleet-sync SKILL.md owner table matches fleet/manifest.json")
     return 0
 
 
