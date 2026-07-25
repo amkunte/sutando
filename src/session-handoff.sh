@@ -51,8 +51,25 @@ TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
 # NOTE (rebase over #2077): the pre-rebase branch also set
 # STATE_FILE="$REPO/session-state.md" here — dropped; STATE_FILE is now
 # derived from the resolved workspace below, per the workspace contract.
+# `[ ! -t 0 ]` is true for ANY non-tty stdin, not just a hook's JSON pipe — it
+# is equally true for an inherited-but-idle pipe (cron, nohup, a parent whose
+# stdin nobody writes to). In that case `json.load(sys.stdin)` blocks forever
+# waiting for EOF that never comes, and the whole handoff hangs rather than
+# falling through to `--latest`. Guard with a short select() poll: data ready →
+# parse as before; nothing within the window → treat as "no stdin JSON". Uses
+# select rather than `timeout(1)`, which is not present on stock macOS.
 if [ -z "$TRANSCRIPT" ] && [ ! -t 0 ]; then
-  TRANSCRIPT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("transcript_path") or "")' 2>/dev/null || true)"
+  TRANSCRIPT="$(SH_STDIN_WAIT="${SH_STDIN_WAIT:-2}" python3 -c '
+import json, os, select, sys
+try:
+    wait = float(os.environ.get("SH_STDIN_WAIT", "2"))
+except ValueError:
+    wait = 2.0
+if select.select([sys.stdin], [], [], wait)[0]:
+    print(json.load(sys.stdin).get("transcript_path") or "")
+else:
+    print("")
+' 2>/dev/null || true)"
 fi
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
