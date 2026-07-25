@@ -53,9 +53,19 @@ for f in dist/*.js; do
   out="$(run_capped "$f")"; rc=$?
   set -e
   # (1) load-time error → the bundle is broken (dep/dynamic-import can't be bundled).
-  if printf '%s' "$out" | grep -qE "$LOAD_ERR"; then
+  # NOTE: herestring, NOT `printf ... | grep -q`. Under `set -o pipefail` that pipeline is a
+  # SILENT FALSE NEGATIVE on large output: `grep -q` exits 0 the instant it matches, which closes
+  # the pipe while `printf` is still writing, so `printf` dies of SIGPIPE (141), `pipefail` makes
+  # the PIPELINE status 141, and the `if` therefore evaluates FALSE — the match is discarded and a
+  # genuinely broken bundle is reported as passing. Measured: a bundle whose output exceeds the pipe
+  # buffer (~64 KiB) slips through green; the same bundle with short output is caught correctly.
+  # A herestring feeds grep from a temp file, so nothing can SIGPIPE and the match is reliable.
+  if grep -qE "$LOAD_ERR" <<<"$out"; then
     echo "  ✗ SMOKE FAIL: $name — bundle load error:"
-    printf '%s\n' "$out" | grep -E "$LOAD_ERR" | head -3
+    # `grep -m3` rather than `| head -3`: same reason — `head` closing the pipe would SIGPIPE the
+    # producer. Here it would abort the script (bare statement under `set -e`) instead of just
+    # misreporting, so the failure detail and the remaining artifacts would be lost.
+    grep -m3 -E "$LOAD_ERR" <<<"$out" || true
     printf '    (last lines)\n'; printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
     fail=1
     continue
