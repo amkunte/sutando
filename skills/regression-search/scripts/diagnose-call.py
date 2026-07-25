@@ -167,7 +167,13 @@ def find_call(sid_query: str) -> Optional[dict]:
         return {
             "callSid": chosen["callSid"],
             "timestamp": _ts_iso(chosen["ts_unix"]),
-            "transcript": _build_transcript(conn, chosen["session_id"]),
+            # Use the resolved sid, not the raw sessions.session_id column:
+            # phone rows leave session_id NULL and carry the id in call_sid,
+            # so passing session_id returned an empty transcript for every
+            # phone call. chosen["callSid"] is `call_sid or session_id`, which
+            # is the value the per-surface tables key their session_id on for
+            # both surfaces.
+            "transcript": _build_transcript(conn, chosen["callSid"]),
         }
     finally:
         conn.close()
