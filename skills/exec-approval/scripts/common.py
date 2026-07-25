@@ -34,7 +34,26 @@ def _warn(msg: str) -> None:
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 POLICY_FILE = SKILL_DIR / "policy.json"
-DISCORD_ENV = Path.home() / ".claude" / "channels" / "discord" / ".env"
+
+# Resolve the bot-token file through the repo's canonical helper rather than
+# hardcoding a path. This line used to read:
+#
+#     DISCORD_ENV = Path.home() / ".claude" / "channels" / "discord" / ".env"
+#
+# which is the PRE-migration location. Post-M2 the channels dir lives under
+# $CLAUDE_CONFIG_DIR (<workspace>/.claude-sutando/), so on a migrated host the
+# token file was simply absent, `_discord_token()` raised, and post_to_approvals()
+# returned False after printing a WARN — the approval was recorded to disk but the
+# owner was NEVER notified. A gate whose whole job is "surface this to the owner"
+# failed invisibly, and the caller still got an id back that looked like success.
+#
+# claude_home_path() already implements the correct precedence
+# ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude), so reuse it instead of
+# keeping a second, divergent copy of the same resolution rule.
+sys.path.insert(0, str(SKILL_DIR.parent.parent / "src"))
+from util_paths import claude_home_path  # noqa: E402
+
+DISCORD_ENV = claude_home_path("channels", "discord", ".env")
 _UA = "DiscordBot (https://github.com/amkunte/sutando, 1.0)"
 
 
