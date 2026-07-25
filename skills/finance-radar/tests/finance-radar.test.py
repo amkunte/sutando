@@ -133,7 +133,12 @@ def main() -> int:
 
     # extract_sheet round-trip on a synthetic xlsx (deterministic parser)
     try:
-        import openpyxl, tempfile, os, subprocess, json as _json, datetime
+        import openpyxl
+        import tempfile
+        import os
+        import subprocess
+        import json as _json
+        import datetime
         wb = openpyxl.Workbook()
         # daily tab
         dly = wb.active; dly.title = "daily"
