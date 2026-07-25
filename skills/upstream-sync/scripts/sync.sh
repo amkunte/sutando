@@ -133,7 +133,15 @@ fi
 # Summarize what came in. Uses the $old_main snapshot rather than the previous
 # `HEAD@{1}..HEAD`: HEAD no longer moves (we never check out), and a reflog-relative
 # range was fragile even when it did.
-summary=$(git log --oneline "$old_main..main" 2>/dev/null | head -10)
+# NOTE: `-10` here, NOT `| head -10`. Piping to `head` closes the pipe once 10 lines are read; if
+# `git log` is still writing (i.e. the range exceeds the pipe buffer) it dies with SIGPIPE -> exit
+# 141 -> `pipefail` propagates -> `set -e` ABORTS THE SCRIPT AT THIS LINE, skipping the notify()
+# below. Before the fix above it also skipped the branch-restore, which is how the 2026-07-25
+# 345-commit fast-forward left the LIVE deployment tree checked out on `main` with no notification.
+# Measured: 3 commits -> ok, 11 -> ok, 30/100/200/345 -> exit 141 — routine syncs pass, which is
+# exactly why this survived review. `git log -10` applies the limit inside git, so nothing closes
+# the pipe early. `| wc -l` below is safe by contrast: `wc` reads to EOF and never closes early.
+summary=$(git log --oneline -10 "$old_main..main" 2>/dev/null)
 total=$(git log --oneline "$old_main..main" 2>/dev/null | wc -l | tr -d ' ')
 
 notify "🔄 Upstream sync — fast-forwarded **$behind commit(s)** from \`sonichi/sutando\` onto \`amkunte/main\`.

@@ -59,11 +59,16 @@ setup_repo() {
     echo "deployment-local-content" > shared.txt   # differs from main
     git_q commit -qam "local deployment commit" )
 
-  # A new upstream commit for the sync to pull.
+  # New upstream commits for the sync to pull. $1 = how many (default 1).
+  # Size matters: the summary line used to abort with SIGPIPE only once the range
+  # was big enough to fill the pipe buffer, so a 1-commit fixture cannot see it.
+  local n="${1:-1}"
   git_q clone -q "$TMPDIR/up" "$TMPDIR/upwork"
   ( cd "$TMPDIR/upwork"
-    echo "upstream-v2" > shared.txt
-    git_q commit -qam "c2 upstream"
+    for i in $(seq 1 "$n"); do
+      echo "upstream-v$((i+1))" > shared.txt
+      git_q commit -qam "c$((i+1)) upstream"
+    done
     git_q push -q origin main )
   rm -rf "$TMPDIR/upwork"
 }
@@ -141,5 +146,30 @@ ls "$TMPDIR/ws/results"/proactive-upstream-sync-*.txt >/dev/null 2>&1 && \
   fail "up-to-date: should stay silent but wrote a notification"
 ok "already-current run is a silent, tree-preserving no-op"
 
+# --- 4. a LARGE fast-forward must complete, not abort mid-script -------------
+# The 2026-07-25 incident: a 345-commit FF aborted at the summary line
+# (`git log ... | head -10` -> SIGPIPE -> exit 141 -> pipefail+set -e), skipping
+# both the branch-restore and the notify(). Cases 1-3 above FF by a single commit,
+# which is ~30x below the observed abort threshold — that is exactly why an
+# otherwise-thorough suite never caught it. This case runs the WHOLE script over a
+# range large enough to fill the pipe buffer.
+setup_repo 60
+set +e; run_sync; rc=$?; set -e
+[ "$rc" -ne 141 ] || fail "large FF: script died of SIGPIPE (141) — the summary line still pipes to head"
+[ "$rc" -eq 0 ] || fail "large FF: expected exit 0, got $rc"
+ok "a 60-commit fast-forward completes without aborting"
+
+[ "$(git_q -C "$TMPDIR/fork" rev-parse --abbrev-ref HEAD)" = "local-main" ] \
+  || fail "large FF: left the tree off local-main — the abort skipped the restore"
+ok "large FF leaves the tree on local-main"
+
+ls "$TMPDIR/ws/results"/proactive-upstream-sync-*.txt >/dev/null 2>&1 \
+  || fail "large FF: no notification written — the abort skipped notify()"
+ok "large FF still notifies (the abort used to swallow this)"
+
+grep -q "60" "$TMPDIR/ws/results"/proactive-upstream-sync-*.txt \
+  || fail "large FF: notification does not report the full commit total"
+ok "notification reports all 60 commits, not just the 10 summarized"
+
 echo
-echo "OK — 11/11 upstream-sync tests passed"
+echo "OK — 15/15 upstream-sync tests passed"
