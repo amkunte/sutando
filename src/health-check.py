@@ -786,7 +786,24 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
         try:
             src_mtime = src_file.stat().st_mtime
             bin_mtime = binary_path.stat().st_mtime
-            if src_mtime - bin_mtime > threshold_sec:
+            # Cross-check content before flagging, exactly as the proc_start
+            # path below and the bridges path do. Without this, ANY operation
+            # that re-stamps the source without changing it — `git checkout`,
+            # pull, rebase, stash pop — flags "rebuild needed" forever after.
+            # This branch was the only mtime comparison in the file with no
+            # content cross-check.
+            #
+            # `_file_unchanged_since(src_file, bin_mtime)` asks the question
+            # that actually matters for a compiled artifact: is the source
+            # content today identical to what it was when this binary was
+            # built? If yes the binary IS current, whatever the mtimes say.
+            #
+            # Observed 2026-07-25 on Maverick: the daily 08:07 upstream-sync
+            # re-stamped src/Sutando/main.swift (content unchanged since
+            # 07-18); src-minus-binary went from -10 min to +20 h and
+            # sutando-app reported "rebuild needed" every day. Falsely.
+            if (src_mtime - bin_mtime > threshold_sec
+                    and not _file_unchanged_since(src_file, bin_mtime)):
                 age_min = int((src_mtime - bin_mtime) / 60)
                 check["status"] = "stale"
                 check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
