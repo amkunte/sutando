@@ -795,10 +795,8 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                 # path). `git checkout` bumps mtime on files whose content is
                 # byte-identical, so a branch switch alone made this branch
                 # report "rebuild needed" for a binary that is in fact built
-                # from exactly the source on disk. If the content at the time
-                # the binary was built matches the content now, the bump was
-                # idempotent and the binary is current.
-                if _file_unchanged_since(src_file, bin_mtime):
+                # from exactly the source on disk.
+                if _binary_is_current(binary_path, src_file):
                     return
                 age_min = int((src_mtime - bin_mtime) / 60)
                 check["status"] = "stale"
@@ -900,6 +898,27 @@ def _filter_pids_this_checkout(pids: list) -> list:
         elif not argv:
             kept.append(pid)  # neither probe answered — fail open
     return kept
+
+
+def _binary_is_current(binary_path: Path, src_file: Path) -> bool:
+    """True if `binary_path` was built from the content now in `src_file`.
+
+    mtime ordering alone is not enough. `git checkout`, `pull`, and `rebase`
+    restamp files whose content is byte-identical, so a branch switch can make
+    a perfectly current binary look stale. Accept two ways: the binary is at
+    least as new as the source, or the source's mtime moved but the content
+    cross-check proves the bump was idempotent.
+
+    Fails safe (False) on any stat error, matching `_file_unchanged_since`:
+    an unresolvable check must never assert a stale binary is current.
+    """
+    try:
+        bin_mtime = binary_path.stat().st_mtime
+        if bin_mtime >= src_file.stat().st_mtime:
+            return True
+    except OSError:
+        return False
+    return _file_unchanged_since(src_file, bin_mtime)
 
 
 def _file_unchanged_since(src_file: Path, proc_start: float) -> bool:
@@ -3763,7 +3782,7 @@ def main():
                         and "not running" in (c.get("detail") or "")
                         and binary.exists()
                         and source.exists()
-                        and binary.stat().st_mtime >= source.stat().st_mtime
+                        and _binary_is_current(binary, source)
                     ):
                         try:
                             subprocess.run(["/usr/bin/open", str(binary)],

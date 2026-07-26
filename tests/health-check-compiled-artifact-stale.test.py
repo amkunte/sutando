@@ -219,5 +219,76 @@ class CompiledArtifactStaleTests(unittest.TestCase):
         self.assertEqual(check["status"], "ok")
 
 
+class BinaryIsCurrentTests(unittest.TestCase):
+    """`_binary_is_current` — the shared predicate behind both the stale
+    check and the `--fix` auto-launch gate.
+
+    The auto-launch gate previously compared mtimes directly
+    (`binary.st_mtime >= source.st_mtime`), so a checkout that restamped
+    `main.swift` made `--fix` refuse to launch a current binary and print
+    "needs manual rebuild + relaunch". The app then stayed down until
+    someone rebuilt something that did not need rebuilding.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        _init_git_repo(self.repo)
+        self._patch = patch.object(hc, "REPO_DIR", self.repo)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+        self.now = time.time()
+        self.commit_ts = self.now - 30 * 3600
+        self.bin_mtime = self.now - 20 * 3600
+        self.src = self.repo / "src" / "App" / "main.swift"
+        self.binary = self.repo / "src" / "App" / "App"
+
+    def _build(self):
+        self.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.binary.write_bytes(b"compiled")
+        _set_mtime(self.binary, self.bin_mtime)
+
+    def test_binary_newer_by_mtime_is_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build()
+        _set_mtime(self.src, self.bin_mtime - 60)
+        self.assertTrue(hc._binary_is_current(self.binary, self.src))
+
+    def test_idempotent_restamp_is_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build()
+        _set_mtime(self.src, self.now)  # checkout restamp, content unchanged
+        # Pin the behavior delta: the expression the --fix gate used before
+        # this change rejects the restamp, the predicate replacing it accepts
+        # it. Spelled out here because the new cases cannot fail against the
+        # parent commit — the symbol they exercise does not exist there, so
+        # they error rather than assert, and an error is a weaker gate.
+        old_gate = self.binary.stat().st_mtime >= self.src.stat().st_mtime
+        self.assertFalse(old_gate, "fixture must reproduce the restamp")
+        self.assertTrue(
+            hc._binary_is_current(self.binary, self.src),
+            "a restamp with identical content must not block --fix auto-launch")
+
+    def test_real_content_change_is_not_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        self._build()
+        self.src.write_bytes(b"print(2)\n")
+        _set_mtime(self.src, self.now)
+        self.assertFalse(
+            hc._binary_is_current(self.binary, self.src),
+            "a genuine post-build edit must still block auto-launch")
+
+    def test_missing_binary_is_not_current(self):
+        _commit_file(self.repo, "src/App/main.swift", b"print(1)\n", "init",
+                     when=self.commit_ts)
+        _set_mtime(self.src, self.now)
+        self.assertFalse(hc._binary_is_current(self.binary, self.src))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
