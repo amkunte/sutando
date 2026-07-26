@@ -774,7 +774,10 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
     Sutando.app), the function ALSO checks whether the binary itself is
     older than the source. A stale binary means the running process —
     however recently relaunched — is executing old code. When this fires,
-    the message tells the user to rebuild, not just restart.
+    the message tells the user to rebuild, not just restart. That branch
+    applies the same `_file_unchanged_since` content cross-check as the
+    process-start path, so a mtime bump from `git checkout` on unchanged
+    content does not read as "rebuild needed".
     """
     if not src_file.exists():
         return
@@ -787,6 +790,16 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
             src_mtime = src_file.stat().st_mtime
             bin_mtime = binary_path.stat().st_mtime
             if src_mtime - bin_mtime > threshold_sec:
+                # Same git cross-check the other two mtime comparisons carry
+                # (PR #253 for the proc_start path below, #255 for the bridges
+                # path). `git checkout` bumps mtime on files whose content is
+                # byte-identical, so a branch switch alone made this branch
+                # report "rebuild needed" for a binary that is in fact built
+                # from exactly the source on disk. If the content at the time
+                # the binary was built matches the content now, the bump was
+                # idempotent and the binary is current.
+                if _file_unchanged_since(src_file, bin_mtime):
+                    return
                 age_min = int((src_mtime - bin_mtime) / 60)
                 check["status"] = "stale"
                 check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
