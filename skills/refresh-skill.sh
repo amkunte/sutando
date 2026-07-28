@@ -16,16 +16,26 @@
 # slow and can choke on dangling symlinks (the make-wire-episode foot-gun).
 #
 # Usage:
-#   bash scripts/refresh-skill.sh <name> [<name> ...]   # refresh specific skills
-#   bash scripts/refresh-skill.sh --all                 # every symlinked skill
+#   bash skills/refresh-skill.sh <name> [<name> ...]   # refresh specific skills
+#   bash skills/refresh-skill.sh --all                 # every symlinked skill
 set -uo pipefail   # NOT -e: one skill's hiccup must not strand a half-swapped symlink
 
 # Resolve the live skills dir. Pre-revamp: ~/.claude/skills. The workspace-revamp
 # relocates it under claude-home, resolved by the main repo's config helper.
 # Precedence: SKILLS_DST env > sutando-config helper (if reachable) > ~/.claude/skills.
+# The repo is derived from THIS SCRIPT'S OWN LOCATION (it lives at <repo>/skills/),
+# not guessed. It used to read `${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}` — a
+# hardcoded checkout path that is wrong on any host that keeps the repo elsewhere
+# (e.g. ~/sutando). When that guess misses, the helper is unreachable, SKILLS_DST
+# silently falls back to the PRE-migration ~/.claude/skills, and every refresh
+# targets a dead directory: `refresh_one` finds no symlink there and prints
+# "skip <name> (not a symlink ...)" while exiting 0, so the skill is never
+# refreshed and nothing looks wrong. `--all` is worse — it enumerates the stale
+# directory and refreshes the wrong set entirely.
+_self_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SKILLS_DST="${SKILLS_DST:-}"
 if [ -z "$SKILLS_DST" ]; then
-  _cfg="${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}/scripts/sutando-config.sh"
+  _cfg="${SUTANDO_REPO_DIR:-$_self_repo}/scripts/sutando-config.sh"
   [ -x "$_cfg" ] && SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>/dev/null || true)"
   SKILLS_DST="${SKILLS_DST:-$HOME/.claude/skills}"
 fi
