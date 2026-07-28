@@ -114,6 +114,11 @@ def main() -> None:
             # No readable state yet -> treat as due (first run).
             print(f"SCANDUE {s['name']} :: {s['hint']}")
             continue
+        if data.get("suspended"):
+            # Operator/owner suspended this scan for now (e.g. all sources
+            # blocked). Skip silently so the self-healing backstop doesn't
+            # re-fire a scan the cron layer was deliberately turned off.
+            continue
         if last is None:
             print(f"SCANDUE {s['name']} :: {s['hint']}")
             continue
