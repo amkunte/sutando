@@ -81,4 +81,4 @@ contention (the lock + retry handle any overlap regardless):
 | parcel-radar-state | goose | scan state + history |
 | trip-radar-state | goose | trips.json, travel-preferences.json, history |
 | subscription-scanner-state | goose | scan state + history |
-| karts-air | maverick | personal-only skill code + criteria/state |
+| karts-air | goose | personal-only skill code + criteria/state |
