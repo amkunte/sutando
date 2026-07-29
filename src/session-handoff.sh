@@ -129,9 +129,38 @@ from util_paths import personal_path
 from pathlib import Path
 print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
 " 2>/dev/null || echo "$WORKSPACE_DIR/hosts/${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-$(scutil --get LocalHostName 2>/dev/null | grep . || hostname | sed 's/\..*//')}}/pending-questions.md")
+  # Extract via the canonical parser (src/check-pending-questions.py) instead of
+  # a second, weaker pattern here. Its `^## ` section split matches all three
+  # heading formats in use — legacy `## Q1 — Title`, `## Title` + `**Status:**`,
+  # and the free-form dated headings the proactive loop actually writes. The
+  # previous `grep "^## Q"` matched only the legacy shape, so on a file using
+  # either newer format the section rendered EMPTY.
+  #
+  # Empty is the dangerous part: it reads as "nothing pending" rather than "not
+  # parsed", so the successor session is told there is nothing waiting on the
+  # owner. Note this is the SECOND fix to this same section — the comment above
+  # records a path-resolution fix, and repairing the path is what turned an
+  # honest "None" (file not found) into a silent "" (found, matched nothing).
+  # Hence the explicit parse-failure branch below: a broken extractor must never
+  # be indistinguishable from an empty queue.
   echo "## Pending Questions"
   if [ -f "$PQ_PATH" ]; then
-    grep -A1 "^## Q" "$PQ_PATH" | head -20
+    pq_out=$(python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('cpq', '$REPO/src/check-pending-questions.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+qs = m.get_waiting_questions()
+print('\n'.join('- ' + q['title'] for q in qs[:20]) if qs else 'None')
+" 2>/dev/null)
+    if [ -n "$pq_out" ]; then
+      echo "$pq_out"
+    else
+      # Name both inputs so the failure is reproducible by hand. stderr is
+      # dropped above to match the idiom of the sibling extractors in this
+      # function, which makes this line the only handle an operator gets.
+      echo "(could not parse $PQ_PATH via $REPO/src/check-pending-questions.py — section unavailable, NOT necessarily empty)"
+    fi
   else
     echo "None"
   fi
