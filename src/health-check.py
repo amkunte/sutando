@@ -155,6 +155,32 @@ def twilio_configured(env_content: str) -> bool:
     return False
 
 
+def _dotenv_flag_enabled(name: str, env_content: str) -> bool:
+    """True when ``env_content`` carries an ACTIVE ``name=1`` line.
+
+    Generalises ``twilio_configured()`` above to the boolean SKIP_* flags. Those
+    were read with ``f"{name}=1" in env_content``, which cannot see comment
+    syntax — so a commented-out flag still activated it and commenting the line
+    out did not turn the gate off. Only ``=0`` or deleting the line worked, and
+    ``=0`` only by accident (no ``=1`` substring).
+
+    Same fix as ``twilio_configured``, whose docstring records the 2026-07-02
+    cost of the substring form: it matched the commented template placeholder, so
+    unconfigured hosts ran the phone checks and startup.sh kept a public ngrok
+    tunnel open to a port with nothing behind it.
+    """
+    for raw in env_content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != name:
+            continue
+        if value.partition("#")[0].strip() == "1":   # tolerate a trailing comment
+            return True
+    return False
+
+
 def check_port(port: int, name: str, probe: bool = False) -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
@@ -2445,7 +2471,14 @@ def run_all_checks() -> list[dict]:
     # the top of the loop below and subsumes it. `skip_sms`/`sms_configured` are
     # NOT subsumed (sms is configured in workspace .env, not channels/) and are
     # still read inside the loop.
-    skip_sms = (env_path.exists() and "SKIP_SMS_BRIDGE=1" in env_path.read_text()) or os.environ.get("SKIP_SMS_BRIDGE") == "1"
+    # Line-wise, not a substring test: `"SKIP_SMS_BRIDGE=1" in text` also matched a
+    # COMMENTED line, so commenting the flag out did not re-enable the check —
+    # exactly the bug `twilio_configured()` above was written to fix (see its
+    # docstring for what the substring form cost on 2026-07-02). `SKIP_SMS_BRIDGE`
+    # does not exist upstream, so this line is local-main-only.
+    skip_sms = (env_path.exists()
+                and _dotenv_flag_enabled("SKIP_SMS_BRIDGE", env_path.read_text())
+                ) or os.environ.get("SKIP_SMS_BRIDGE") == "1"
     channels_dir = claude_home_path("channels")
     # sms-bridge is configured in workspace .env (TWILIO_*) rather than ~/.claude/channels/.
     # Configured = all three TWILIO_* vars present AND non-empty in .env.
