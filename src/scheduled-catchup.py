@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Self-healing catch-up for daily scheduled deliveries (Option A, 2026-06-01).
 
-The morning briefing (06:00) and Siemens-prep drip (07:33) are session-only
+Daily deliveries such as the morning briefing (05:45) are session-only
 CronCreate jobs. If the host sleeps overnight or the session is busy at the
 fire minute, the slot is silently SKIPPED (not deferred) — so the owner just
 doesn't get that day's delivery. Observed repeatedly ~2026-05-31..06-01.
@@ -17,7 +17,7 @@ Output (stdout): one `CATCHUP <name>` line per delivery to run now, else
 nothing. Exit 0 always (never break the loop).
 
 Multi-node gate: a node that should NOT deliver dailies (e.g. a roaming node
-when the home-base node owns the briefing/drip) sets
+when the home-base node owns the deliveries) sets
 `SKIP_SCHEDULED_DELIVERIES=1` (env or .env file). When set, main() returns
 silently — no CATCHUP lines — so its proactive loop never fires the hardcoded
 JOBS below. Mirrors the SKIP_PHONE flag. Without this, removing a job from
@@ -46,8 +46,8 @@ def _node_skips_deliveries() -> bool:
     """True if this node is gated OUT of daily scheduled deliveries.
 
     Home-base/roaming split (Goose runs dailies; Maverick roams): a node sets
-    `SKIP_SCHEDULED_DELIVERIES=1` to opt out of the morning briefing / Siemens
-    drip so only one node delivers. Without this, a roaming node's proactive
+    `SKIP_SCHEDULED_DELIVERIES=1` to opt out of the daily deliveries
+    so only one node delivers. Without this, a roaming node's proactive
     loop still fires the hardcoded JOBS below (independent of crons.json),
     double-delivering. Mirrors the SKIP_PHONE flag pattern (env OR .env file).
     """
@@ -71,14 +71,6 @@ JOBS = [
         "window_hours": 9,        # recover until ~14:45
         "until": None,
         "run_hint": "/morning-briefing",
-    },
-    {
-        "name": "siemens-prep",
-        "key": "siemens-drip",
-        "hour": 7, "minute": 33,
-        "window_hours": 14,       # prep content useful all day → recover until ~21:30
-        "until": "2026-06-09",
-        "run_hint": "Siemens prep daily drip (read notes/siemens-prep/dossier.md; see crons.json siemens-interview-prep prompt)",
     },
 ]
 
