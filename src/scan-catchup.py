@@ -80,14 +80,51 @@ SCANS = [
 GRACE = 1.5  # flag only after 1.5x cadence elapsed (absorbs one missed tick)
 
 
+def _dotenv_flag_enabled(name: str, env_path: Path) -> bool:
+    """True when ``.env`` carries an ACTIVE ``name=1`` line.
+
+    NOT a substring test. The previous form was ``f"{name}=1" in text``, which
+    also matched a **commented** line — so commenting the flag out did not
+    disable it, and the only ways to turn the gate off were ``=0`` or deleting
+    the line. ``=0`` worked purely by accident: it simply does not contain the
+    ``=1`` substring.
+
+    This is the same bug, and the same fix, as ``health-check.py``'s
+    ``twilio_configured()``. Its docstring records what the substring form cost
+    on 2026-07-02: it matched the commented template placeholder
+    (``# TWILIO_ACCOUNT_SID=ACxxxxxxxxx``), so hosts that never configured
+    Twilio still ran the phone checks and ``startup.sh``'s matching gate "kept a
+    public ngrok tunnel open to a port with nothing behind it".
+    ``startup.sh:977`` / ``:1094`` carry the anchored-grep equivalent.
+
+    Deliberately duplicated in ``scan-catchup.py`` and ``scheduled-catchup.py``
+    rather than shared: both modules are hyphenated (not importable by name) and
+    ``sutando_config.py``, the natural home, is an upstream file while these two
+    are local-main-only. Two copies of a correct parser beat four copies of a
+    broken one.
+    """
+    try:
+        lines = env_path.read_text().splitlines()
+    except OSError:
+        return False
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != name:
+            continue
+        # Trailing inline comment: `FLAG=1  # why` -> value is "1".
+        if value.partition("#")[0].strip() == "1":
+            return True
+    return False
+
+
 def _node_skips_scans() -> bool:
     """True if this node is gated OUT of skill scans (roaming node)."""
     if os.environ.get("SKIP_SKILL_SCANS") == "1":
         return True
-    try:
-        return "SKIP_SKILL_SCANS=1" in (REPO_DIR / ".env").read_text()
-    except OSError:
-        return False
+    return _dotenv_flag_enabled("SKIP_SKILL_SCANS", REPO_DIR / ".env")
 
 
 def _parse(ts: str | None) -> datetime | None:

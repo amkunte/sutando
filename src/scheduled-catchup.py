@@ -42,6 +42,46 @@ STATE_DIR = WORKSPACE / "state"
 REPO_DIR = Path(__file__).resolve().parent.parent  # src/ -> repo root
 
 
+def _dotenv_flag_enabled(name: str, env_path: Path) -> bool:
+    """True when ``.env`` carries an ACTIVE ``name=1`` line.
+
+    NOT a substring test. The previous form was ``f"{name}=1" in text``, which
+    also matched a **commented** line — so commenting the flag out did not
+    disable it, and the only ways to turn the gate off were ``=0`` or deleting
+    the line. ``=0`` worked purely by accident: it simply does not contain the
+    ``=1`` substring.
+
+    This is the same bug, and the same fix, as ``health-check.py``'s
+    ``twilio_configured()``. Its docstring records what the substring form cost
+    on 2026-07-02: it matched the commented template placeholder
+    (``# TWILIO_ACCOUNT_SID=ACxxxxxxxxx``), so hosts that never configured
+    Twilio still ran the phone checks and ``startup.sh``'s matching gate "kept a
+    public ngrok tunnel open to a port with nothing behind it".
+    ``startup.sh:977`` / ``:1094`` carry the anchored-grep equivalent.
+
+    Deliberately duplicated in ``scan-catchup.py`` and ``scheduled-catchup.py``
+    rather than shared: both modules are hyphenated (not importable by name) and
+    ``sutando_config.py``, the natural home, is an upstream file while these two
+    are local-main-only. Two copies of a correct parser beat four copies of a
+    broken one.
+    """
+    try:
+        lines = env_path.read_text().splitlines()
+    except OSError:
+        return False
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != name:
+            continue
+        # Trailing inline comment: `FLAG=1  # why` -> value is "1".
+        if value.partition("#")[0].strip() == "1":
+            return True
+    return False
+
+
 def _node_skips_deliveries() -> bool:
     """True if this node is gated OUT of daily scheduled deliveries.
 
@@ -53,11 +93,7 @@ def _node_skips_deliveries() -> bool:
     """
     if os.environ.get("SKIP_SCHEDULED_DELIVERIES") == "1":
         return True
-    try:
-        env_content = (REPO_DIR / ".env").read_text()
-    except OSError:
-        return False
-    return "SKIP_SCHEDULED_DELIVERIES=1" in env_content
+    return _dotenv_flag_enabled("SKIP_SCHEDULED_DELIVERIES", REPO_DIR / ".env")
 
 # Daily deliveries to guard. `until` (YYYY-MM-DD, inclusive) marks a job that
 # expires — after it, the job is skipped (and the loop should drop its cron).
