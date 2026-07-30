@@ -86,34 +86,63 @@ if [ "$ahead" != "0" ]; then
   exit 1
 fi
 
-# Switch to main if we're not there
-if [ "$start_branch" != "main" ]; then
-  git checkout main 2>&1 | tail -1
-fi
+old_main=$(git rev-parse main)
 
-# Fast-forward main to upstream/main (guaranteed clean — no local commits on main)
-if ! git merge --ff-only upstream/main 2>&1; then
-  notify "❌ Upstream sync failed: \`git merge --ff-only upstream/main\` rejected. State unexpected — investigate manually."
-  # Try to restore start branch
-  [ "$start_branch" != "main" ] && git checkout "$start_branch" 2>/dev/null || true
-  exit 1
+# Fast-forward `main` to `upstream/main` WITHOUT touching the working tree.
+#
+# This used to be `checkout main` → `merge --ff-only` → `checkout back`. On this
+# host $REPO_DIR is the LIVE DEPLOYMENT TREE, and that dance rewrites the working
+# tree twice, which caused two problems:
+#
+#   1. For the duration of the sync, every file differing between `main` and
+#      `local-main` was swapped to upstream content underneath running bridges —
+#      the exact "never checkout in the deployment tree" hazard.
+#   2. checkout rewrites files, so each of those files came back with a NEW MTIME
+#      despite byte-identical content. health-check.py's mtime-based staleness
+#      checks then reported voice-agent/web-client stale and sutando-app
+#      rebuild-needed on EVERY sync, and --notify-discord posted the transition to
+#      #health. All false — a daily false alarm that trained the owner to ignore
+#      a real signal.
+#
+# `git fetch <remote> <src>:<dst>` updates the ref only; the working tree is never
+# read or written, so neither problem can occur. It still refuses a
+# non-fast-forward — exit 1 with the destination ref left unchanged — so the
+# guarantee `--ff-only` provided is preserved, not traded away.
+#
+# git refuses to fetch into a branch that is currently checked out, so when the
+# tree really is on `main` we keep the merge path. That case never had either
+# problem (no branch switch happens), so nothing is lost.
+if [ "$start_branch" != "main" ]; then
+  if ! git fetch upstream main:main 2>&1; then
+    notify "❌ Upstream sync failed: \`git fetch upstream main:main\` refused the fast-forward, so \`main\` was left unchanged. It has probably diverged from \`upstream/main\` — investigate manually."
+    exit 1
+  fi
+else
+  if ! git merge --ff-only upstream/main 2>&1; then
+    notify "❌ Upstream sync failed: \`git merge --ff-only upstream/main\` rejected. State unexpected — investigate manually."
+    exit 1
+  fi
 fi
 
 # Push to fork
 if ! git push origin main 2>&1; then
   notify "⚠️ Upstream sync — fast-forwarded $behind commit(s) into local \`main\`, but \`git push origin main\` failed. Run manually to retry."
-  [ "$start_branch" != "main" ] && git checkout "$start_branch" 2>/dev/null || true
   exit 1
 fi
 
-# Summarize what came in
-summary=$(git log --oneline HEAD@{1}..HEAD 2>/dev/null | head -10)
-total=$(git log --oneline HEAD@{1}..HEAD 2>/dev/null | wc -l | tr -d ' ')
-
-# Switch back to where we started
-if [ "$start_branch" != "main" ]; then
-  git checkout "$start_branch" 2>&1 | tail -1
-fi
+# Summarize what came in. Uses the $old_main snapshot rather than the previous
+# `HEAD@{1}..HEAD`: HEAD no longer moves (we never check out), and a reflog-relative
+# range was fragile even when it did.
+# NOTE: `-10` here, NOT `| head -10`. Piping to `head` closes the pipe once 10 lines are read; if
+# `git log` is still writing (i.e. the range exceeds the pipe buffer) it dies with SIGPIPE -> exit
+# 141 -> `pipefail` propagates -> `set -e` ABORTS THE SCRIPT AT THIS LINE, skipping the notify()
+# below. Before the fix above it also skipped the branch-restore, which is how the 2026-07-25
+# 345-commit fast-forward left the LIVE deployment tree checked out on `main` with no notification.
+# Measured: 3 commits -> ok, 11 -> ok, 30/100/200/345 -> exit 141 — routine syncs pass, which is
+# exactly why this survived review. `git log -10` applies the limit inside git, so nothing closes
+# the pipe early. `| wc -l` below is safe by contrast: `wc` reads to EOF and never closes early.
+summary=$(git log --oneline -10 "$old_main..main" 2>/dev/null)
+total=$(git log --oneline "$old_main..main" 2>/dev/null | wc -l | tr -d ' ')
 
 notify "🔄 Upstream sync — fast-forwarded **$behind commit(s)** from \`sonichi/sutando\` onto \`amkunte/main\`.
 
