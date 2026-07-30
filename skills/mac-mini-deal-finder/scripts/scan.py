@@ -345,7 +345,12 @@ def main():
     if args.verbose:
         print(f"Found {len(listings)} listings on page")
 
-    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    # `dt.UTC` is a 3.11+ alias; this script can be launched by an interpreter
+    # as old as /usr/bin/python3 (3.9.6 here). `dt.timezone.utc` is identical
+    # and has existed since 3.2. The `from __future__ import annotations` at the
+    # top does NOT cover this — it defers annotations, not runtime attribute
+    # lookups — which is why this line survived the earlier py39 pass.
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     matches = 0
     new_urls = []
     for li in listings:
