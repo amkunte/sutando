@@ -25,6 +25,7 @@ This test file pins every branch of the decision rule so a future
 refactor cannot reintroduce the cross-channel-leak class.
 """
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -35,7 +36,43 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+# HERMETIC IMPORT. proactive_routing resolves DEFAULT_PROACTIVE_CHANNEL from
+# SUTANDO_DEFAULT_PROACTIVE_CHANNEL at *module import* time, so every assertion
+# below silently inherited whatever the HOST had configured. On a deployment that
+# sets the var to `telegram` (a supported, documented configuration) this file
+# failed — 23 of its assertions encode the *upstream* default. That is a test
+# defect, not a product one, and it is invisible in CI because a clean container
+# has no .env.
+#
+# Clearing the var before the import pins these tests to the documented default.
+# The configured-default behaviour is covered separately below, by reloading the
+# module under a patched environment.
+os.environ.pop("SUTANDO_DEFAULT_PROACTIVE_CHANNEL", None)
+
 from proactive_routing import should_claim_proactive  # noqa: E402
+
+
+@contextlib.contextmanager
+def _default_channel(value):
+    """Re-import proactive_routing with SUTANDO_DEFAULT_PROACTIVE_CHANNEL=value.
+
+    A plain os.environ patch is not enough: the module reads the variable once,
+    at import, so reloading is what actually exercises the resolution logic.
+
+    This is a context manager and not a plain function on purpose. The first
+    version returned the reloaded module and restored the environment in a
+    `finally` — but importlib.reload mutates the module *in place*, so the
+    restore ran before the caller could assert anything and every assertion saw
+    the default. Restoration has to happen after the body, not after the return.
+    """
+    import importlib
+    import proactive_routing
+    os.environ["SUTANDO_DEFAULT_PROACTIVE_CHANNEL"] = value
+    try:
+        yield importlib.reload(proactive_routing)
+    finally:
+        os.environ.pop("SUTANDO_DEFAULT_PROACTIVE_CHANNEL", None)
+        importlib.reload(proactive_routing)   # leave the module as the rest expects
 
 
 def _with_state(content, fn):
@@ -205,6 +242,31 @@ def test_bridge_channels_set_is_documented():
     )
 
 
+def test_configured_default_telegram_is_honoured():
+    """SUTANDO_DEFAULT_PROACTIVE_CHANNEL=telegram — a supported deployment shape
+    (this repo's own roaming host uses it) that had NO test at all."""
+    with _default_channel("telegram") as mod:
+        assert mod.DEFAULT_PROACTIVE_CHANNEL == "telegram"
+
+        def run(state):
+            assert mod.should_claim_proactive(state, "telegram") is True
+            assert mod.should_claim_proactive(state, "discord") is False
+
+        _with_state(None, run)
+
+
+def test_invalid_configured_default_falls_back_to_discord():
+    """An unrecognised value must fall back to discord rather than stranding the
+    proactive file with no claimer. Also previously untested."""
+    with _default_channel("carrier-pigeon") as mod:
+        assert mod.DEFAULT_PROACTIVE_CHANNEL == "discord"
+
+        def run(state):
+            assert mod.should_claim_proactive(state, "discord") is True
+
+        _with_state(None, run)
+
+
 def main():
     test_discord_active_routes_to_discord()
     test_telegram_active_routes_to_telegram()
@@ -217,6 +279,8 @@ def main():
     test_github_commits_channel_defaults_to_discord()
     test_unrecognized_channel_defaults_to_discord()
     test_bridge_channels_set_is_documented()
+    test_configured_default_telegram_is_honoured()
+    test_invalid_configured_default_falls_back_to_discord()
     print("All proactive-routing tests passed.")
 
 
