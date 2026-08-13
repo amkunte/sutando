@@ -149,6 +149,64 @@ def test_unparseable_last_scan_treated_as_due():
         assert _run(mod, p).startswith("SCANDUE"), "bad timestamp must fire"
 
 
+def test_all_sources_blocked_emits_scanblocked():
+    """A scan that RUNS but produces nothing must surface.
+
+    `last_scan` age alone cannot see this: the scan runs, every source is
+    blocked, it stamps a fresh last_scan, and the age check reads it as
+    perfectly healthy. That was the real state of #orders/#parcels/#travel
+    from 2026-07-24. Emitted as SCANBLOCKED, not SCANDUE, because re-running
+    a scan whose sources are blocked just reproduces the nothing.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        fresh = datetime.now(timezone.utc).isoformat()
+        _write(p, raw=json.dumps({"last_scan": fresh,
+                                  "sources_status": {"a": "blocked", "b": "blocked"}}))
+        out = _run(mod, p)
+        assert out.startswith("SCANBLOCKED"), f"all-blocked must fire: {out!r}"
+
+
+def test_partial_block_and_healthy_stay_silent():
+    """Degraded is not dead — firing on partial blockage would cry wolf."""
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        fresh = datetime.now(timezone.utc).isoformat()
+        _write(p, raw=json.dumps({"last_scan": fresh,
+                                  "sources_status": {"a": "blocked", "b": "ok"}}))
+        assert _run(mod, p) == "", "partial blockage must stay silent"
+        _write(p, raw=json.dumps({"last_scan": fresh, "sources_status": "ok"}))
+        assert _run(mod, p) == "", "healthy must stay silent"
+
+
+def test_suspended_beats_blocked():
+    """The #142 suspend flag must win, or this change silently undoes it.
+
+    karts-air is BOTH suspended and all-sources-blocked; if blocked-detection
+    ran first, the SCANDUE noise #142 removed would come straight back.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        fresh = datetime.now(timezone.utc).isoformat()
+        _write(p, raw=json.dumps({"last_scan": fresh, "suspended": True,
+                                  "sources_status": {"a": "blocked", "b": "blocked"}}))
+        assert _run(mod, p) == "", "suspended must suppress the blocked signal"
+
+
+def test_sources_status_shape_tolerance():
+    """Two shapes exist on disk: bare string, and per-source dict."""
+    mod = _load()
+    assert mod._blocked_sources({"sources_status": "blocked"}) == ["all"]
+    assert mod._blocked_sources({"sources_status": "BLOCKED"}) == ["all"]
+    assert mod._blocked_sources({"sources_status": "ok"}) == []
+    assert mod._blocked_sources({"sources_status": {"x": "blocked"}}) == ["x"]
+    assert mod._blocked_sources({"sources_status": {}}) == []
+    assert mod._blocked_sources({}) == []
+
+
 TESTS = [
     test_roaming_node_gate_short_circuits,
     test_fresh_scan_is_silent,
@@ -156,6 +214,10 @@ TESTS = [
     test_grace_absorbs_one_missed_tick,
     test_missing_state_treated_as_due,
     test_unparseable_last_scan_treated_as_due,
+    test_all_sources_blocked_emits_scanblocked,
+    test_partial_block_and_healthy_stay_silent,
+    test_suspended_beats_blocked,
+    test_sources_status_shape_tolerance,
 ]
 
 

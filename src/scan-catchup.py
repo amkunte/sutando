@@ -105,6 +105,30 @@ def _parse(ts: str | None) -> datetime | None:
     return dt
 
 
+def _blocked_sources(data: dict) -> list[str]:
+    """Names of blocked sources, but ONLY when every source is blocked.
+
+    `sources_status` has two shapes in the wild (verified on disk 2026-08-13):
+      * a bare string — amazon-orders / parcel-radar / trip-radar use "ok"
+      * a per-source dict — karts-air uses
+        {"barnstormers": "blocked", "aircraftforsale": "blocked", ...}
+      * absent entirely — frontier-scan
+
+    A `sources_status == "blocked"` equality check (the "one-line fix" this
+    started as) would silently miss the dict form, i.e. exactly the scan that
+    motivated the fix. Returns [] for partial blockage — a scan still producing
+    from some sources is degraded, not dead, and firing on it would cry wolf.
+    """
+    ss = data.get("sources_status")
+    if isinstance(ss, str):
+        return ["all"] if ss.strip().lower() == "blocked" else []
+    if isinstance(ss, dict) and ss:
+        vals = [str(v).strip().lower() for v in ss.values()]
+        if all(v == "blocked" for v in vals):
+            return sorted(ss.keys())
+    return []
+
+
 def main() -> None:
     if _node_skips_scans():
         return
@@ -121,6 +145,23 @@ def main() -> None:
             # Operator/owner suspended this scan for now (e.g. all sources
             # blocked). Skip silently so the self-healing backstop doesn't
             # re-fire a scan the cron layer was deliberately turned off.
+            continue
+        # Running-but-producing-nothing. `last_scan` age alone cannot see this:
+        # a scan that runs, finds every source blocked, and stamps a fresh
+        # last_scan looks perfectly healthy to the age check — which is the
+        # actual state #orders/#parcels/#travel were in for days (2026-07-24+).
+        # Deliberately placed AFTER the `suspended` check above so it does not
+        # undo #142: karts-air is both suspended AND all-blocked, and a
+        # suspended scan must stay silent.
+        #
+        # Emitted as SCANBLOCKED, not SCANDUE, on purpose — re-running a scan
+        # whose sources are blocked just reproduces the nothing. The loop should
+        # surface this to the owner, not retry it.
+        blocked = _blocked_sources(data)
+        if blocked:
+            print(f"SCANBLOCKED {s['name']} :: all sources blocked "
+                  f"({', '.join(blocked)}) — last_scan is fresh, so the age check "
+                  f"cannot see this. Re-running will not help; surface it.")
             continue
         if last is None:
             print(f"SCANDUE {s['name']} :: {s['hint']}")
