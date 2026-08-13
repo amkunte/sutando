@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import unittest
+import unittest.mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-input-watch.py")
@@ -130,8 +131,28 @@ class TestComposeState(unittest.TestCase):
         self.assertEqual(st, "logged-out")
 
     def test_gateway_down_when_base_ok_gateway_dead(self):
-        st, *_ = compose_state(_IDLE, "idle", gateway_alive=False)
+        # HERMETIC: compose_state only escalates to gateway-down when the relay
+        # is actually configured (gateway_configured(), added so relay-less hosts
+        # are not pinned at a permanent false gateway-down). Without pinning the
+        # token this assertion silently depends on whether the HOST happens to
+        # have a relay configured — it passed in CI and failed on a real
+        # relay-less machine, which is a test defect, not a product one.
+        with unittest.mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": "test-token"}):
+            st, *_ = compose_state(_IDLE, "idle", gateway_alive=False)
         self.assertEqual(st, "gateway-down")
+
+    def test_no_gateway_down_when_relay_unconfigured(self):
+        """The branch added alongside gateway_configured(), previously untested.
+
+        On a host with no relay token the gateway is *meant* to be absent, so a
+        dead gateway must NOT escalate — it stays idle-ready. This is the whole
+        point of the change and nothing covered it.
+        """
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+        with unittest.mock.patch.dict(os.environ, clean, clear=True):
+            st, *_ = compose_state(_IDLE, "idle", gateway_alive=False)
+        self.assertEqual(st, "idle-ready")
 
     def test_idle_ready_when_base_idle(self):
         st, *_ = compose_state(_IDLE, "idle", True)
