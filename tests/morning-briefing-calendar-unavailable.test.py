@@ -149,7 +149,11 @@ class TestSynthesizeCalendarLine(unittest.TestCase):
 
     def test_unavailable_says_couldnt_read(self):
         text = self._synth(None)
-        self.assertIn("couldn't read your calendar", text)
+        self.assertIn("couldn't read your", text)
+        # The failure must name its own source. This reads the LOCAL macOS
+        # Calendar over AppleScript; an unqualified "your calendar" has twice
+        # been misread as a Google/connector auth failure.
+        self.assertIn("macOS Calendar", text)
         self.assertNotIn("clear", text)
         self.assertNotIn("0 events", text)
         # Unknown calendar state must not be claimed as a clean day.
@@ -190,7 +194,8 @@ class TestMainCalendarStatusLine(unittest.TestCase):
             printed = out.getvalue()
             self.assertIn("calendar: unavailable", printed)
             self.assertNotIn("0 events", printed)
-            self.assertIn("couldn't read your calendar", printed)
+            self.assertIn("couldn't read your", printed)
+            self.assertIn("macOS Calendar", printed)
 
 
 if __name__ == "__main__":
