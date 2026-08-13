@@ -1227,77 +1227,41 @@ def main():  # pragma: no cover
         # _gather_pending_task_ids for why this must run every tick).
         for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
-            if result_file.exists():
-                reply_text = read_ready_result(result_file)
-                if reply_text is None:
-                    continue
-                # Hardened from a bare pop. _gather_pending_task_ids setdefaults its
-                # recovered ids in, so THAT path is safe — but a concurrent coroutine
-                # can still drop the key during an await in an earlier iteration's send,
-                # which is exactly the KeyError that took discord-bridge down ~19 min
-                # on 2026-06-12. Same class, same two-line guard.
-                chat_id = pending_replies.pop(task_id, None)
-                if chat_id is None:
-                    continue
-                # Parse markers via the unified module (#873). Telegram
-                # honors [no-send] / [REPLIED] / [deduped: <id>] as skip,
-                # sends attached files, and silently drops [channel:] redirects
-                # (no concept in Telegram). Pass parsed.body so NO marker ever
-                # leaks as literal text in the user's DM (#1381).
-                parsed = parse_markers(reply_text)
-                if any(a.kind == "skip" for a in parsed.actions):
-                    _sk = next(a for a in parsed.actions if a.kind == "skip")
-                    if _sk.value == "deduped":
-                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
-                        if _rq:
-                            pending_replies[_rq] = chat_id
-                    print(f"  Skipped (marker): {task_id}", flush=True)
-                    _clear_progress(task_id)  # remove any progress placeholder + tier tracking
-                    archive_file(result_file, "results", task_id)
-                    task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
-                    archive_file(task_file, "tasks", task_id)
-                    continue
-                try:
-                    # Use parsed.body — all markers stripped — so [channel:] etc. never leak.
-                    # File attachments are in parsed.actions; send_reply() won't re-find them,
-                    # so send them here and fold the result into ONE obs event below.
-                    _tier = pending_task_tiers.get(task_id, "unknown")
-                    _s = send_reply(chat_id, parsed.body, task_id=task_id)
-                    delivered_ok = _s["ok"]
-                    sent_files = _s["files_sent"]
-                    for action in parsed.actions:
-                        if action.kind == "attach":
-                            fpath = action.value.strip()
-                            if _is_path_sendable(fpath):
-                                resp = send_file(chat_id, fpath)
-                                if isinstance(resp, dict) and resp.get("ok"):
-                                    sent_files += 1
-                                    print(f"  Sent file: {fpath}", flush=True)
-                                else:
-                                    delivered_ok = False
-                                    print(f"  Send file failed: {fpath}", flush=True)
-                            elif os.path.isfile(fpath):
-                                api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
-                                print(f"  BLOCKED file: {fpath}")
-                            else:
-                                print(f"  file marker, file not found — likely a prose quotation: {fpath}", flush=True)
-                    # Observability: one delivered-reply event covering text +
-                    # externally-sent attachments. outcome reflects real success;
-                    # file_count is files actually delivered (api/send_file swallow
-                    # errors, so we must not assume "ok").
-                    if _s["text_chunks"] or sent_files or not delivered_ok:
-                        _emit_channel(
-                            "telegram", "out",
-                            user_id=str(chat_id),
-                            channel_id=str(chat_id),
-                            access_tier=_tier,
-                            outcome="ok" if delivered_ok else "error",
-                            data={"task_id": task_id, "text_chunks": _s["text_chunks"], "file_count": sent_files},
-                        )
-                    print(f"  Replied to {chat_id}: {parsed.body[:80]}...", flush=True)
-                except Exception as e:
-                    print(f"[Telegram] Reply error: {e}", flush=True)
-                _clear_progress(task_id)  # remove any progress placeholder + tier tracking
+            if not result_file.exists():
+                continue
+            # read_ready_result (upstream) instead of a bare read_text(): it
+            # returns None for a result file still being written, closing the
+            # partial-read race. Keep the fork's peek-don't-pop below.
+            reply_text = read_ready_result(result_file)
+            if reply_text is None:
+                continue
+            # Peek, don't pop — the fork's delivery contract (#8/#22) only
+            # retires the routing after a CONFIRMED send, so a transient
+            # 429/5xx retries instead of silently losing the owner's reply.
+            # (Upstream pops here and archives unconditionally; that is the
+            # reply-loss bug this fork already fixed, so we keep ours.)
+            chat_id = pending_replies.get(task_id)
+            if chat_id is None:
+                continue
+
+            # Parse markers via the unified module (#873/#1381). Telegram honors
+            # [no-send]/[REPLIED]/[deduped: <id>] as skip, sends attached files,
+            # and silently drops [channel:] redirects (no concept in Telegram).
+            # Pass parsed.body so NO marker ever leaks as literal text in the DM.
+            parsed = parse_markers(reply_text)
+            if any(a.kind == "skip" for a in parsed.actions):
+                _sk = next(a for a in parsed.actions if a.kind == "skip")
+                print(f"  Skipped (marker): {task_id}", flush=True)
+                # Retire THIS id first, then apply upstream's dedup requeue, so a
+                # self-referential requeue cannot be popped away by our cleanup.
+                pending_replies.pop(task_id, None)
+                delivery_attempts.pop(task_id, None)
+                if _sk.value == "deduped":
+                    _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                    if _rq:
+                        pending_replies[_rq] = chat_id
+                _save_pending_replies(pending_replies)
+                _clear_progress(task_id)
                 archive_file(result_file, "results", task_id)
                 task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
