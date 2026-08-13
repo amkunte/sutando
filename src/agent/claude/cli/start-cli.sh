@@ -117,19 +117,54 @@ fi
 if _proxy_listening; then
   export ANTHROPIC_BASE_URL=http://localhost:7846
   CORE_ENV_ARGS+=(-e ANTHROPIC_BASE_URL=http://localhost:7846)
-  # The core runs under a namespaced CLAUDE_CONFIG_DIR whose keychain has no
-  # OAuth login of its own (the onboarding-seed deliberately does NOT copy
-  # credentials — auth is the proxy's job). But Claude Code refuses to send ANY
-  # request when it believes it's unauthenticated ("Not logged in · run /login"),
-  # so it never reaches the proxy. Give it a PLACEHOLDER key so it flips to
-  # authenticated (API-billing) mode and actually sends requests; the
-  # credential-proxy then strips this placeholder and injects the real Max OAuth
-  # token from the keychain (see skills/quota-tracker/scripts/credential-proxy.ts).
-  # This is what keeps the headless core working across config-dir changes
-  # (regressed post-#1454, when the core moved off ~/.claude to the namespaced dir).
-  # NOT a real secret — it is discarded at the proxy and never sent upstream.
-  export ANTHROPIC_API_KEY="sk-ant-sutando-core-proxy-placeholder"
-  CORE_ENV_ARGS+=(-e ANTHROPIC_API_KEY=sk-ant-sutando-core-proxy-placeholder)
+  # NO ANTHROPIC_API_KEY IS EVER SET HERE. This install is subscription-only
+  # (Max); API-key billing is never wanted. Deliberate, load-bearing, and easy
+  # to "helpfully" reintroduce — don't.
+  #
+  # History: 6cc959f3 (2026-07-23) exported a PLACEHOLDER key here. Post-#1454
+  # the core moved to a namespaced CLAUDE_CONFIG_DIR carrying no OAuth login of
+  # its own (the onboarding-seed deliberately does not copy credentials — "auth
+  # is the proxy's job"), and Claude Code refuses to send ANY request while it
+  # believes it's unauthenticated, so the core sat at "Not logged in" and never
+  # reached the proxy. The placeholder made the client believe it was authed;
+  # the proxy then discarded it and injected the real Max OAuth token. It was
+  # never a real key and was never billed.
+  #
+  # Why it's gone: a non-empty ANTHROPIC_API_KEY takes precedence over the
+  # claude.ai login and DISABLES every claude.ai connector ("connectors are
+  # disabled because ANTHROPIC_API_KEY … is set") — the core silently loses
+  # Gmail/Calendar/Drive/Notion/etc. That cost 13 days of silent breakage
+  # (2026-07-31 → 08-13). The correct fix is for the core to hold its OWN
+  # subscription login, which it now does.
+  #
+  # Verified 2026-08-13: ANTHROPIC_BASE_URL alone does NOT suppress connectors —
+  # routing through the proxy is fine, only the key is fatal. The proxy is
+  # indifferent to what the client sends: credential-proxy.ts deletes both
+  # `x-api-key` and `authorization` and injects the keychain token regardless,
+  # so quota telemetry is unaffected by this removal.
+  #
+  # If the core has no login, FAIL LOUDLY rather than limping on a placeholder
+  # with connectors silently off — a dead core is noticed in minutes, a
+  # connector-less one took 13 days.
+  #
+  # NOTE: the canonical CLAUDE_CONFIG_DIR is resolved further down this script,
+  # so it is not yet exported here — resolve it independently via the same
+  # helper (falling back to an already-exported value, then to the CLI default).
+  _auth_ccd="${CLAUDE_CONFIG_DIR:-$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || echo "$HOME/.claude")}"
+  if ! _auth_ccd="$_auth_ccd" python3 -c "
+import json, os, sys
+try:
+    with open(os.path.join(os.environ['_auth_ccd'], '.claude.json')) as f:
+        sys.exit(0 if (json.load(f).get('oauthAccount') or {}).get('accountUuid') else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+    echo "  ⚠ CORE HAS NO claude.ai LOGIN in $_auth_ccd" >&2
+    echo "    The core will sit at 'Not logged in' and drain no tasks." >&2
+    echo "    Fix: tmux -S ${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock} attach -t ${SUTANDO_TMUX_SESSION:-sutando-core}" >&2
+    echo "         then run /login and pick the subscription account." >&2
+    echo "    (Do NOT set ANTHROPIC_API_KEY to work around this — it disables all claude.ai connectors.)" >&2
+  fi
 fi
 
 # Optional working-directory override for the core `claude` process.
