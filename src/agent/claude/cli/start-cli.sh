@@ -469,12 +469,33 @@ if [ "${1:-}" = "--restart" ]; then
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
-    # Poll for actual shutdown — robust on slow machines, faster on fast
-    # ones (~1s ceiling) than a fixed sleep.
-    for _ in 1 2 3 4 5; do
+    # Poll for actual shutdown. This MUST fully complete before we fall
+    # through: the "orphaned core → adopt it" branch further down matches any
+    # live `claude --name $SESSION`, so a still-dying process makes --restart
+    # tear the core down and then decline to start a new one — leaving NO core
+    # at all. The old ceiling here was 1s (5 × 0.2), and `claude` reliably takes
+    # longer than that to exit, so --restart deterministically killed the core
+    # and left the host coreless (hit twice on 2026-08-13).
+    #
+    # Wait up to 10s for a graceful exit, then escalate to SIGKILL and give the
+    # kernel a further 3s to reap. Only then continue.
+    for _ in $(seq 1 50); do
       tmux_session_exists || core_claude_running || break
       sleep 0.2
     done
+    if core_claude_running; then
+      echo "  core did not exit gracefully after 10s — escalating to SIGKILL" >&2
+      core_claude_pids | while read -r pid; do
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+      done
+      for _ in $(seq 1 15); do
+        core_claude_running || break
+        sleep 0.2
+      done
+    fi
+    core_claude_running \
+      && echo "  ⚠ a core process survived SIGKILL — not starting a second one; investigate manually" >&2 \
+      || true
   fi
 fi
 
