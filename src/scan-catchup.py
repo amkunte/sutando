@@ -37,6 +37,9 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent.parent  # src/ -> repo root
 HOME = Path.home()
 
+sys.path.insert(0, str(REPO_DIR / "src"))
+from util_paths import claude_home_path  # noqa: E402  (needs REPO_DIR on sys.path)
+
 # cadence_hours: how often the scan should run. A scan is flagged overdue only
 # after cadence_hours * GRACE, so a single missed cron tick doesn't churn.
 SCANS = [
@@ -56,16 +59,16 @@ SCANS = [
     },
     {
         "name": "trip-radar",
-        "state": HOME / ".claude/skills/trip-radar/state/trips.json",
+        "state": REPO_DIR / "skills/trip-radar/state/trips.json",
         "cadence_hours": 24,
-        "hint": "Run the trip-radar scan per ~/.claude/skills/trip-radar/scan-prompt.md; "
+        "hint": "Run the trip-radar scan per skills/trip-radar/scan-prompt.md; "
                 "post #travel only on new trip / material change / imminent check-in, else silent.",
     },
     {
         "name": "karts-air",
-        "state": HOME / ".claude/skills/karts-air/state/karts-air-data.json",
+        "state": claude_home_path("skills/karts-air/state/karts-air-data.json"),
         "cadence_hours": 24,
-        "hint": "Run the Cirrus SR22T deal-hunter per ~/.claude/skills/karts-air/scan-prompt.md; "
+        "hint": "Run the Cirrus SR22T deal-hunter per the karts-air skill's scan-prompt.md; "
                 "post #deals only on new/changed airframes, else silent.",
     },
     {
