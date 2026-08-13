@@ -524,7 +524,7 @@ class TestBackendRecordContract(unittest.TestCase):
         import sys
         import types
         stub = types.ModuleType("workspace_default")
-        stub.resolve_workspace = lambda: self.ws
+        stub.resolve_workspace = lambda *a, **kw: self.ws
         prev = sys.modules.get("workspace_default")
         sys.modules["workspace_default"] = stub
         try:
