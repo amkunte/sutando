@@ -56,15 +56,32 @@ ok("section body → snippet is first line",
    len(qs) == 1 and qs[0].get("snippet", "").startswith("To enable cross-machine"),
    f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
 
-# 2. Strikethrough lines are skipped; first non-strikethough line wins
+# 2. Strikethrough lines are skipped; first non-strikethough line wins.
+#
+# The title deliberately avoids the words resolved/done/answered. It used to be
+# "[done-ish] something", and `\bdone\b` matches "done-ish" because a hyphen is a
+# word boundary — so get_waiting_questions() dropped the whole section as
+# resolved and returned []. The assertion below then failed for a reason that
+# has nothing to do with strikethrough, and, worse, **this test verified nothing
+# about strikethrough handling at all** for as long as that was true.
 qs = questions_for(
-    "## [done-ish] something\n"
+    "## [stale-ish] something\n"
     "~~RESOLVED — no longer relevant~~\n"
     "Actual action: run foo to fix.\n"
 )
 ok("strikethrough skipped → first real line is snippet",
    len(qs) == 1 and "Actual action" in qs[0].get("snippet", ""),
    f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
+
+# 2a. Pin the filter the old fixture was tripping over by accident, so the
+# behaviour is asserted on purpose rather than discovered by a confusing failure.
+qs = questions_for(
+    "## [done-ish] something\n"
+    "Actual action: run foo to fix.\n"
+)
+ok("a title matching resolved/done/answered is filtered out",
+   len(qs) == 0,
+   f"expected 0 sections, got {len(qs)}")
 
 # 2b. Regression for reviewer finding (liususan091219, 2026-07-12): a section
 # whose **Status:** line comes before the narrative text must not DM the
