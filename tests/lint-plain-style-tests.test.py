@@ -32,7 +32,13 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SEARCH_ROOTS = [REPO / "tests", REPO / "skills"]
+# Both in-tree (`tests/`, `skills/`) and the hand-wired out-of-tree suites
+# that ci.yml invokes by name (`packages/`, `src/`). The out-of-tree ones use
+# the `test_*.py` convention rather than `*.test.py`, so BOTH patterns are
+# scanned — checking only one glob was the original scope gap: the 8 ci.yml
+# suites were verified by hand on 2026-08-13, which is a snapshot, not a guard.
+SEARCH_ROOTS = [REPO / "tests", REPO / "skills", REPO / "packages", REPO / "src"]
+SEARCH_GLOBS = ("*.test.py", "test_*.py")
 
 _offenders: list[tuple[str, int]] = []
 _scanned = 0
@@ -70,13 +76,16 @@ def _defines_but_never_runs(path: Path) -> int | None:
 for root in SEARCH_ROOTS:
     if not root.is_dir():
         continue
-    for f in sorted(root.rglob("*.test.py")):
-        if "node_modules" in f.parts:
-            continue
-        _scanned += 1
-        n = _defines_but_never_runs(f)
-        if n is not None:
-            _offenders.append((str(f.relative_to(REPO)), n))
+    seen_in_root = set()
+    for glob in SEARCH_GLOBS:
+        for f in sorted(root.rglob(glob)):
+            if "node_modules" in f.parts or f in seen_in_root:
+                continue
+            seen_in_root.add(f)
+            _scanned += 1
+            n = _defines_but_never_runs(f)
+            if n is not None:
+                _offenders.append((str(f.relative_to(REPO)), n))
 
 if _offenders:
     print(f"  FAIL: {len(_offenders)} of {_scanned} test file(s) define test_* "
