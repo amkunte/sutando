@@ -116,7 +116,13 @@ def get_waiting_questions():
         # template `## Active\n_(none)_`. Strip HTML comments first, then
         # treat a body that is blank or just a "none" placeholder as no-op.
         body_text = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL).strip()
-        if not body_text or re.fullmatch(
+        # A section with a TITLE but no body is still a pending question — the
+        # title carries the ask. Only an explicit "(none)"-style placeholder is
+        # skipped. Note the placeholder regex is all-optional, so it matches ""
+        # as well; the `body_text and` guard is what keeps an empty body from
+        # being swallowed by it. (Owner decision 2026-08-13: empty body → the
+        # question is reported with snippet "", not dropped.)
+        if body_text and re.fullmatch(
             r'[_*~`\s\-—]*\(?\s*none\s*\)?[_*~`\s\-—.]*', body_text, re.IGNORECASE
         ):
             continue
