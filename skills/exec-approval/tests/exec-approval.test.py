@@ -38,7 +38,8 @@ def main() -> int:
     (Path(tmp) / "state").mkdir(parents=True, exist_ok=True)
     (Path(tmp) / "state" / "discord-config.json").write_text(json.dumps({"channels": {}}))
 
-    import common, importlib
+    import common
+    import importlib
     importlib.reload(common)
     from common import classify, new_id, approvals_dir
 
@@ -94,7 +95,8 @@ def main() -> int:
     check("kind+command both confirm (owner) → confirm", v["decision"] == "confirm")
 
     # --- request → resolve round-trip (no Discord) ---
-    import request_approval, resolve_approval
+    import request_approval
+    import resolve_approval
     # simulate request
     rec = {
         "id": "testid01", "status": "pending", "kind": "email_send",

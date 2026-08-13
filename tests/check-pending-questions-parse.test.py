@@ -1,7 +1,9 @@
 """Regression: get_waiting_questions() must not phantom-count the canonical
 empty template (`## Active` / `_(none)_` + footer) and must skip RESOLVED
 headers, while still detecting genuine waiting questions. (PR: parser hardening)"""
-import importlib.util, pathlib, sys
+import importlib.util
+import pathlib
+import sys
 
 _spec = importlib.util.spec_from_file_location(
     "cpq", str(pathlib.Path(__file__).resolve().parent.parent / "src" / "check-pending-questions.py")
