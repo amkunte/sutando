@@ -3578,6 +3578,25 @@ async def _handle_discord_message(message, force=False):
             f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
+        # Fidelity gate: the same rule already lives in the proactive-loop skill
+        # body (step 6.6) — but that only binds on a LOOP pass, and most
+        # owner-facing output is produced on THIS path (a task notification),
+        # which never runs the loop. Observed 2026-08-13: the gate was written at
+        # 20:10 and skipped ~90 min later on the very next recommendation,
+        # because the recommendation arrived as a task, not as a loop iteration.
+        # Unconditional for the same reason CONTEXT-FIRST above is: "is this big
+        # enough to need the check?" is exactly the judgment that fails.
+        lines.append(
+            f'{step}. FIDELITY GATE (unconditional): tag each claim MEASURED '
+            f'(command + output you can paste) / INFERRED (reasoning from a '
+            f'measurement) / ASSUMED. Do NOT assert a cause you formed this turn '
+            f'without first trying to falsify it. If the reply recommends an action, '
+            f'asserts a root cause, or precedes an irreversible operation, run the '
+            f'`red-team` skill on it BEFORE sending — this is a trigger, not a '
+            f'judgment call. Print the denominator beside any difference count, and '
+            f'state your search scope before reporting an absence.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_cmd = (
                 f"python3 {_notify_py}"
