@@ -365,8 +365,12 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         parts.append(f"It's {weather}.")
 
     # Calendar — None means the query failed (distinct from verified empty).
+    # Name the source: this reads the LOCAL macOS Calendar over AppleScript, not
+    # any Google/claude.ai connector. An unqualified "couldn't read your calendar"
+    # has twice been misattributed to Google auth, sending diagnosis down the
+    # wrong path while the actual fault was Calendar.app's dispatch queue wedging.
     if events is None:
-        parts.append("I couldn't read your calendar this morning.")
+        parts.append("I couldn't read your macOS Calendar this morning (the app isn't responding).")
     elif events:
         count = len(events)
         if count == 1:
