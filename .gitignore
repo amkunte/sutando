@@ -60,6 +60,12 @@ tests/*
 !tests/_helpers/*.ts
 !tests/fixtures/
 !tests/fixtures/*.json
+# …but NOT bytecode caches. `!tests/*/` above re-includes EVERY subdirectory,
+# which un-ignores __pycache__ (src/ etc. are covered by the global rule at
+# line 6). Since pytest imports test modules, this left the tree permanently
+# dirty after any pytest run — and a dirty tree makes upstream-sync skip
+# silently. Later rule wins, so this must come after the negations. 2026-08-13.
+tests/**/__pycache__/
 skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
