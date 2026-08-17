@@ -78,6 +78,11 @@ def _drive(box: Path, task_id: str, iterations: int) -> list[str]:
     # recipient: a log-line assertion passes even when no DM is attempted.
     db.ACCESS_FILE = box / "access.json"
     db.ACCESS_FILE.write_text(json.dumps({"allowFrom": [OWNER_ID]}))
+    # Rebinding ACCESS_FILE is not enough: resolve_owner_id() consults the
+    # WORKSPACE discord-config.json first (step 2 of its chain) and that `owner`
+    # field wins over allowFrom — so the DM went to the operator's real user id
+    # and the recipient proof below asserted against live config, not the fixture.
+    db.discord_config.load_config = lambda *a, **k: {}
     SENT.clear()
 
     class _DM:
