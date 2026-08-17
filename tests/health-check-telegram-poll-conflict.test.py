@@ -125,7 +125,10 @@ def _telegram_check(log_contents: str, heartbeat_age_s: Optional[int] = None):
             os.utime(hb, (stamp, stamp))
         chan = Path(tmphome) / "channels" / "telegram"
         chan.mkdir(parents=True)
-        (chan / ".env").write_text("TELEGRAM_BOT_TOKEN=test\n")
+        # Must clear the 30-char placeholder floor in run_all_checks(): a shorter
+        # value makes the bridge loop skip every channel as unconfigured, so the
+        # telegram row this file asserts on is never produced at all.
+        (chan / ".env").write_text("TELEGRAM_BOT_TOKEN=" + "t" * 46 + "\n")
 
         _orig_chp = hc.claude_home_path
 
