@@ -31,6 +31,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+# $SUTANDO_DM_OWNER_ID is step 1 of the resolver chain and outranks everything,
+# so an operator using that documented escape hatch would fail every case here
+# that asserts a tierMap/access.json owner. Neutralise the AMBIENT value; the
+# env-override case below sets and deletes its own.
+os.environ.pop("SUTANDO_DM_OWNER_ID", None)
+
 # Isolate the channel config BEFORE importing the bridge, and SEED it.
 #
 # This file used to write a fake DISCORD_BOT_TOKEN into the operator's real
