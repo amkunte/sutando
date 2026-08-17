@@ -5,9 +5,12 @@ All Keychain writes are mocked: no real 'security' subprocess is spawned,
 secrets never touch the test runner's Keychain.
 """
 
+import atexit
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -46,6 +49,13 @@ if importlib.util.find_spec("detect_secrets") is None and not os.environ.get("CI
 
 import vault_intercept
 from vault_intercept import InterceptResult, intercept_vault_commands, redact_vault_commands
+
+# Mocking the Keychain subprocess is not enough: store_vault_key() still calls the
+# real _register_key(), so every run appended its fixture names to the live
+# workspace manifest and list_vault_keys() then advertised keys no Keychain holds.
+_MANIFEST_DIR = tempfile.mkdtemp(prefix="vault-intercept-test-")
+vault_intercept._manifest_path = lambda: os.path.join(_MANIFEST_DIR, "keys.json")
+atexit.register(shutil.rmtree, _MANIFEST_DIR, True)
 
 
 def _mock_store(monkeypatch=None):
