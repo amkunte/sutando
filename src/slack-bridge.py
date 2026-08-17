@@ -1600,9 +1600,16 @@ def result_watcher():
                             print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
                         except Exception as e:
                             print(f"  [proactive] failed: {e}", flush=True)
+                        claim.unlink(missing_ok=True)
                     else:
-                        print(f"  [proactive] no owner in allowFrom, skipping {claim.name}", flush=True)
-                    claim.unlink(missing_ok=True)
+                        from proactive_retention import (
+                            retain_dir_for, retain_undeliverable,
+                        )
+                        kept = retain_undeliverable(claim, retain_dir_for(RESULTS_DIR))
+                        if kept:
+                            print(f"  [proactive] no owner in allowFrom, retained {claim.name} -> {kept}", flush=True)
+                        else:
+                            print(f"  [proactive] no owner in allowFrom, could NOT retain {claim.name}", flush=True)
 
             # Heartbeat (used by health-check.py)
             now = time.time()

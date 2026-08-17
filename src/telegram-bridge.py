@@ -1185,8 +1185,14 @@ def main():  # pragma: no cover
                             access_data = {}
                         owner_id = _resolve_proactive_owner_id(env_override, access_data)
                         if owner_id is None:
-                            print(f"  [proactive] no owner in allowFrom, skipping {f.name}")
-                            f.unlink(missing_ok=True)
+                            from proactive_retention import (
+                                retain_dir_for, retain_undeliverable,
+                            )
+                            kept = retain_undeliverable(f, retain_dir_for(RESULTS_DIR))
+                            if kept:
+                                print(f"  [proactive] no owner in allowFrom, retained {f.name} -> {kept}")
+                            else:
+                                print(f"  [proactive] no owner in allowFrom, could NOT retain {f.name}")
                             continue
                         try:
                             _s = send_reply(int(owner_id), text)

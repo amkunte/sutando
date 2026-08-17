@@ -5259,8 +5259,14 @@ async def poll_proactive():
                             except Exception:
                                 continue
                     if owner_id is None:
-                        print(f"  [proactive] no human user in allowFrom, skipping {f.name}")
-                        f.unlink(missing_ok=True)
+                        from proactive_retention import (
+                            retain_dir_for, retain_undeliverable,
+                        )
+                        kept = retain_undeliverable(f, retain_dir_for(RESULTS_DIR))
+                        if kept:
+                            print(f"  [proactive] no human user in allowFrom, retained {f.name} -> {kept}")
+                        else:
+                            print(f"  [proactive] no human user in allowFrom, could NOT retain {f.name}")
                         continue
                     # Bound BEFORE the try: the handler reads it, so a failure in
                     # fetch_user/create_dm would raise UnboundLocalError instead.
