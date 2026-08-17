@@ -414,9 +414,12 @@ def test_no_writes_reach_the_live_workspace(live_ws) -> int:
     #
     # Deletion of the owner's staged results is the worst case this guard
     # exists for, so it is reported as its own category rather than folded in.
-    deleted = sorted(k for k in before if k not in now)
-    added = sorted(k for k in now if k not in before)
-    modified = sorted(k for k in (set(before) & set(now)) if before[k] != now[k])
+    # Ambient churn is excluded by RE-OBSERVING each suspect, not by naming paths:
+    # a live core rewrites part of the workspace on its own, and the set differs
+    # between runs (call-tiers.json one run, task-workstream-classifier.json the
+    # next), so this was red on every host running production and green only on CI.
+    from live_workspace_guard import escapes
+    deleted, modified, added, _ambient, _suspects = escapes(before, now)
 
     if deleted or added or modified:
         print(f"  \u2717 live workspace was written to \u2014 {len(deleted)} deleted, "

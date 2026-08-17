@@ -53,6 +53,12 @@ _ccd_discord.mkdir(parents=True, exist_ok=True)
 (_ccd_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+from live_workspace_guard import (  # noqa: E402
+    ambient_subset as _ambient_subset,
+    escapes as _escapes,
+    workspace_fingerprint as _workspace_fingerprint,
+)
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 os.environ.setdefault("SUTANDO_WORKSPACE", tempfile.mkdtemp(prefix="sutando-dm-mp-test-ws-"))
@@ -342,45 +348,8 @@ def test_filename_crlf_quote_sanitized_in_header():
 
 # --- live-workspace isolation -------------------------------------------------
 _LIVE_BASELINE: dict = {}
-#: Seconds to watch a suspect path before calling it a fixture escape. A LIVE core
-#: rewrites some of the workspace on its own: measured on a running host, 4 of
-#: 61,225 paths moved in 40s with NO test executing (voice-agent.log,
-#: call-tiers.json, services-status.json, cores/<host>.alive). The whole-tree
-#: compare therefore failed on every live host and passed only on CI. Re-observing
-#: the suspects distinguishes the two without a name list, which would miss the
-#: next periodic emitter — the mistake this guard's own docstring warns about.
-#:
-#: Sized from the SLOWEST emitter, measured not read: telegram-bridge's heartbeat
-#: gate is `>= 60`, but its poll loop puts the real inter-write gap at 69.4s, and a
-#: window derived from the source constant alone was too small (a 35s one left it
-#: as the last false positive). Anything slower than this still trips the guard —
-#: raise it against a fresh measurement, don't add a name. Paid only when there
-#: ARE suspects, so a clean run (CI, no core) costs nothing.
-_AMBIENT_SETTLE_S = 90.0
 
 
-def _workspace_fingerprint(ws) -> dict:
-    """(size, mtime) per file; CONTENT HASH under results/.
-
-    Whole-tree rather than an enumerated list of the paths this fixture is known
-    to touch — an assertion only catches what it looks at. Union-compared below
-    so a DELETION is visible too (#2619 shipped both lessons the hard way).
-    """
-    out = {}
-    if not ws.is_dir():
-        return out
-    for f in ws.rglob("*"):
-        if not f.is_file():
-            continue
-        try:
-            if "results" in f.parts:
-                out[str(f)] = ("sha", hashlib.sha256(f.read_bytes()).hexdigest())
-            else:
-                st = f.stat()
-                out[str(f)] = (st.st_size, st.st_mtime)
-        except OSError:
-            pass
-    return out
 
 
 @contextlib.contextmanager
@@ -461,74 +430,10 @@ def test_resolver_bindings_restored_after_the_context(tmp_root_prefix="multipart
           f"(outbox_log -> {resolved})")
 
 
-def _stat_key(path: str):
-    """Same tuple shape _workspace_fingerprint() stores, for one path."""
-    p = Path(path)
-    try:
-        if "results" in p.parts:
-            return ("sha", hashlib.sha256(p.read_bytes()).hexdigest())
-        st = p.stat()
-        return (st.st_size, st.st_mtime)
-    except OSError:
-        return None
 
 
-def _ambient_subset(suspects: set) -> set:
-    """Of the paths that changed, which are STILL changing on their own?
-
-    The fixture is finished by the time this runs, so anything that moves again
-    is a live service, not an escape. Watched rather than name-listed; see
-    _AMBIENT_SETTLE_S.
-    """
-    first = {k: _stat_key(k) for k in suspects}
-    deadline = time.monotonic() + _AMBIENT_SETTLE_S
-    ambient: set = set()
-    while time.monotonic() < deadline and len(ambient) < len(suspects):
-        time.sleep(1.0)
-        for k in suspects - ambient:
-            if _stat_key(k) != first[k]:
-                ambient.add(k)
-    return ambient
 
 
-def test_ambient_subset_discriminates() -> None:
-    """The exemption must excuse live services WITHOUT excusing an escape.
-
-    A widened exemption is indistinguishable from a passing guard, so the
-    discriminator gets its own assertion rather than being trusted because the
-    suite went green.
-    """
-    global _AMBIENT_SETTLE_S
-    d = Path(tempfile.mkdtemp(prefix="ambient-discriminate-"))
-    static, churn = d / "escape.txt", d / "churner.txt"
-    static.write_text("written once, like a fixture escape")
-    churn.write_text("0")
-    stop = threading.Event()
-
-    def _beat():
-        i = 0
-        while not stop.is_set():
-            time.sleep(0.5)
-            i += 1
-            churn.write_text(str(i))
-
-    t = threading.Thread(target=_beat, daemon=True)
-    prior = _AMBIENT_SETTLE_S
-    _AMBIENT_SETTLE_S = 6.0
-    t.start()
-    try:
-        ambient = _ambient_subset({str(static), str(churn)})
-    finally:
-        stop.set()
-        t.join(timeout=5)
-        _AMBIENT_SETTLE_S = prior
-        shutil.rmtree(d, ignore_errors=True)
-
-    assert str(churn) in ambient, \
-        "a continuously-written path was not recognised as ambient churn"
-    assert str(static) not in ambient, \
-        "a write-once path was excused as ambient — the escape guard is disabled"
-    print("  ✓ ambient discriminator: churn excused, write-once escape still flagged")
 
 
 def test_no_writes_reach_the_live_workspace(live_ws) -> None:
@@ -573,7 +478,6 @@ def main():
         test_filename_crlf_quote_sanitized_in_header()
         print("  ✓ test_filename_crlf_quote_sanitized_in_header")
     test_resolver_bindings_restored_after_the_context()
-    test_ambient_subset_discriminates()
     test_no_writes_reach_the_live_workspace(live_ws)
     print("All dm-result multipart-upload tests passed.")
 
