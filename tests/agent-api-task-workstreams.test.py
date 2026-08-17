@@ -47,8 +47,17 @@ def test_history_and_active_routes_expose_workstreams() -> None:
     api.WORKSPACE_DIR = workspace
     api.TASK_DIR = workspace / "tasks"
     api.RESULT_DIR = workspace / "results"
+    # STATE_DIR and OWNER_ACTIVITY_FILE are separate module constants computed at
+    # IMPORT, so rebinding WORKSPACE_DIR alone left them pointing at the live
+    # workspace and record_owner_activity() rewrote the operator's real
+    # state/last-owner-activity.json. That file decides owner-presence in the
+    # proactive loop and which bridge claims a proactive result, so the escape
+    # changed production behaviour rather than just leaving a stray file.
+    api.STATE_DIR = workspace / "state"
+    api.OWNER_ACTIVITY_FILE = api.STATE_DIR / "last-owner-activity.json"
     api.TASK_DIR.mkdir(parents=True)
     api.RESULT_DIR.mkdir(parents=True)
+    api.STATE_DIR.mkdir(parents=True)
     api.API_TOKEN = "test-secret"
     api.task_history.clear()
 
