@@ -146,8 +146,6 @@ API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 RESULT_DIR = WORKSPACE_DIR / "results"
 STATE_DIR = WORKSPACE_DIR / "state"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
-TASK_DIR.mkdir(exist_ok=True)
-RESULT_DIR.mkdir(exist_ok=True)
 TASK_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -166,7 +164,7 @@ def write_owner_activity(channel: str, summary: str) -> None:
       - src/telegram-bridge.py (canonical schema: ts, channel, summary)
     """
     try:
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts": int(time.time()),
             "channel": channel,
