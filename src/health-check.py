@@ -7597,24 +7597,46 @@ def run_all_checks() -> list[dict]:
             # placeholder file at 13:20 PT. Real Telegram bot tokens are
             # ~45 chars; real Discord bot tokens are ~70 chars. Anything
             # well below that floor cannot have come from the real API.
-            if env_file.exists() and not access_file.exists():
+            # Gating this on `not access_file.exists()` made it unreachable on
+            # exactly the hosts that need it: once access.json exists the probe
+            # skipped straight to pgrep and reported the generic "configured but
+            # not running", so a stub token read as a crashed bridge for days.
+            if env_file.exists():
                 try:
                     env_lines = env_file.read_text().splitlines()
                     has_real_token = False
+                    stub_note = ""
                     for line in env_lines:
                         if "=" not in line or line.lstrip().startswith("#"):
                             continue
                         key, _, val = line.partition("=")
                         # Strip optional quotes that some users add
                         val = val.strip().strip('"').strip("'")
+                        key = key.strip()
+                        if not key.endswith("_TOKEN"):
+                            continue
                         # 30-char floor is well below the smallest real
                         # token shape (Telegram bot tokens ~45 chars,
                         # Discord ~70). Generous enough to never reject
                         # a real credential.
-                        if key.strip().endswith("_TOKEN") and len(val) >= 30:
+                        if len(val) >= 30:
                             has_real_token = True
                             break
+                        if val and not stub_note:
+                            stub_note = f"{key} is {len(val)} chars"
                     if not has_real_token:
+                        if not access_file.exists():
+                            continue
+                        # Never echo the value — it is a credential slot even
+                        # when what is sitting in it is a stub.
+                        detail = (
+                            f"{channel_name} is configured (access.json present) but "
+                            f"{env_file}'s token is a placeholder"
+                            + (f" ({stub_note}, below the 30-char floor)" if stub_note
+                               else " (no non-empty *_TOKEN line)")
+                            + " — the bridge cannot authenticate; install the real token"
+                        )
+                        checks.append({"name": name, "status": "warn", "detail": detail})
                         continue
                 except OSError:
                     continue
