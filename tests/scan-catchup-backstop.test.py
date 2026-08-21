@@ -13,7 +13,8 @@ announce itself — the scans just stop being flagged, exactly as if everything
 were fine.
 
 Covers current behaviour only:
-  * the roaming-node gate (`SKIP_SKILL_SCANS`) short-circuits before any scan
+  * the roaming-node gate (`SKIP_SKILL_SCANS`) never SCANDUEs, but still
+    reports SCANSTALE when the owner node's state has gone stale
   * a fresh scan is silent
   * an overdue scan emits SCANDUE
   * the GRACE boundary (1.5x cadence) absorbs one missed tick
@@ -67,10 +68,18 @@ def _write(path, hours_ago=None, raw=None):
     path.write_text(json.dumps({"last_scan": ts}))
 
 
-def test_roaming_node_gate_short_circuits():
-    """SKIP_SKILL_SCANS=1 must return before evaluating any scan.
+def test_roaming_node_gate_never_schedules_a_scan():
+    """SKIP_SKILL_SCANS=1 must never produce work for THIS node.
 
     Guards the Maverick/Goose split: the roaming node must not double-post.
+
+    This test previously asserted the gated node emits *nothing at all*, which
+    encoded the short-circuit as the contract. That was too strong, and it was
+    load-bearing in the wrong direction: emitting nothing is also what a node
+    does when the owner node has died, so the two states were indistinguishable
+    and #orders/#parcels/#travel went dark for three days (2026-08-17+) with
+    every backstop reading healthy. The invariant that actually matters is
+    narrower -- no SCANDUE, i.e. no scan is ever scheduled here.
     """
     mod = _load()
     prev = os.environ.get("SKIP_SKILL_SCANS")
@@ -84,7 +93,8 @@ def test_roaming_node_gate_short_circuits():
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 mod.main()
-            assert buf.getvalue().strip() == "", "gated node must emit nothing"
+            out = buf.getvalue().strip()
+            assert "SCANDUE" not in out, f"gated node must not schedule a scan: {out!r}"
     finally:
         if prev is None:
             os.environ.pop("SKIP_SKILL_SCANS", None)
@@ -207,8 +217,102 @@ def test_sources_status_shape_tolerance():
     assert mod._blocked_sources({}) == []
 
 
+def _run_roaming(mod, state_path, cadence_hours=24):
+    """Drive main() on a node gated OUT of scanning, capturing stdout."""
+    mod.SCANS = [{
+        "name": "fixture-scan",
+        "state": state_path,
+        "cadence_hours": cadence_hours,
+        "hint": "HINT",
+    }]
+    mod._node_skips_scans = lambda: True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.main()
+    return buf.getvalue().strip()
+
+
+def test_roaming_node_never_emits_scandue():
+    """The roaming gate must never trigger a scan on this node.
+
+    SKIP_SKILL_SCANS exists so exactly one node scans; a second runner
+    double-posts to the channel. So however stale the state is, the roaming
+    node's output must not contain SCANDUE.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        ancient = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": ancient}))
+        out = _run_roaming(mod, p)
+        assert "SCANDUE" not in out, f"roaming node must not self-trigger: {out!r}"
+
+
+def test_roaming_node_reports_stalled_owner_node():
+    """The gate must not blind this node to the owner node having stopped.
+
+    The roaming node pulls the owner node's scan state via fleet-sync, so it
+    holds the evidence. Returning silently is what let #orders/#parcels/#travel
+    go dark for three days after the home node stopped on 2026-08-17.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        ancient = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": ancient}))
+        out = _run_roaming(mod, p, cadence_hours=6)   # 72h vs 6h*4=24h
+        assert out.startswith("SCANSTALE"), f"stalled owner node must surface: {out!r}"
+
+
+def test_roaming_node_quiet_while_owner_merely_late():
+    """Wider than GRACE on purpose — the owner node is allowed to be off a bit.
+
+    At 1.5x cadence the age check would fire on a scanning node. Here that is
+    only "late", not "down", and firing would cry wolf every pass.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        late = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": late}))
+        out = _run_roaming(mod, p, cadence_hours=6)   # 12h < 6h*4=24h
+        assert out == "", f"merely-late owner node must stay quiet: {out!r}"
+
+
+def test_roaming_node_respects_suspended():
+    """A suspended scan stays silent on the roaming node too (#142).
+
+    karts-air is suspended and its last_scan is months old; without this the
+    roaming report would emit SCANSTALE for it on every single pass.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        ancient = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": ancient, "suspended": True}))
+        out = _run_roaming(mod, p, cadence_hours=24)
+        assert out == "", f"suspended scan must stay silent when roaming: {out!r}"
+
+
+def test_roaming_node_ignores_state_it_does_not_carry():
+    """Absence is not evidence — fleet-sync only carries manifest-listed items.
+
+    A state file this node never pulled says nothing about the owner node, so
+    it must not be reported as a stall.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        out = _run_roaming(mod, Path(d) / "missing.json")
+        assert out == "", f"uncarried state must not be flagged: {out!r}"
+
+
 TESTS = [
-    test_roaming_node_gate_short_circuits,
+    test_roaming_node_gate_never_schedules_a_scan,
+    test_roaming_node_never_emits_scandue,
+    test_roaming_node_reports_stalled_owner_node,
+    test_roaming_node_quiet_while_owner_merely_late,
+    test_roaming_node_respects_suspended,
+    test_roaming_node_ignores_state_it_does_not_carry,
     test_fresh_scan_is_silent,
     test_overdue_scan_emits_scandue,
     test_grace_absorbs_one_missed_tick,

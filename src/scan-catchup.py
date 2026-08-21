@@ -23,7 +23,9 @@ Exit 0 always (never break the loop).
 
 Roaming gate: a node that should NOT run skill scans (e.g. Maverick, which roams
 with the owner while Goose stays home and owns the scans) sets SKIP_SKILL_SCANS=1
-(env or .env file). When set, main() returns silently. Mirrors the
+(env or .env file). When set, this node never scans -- but it does still check
+whether the owner node has stopped, emitting `SCANSTALE <name> :: <why>` when the
+state it pulled via fleet-sync has gone far past cadence. Mirrors the
 SKIP_SCHEDULED_DELIVERIES gate in scheduled-catchup.py.
 """
 from __future__ import annotations
@@ -82,6 +84,11 @@ SCANS = [
 
 GRACE = 1.5  # flag only after 1.5x cadence elapsed (absorbs one missed tick)
 
+# Roaming node: only speak when the owner node looks DOWN, not merely late.
+# Deliberately much wider than GRACE -- GRACE absorbs one missed tick, this has
+# to absorb the owner node being legitimately off for a while.
+ROAMING_STALE_MULT = 4
+
 
 def _node_skips_scans() -> bool:
     """True if this node is gated OUT of skill scans (roaming node)."""
@@ -129,10 +136,47 @@ def _blocked_sources(data: dict) -> list[str]:
     return []
 
 
+def _report_owner_node_stall(now: datetime) -> None:
+    """Roaming node: do not scan, but do not go blind either.
+
+    A roaming node pulls the owner node's scan state via fleet-sync, so it is
+    already holding the evidence that the owner node stopped -- it was simply
+    never allowed to look at it. `main()` returned before reading a single
+    `last_scan`, which is why #orders/#parcels/#travel went dark for three days
+    after the home node's session ended on 2026-08-17: the only node still
+    running was the one node gated out of noticing.
+
+    Emits SCANSTALE, never SCANDUE. This node must not run the scan -- that is
+    what SKIP_SKILL_SCANS exists to prevent, and a second runner double-posts to
+    the channel. The signal is for the owner: the home node needs waking.
+
+    A state file this node does not carry is skipped, not flagged. fleet-sync
+    only syncs manifest-listed items, so absence here is a gap in what was
+    pulled, not evidence about the owner node.
+    """
+    for s in SCANS:
+        try:
+            data = json.loads(s["state"].read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("suspended"):
+            continue
+        last = _parse(data.get("last_scan"))
+        if last is None:
+            continue
+        hours = (now - last).total_seconds() / 3600.0
+        if hours > s["cadence_hours"] * ROAMING_STALE_MULT:
+            print(f"SCANSTALE {s['name']} :: last_scan is {hours:.1f}h old "
+                  f"(cadence {s['cadence_hours']}h) and this node is gated out of "
+                  f"scanning -- the owner node has probably stopped. Do NOT scan "
+                  f"here (double-post); wake the owner node.")
+
+
 def main() -> None:
-    if _node_skips_scans():
-        return
     now = datetime.now(timezone.utc)
+    if _node_skips_scans():
+        _report_owner_node_stall(now)
+        return
     for s in SCANS:
         try:
             data = json.loads(s["state"].read_text())
