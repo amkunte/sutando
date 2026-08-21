@@ -148,7 +148,21 @@ def _report_owner_node_stall(now: datetime) -> None:
 
     Emits SCANSTALE, never SCANDUE. This node must not run the scan -- that is
     what SKIP_SKILL_SCANS exists to prevent, and a second runner double-posts to
-    the channel. The signal is for the owner: the home node needs waking.
+    the channel.
+
+    It reports an OBSERVATION, not a diagnosis. `last_scan` freshness here is a
+    function of two independent systems -- the owner node scanning, and fleet-sync
+    delivering -- and this script can see neither. An earlier draft asserted "the
+    owner node has probably stopped"; kill the fleet-sync clone and that sentence
+    sends the owner to fix a machine that is fine. Naming both candidates costs a
+    clause and cannot be wrong.
+
+    Repetition is the CONSUMER's problem, deliberately. This script stays
+    read-only (see the scan-catchup entry in tests/state-paths-adoption.test.py's
+    ALLOWLIST: it composes skill-local state and owns no workspace runtime-state,
+    so a dedup sentinel does not belong here). The proactive loop already has
+    surface-once-per-changed-set machinery in step 6.5; step 2.6 routes these
+    lines through it.
 
     A state file this node does not carry is skipped, not flagged. fleet-sync
     only syncs manifest-listed items, so absence here is a gap in what was
@@ -166,10 +180,11 @@ def _report_owner_node_stall(now: datetime) -> None:
             continue
         hours = (now - last).total_seconds() / 3600.0
         if hours > s["cadence_hours"] * ROAMING_STALE_MULT:
-            print(f"SCANSTALE {s['name']} :: last_scan is {hours:.1f}h old "
-                  f"(cadence {s['cadence_hours']}h) and this node is gated out of "
-                  f"scanning -- the owner node has probably stopped. Do NOT scan "
-                  f"here (double-post); wake the owner node.")
+            print(f"SCANSTALE {s['name']} :: last_scan has not advanced in "
+                  f"{hours:.1f}h (cadence {s['cadence_hours']}h, flagged past "
+                  f"{ROAMING_STALE_MULT}x) and this node is gated out of scanning. "
+                  f"Either the owner node stopped or fleet-sync stopped delivering "
+                  f"-- check both. Do NOT scan here (double-post).")
 
 
 def main() -> None:

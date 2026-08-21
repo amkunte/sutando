@@ -280,10 +280,15 @@ def test_roaming_node_quiet_while_owner_merely_late():
 
 
 def test_roaming_node_respects_suspended():
-    """A suspended scan stays silent on the roaming node too (#142).
+    """A scan carrying `suspended: true` stays silent on the roaming node (#142).
 
-    karts-air is suspended and its last_scan is months old; without this the
-    roaming report would emit SCANSTALE for it on every single pass.
+    This docstring previously claimed "karts-air is suspended and its last_scan
+    is months old". The second half is true (2026-06-11); the first is FALSE on
+    disk — the real state file's keys are ['candidates', 'last_scan',
+    'scan_history', 'sources_status'] and `.get("suspended")` is None. The claim
+    came from reading PR #142's TITLE rather than the object, and the fixture
+    below made the test green while the real file walks straight past the guard.
+    See test_real_world_shape_without_suspended_is_reported for that case.
     """
     mod = _load()
     with tempfile.TemporaryDirectory() as d:
@@ -306,6 +311,50 @@ def test_roaming_node_ignores_state_it_does_not_carry():
         assert out == "", f"uncarried state must not be flagged: {out!r}"
 
 
+def test_real_world_shape_without_suspended_is_reported():
+    """The shape that actually exists on disk must reach the owner, not be silently dropped.
+
+    karts-air's live state carries no `suspended` key and a last_scan from
+    2026-06-11. The guard above does not apply to it, so it IS reported — which
+    is correct: a scan nobody has run in months is either abandoned or was
+    suspended without anyone recording that, and both deserve the owner's
+    attention rather than a silence invented by the tooling.
+
+    The cost of reporting it (a line that never goes away) is paid by the
+    consumer, which surfaces once per changed set — see SKILL.md step 2.6.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        _write(p, raw=json.dumps({
+            "last_scan": "2026-06-11T05:33:42-07:00",
+            "sources_status": {"barnstormers": "blocked", "aircraftforsale": "ok"},
+            "candidates": [],
+            "scan_history": [],
+        }))
+        out = _run_roaming(mod, p, cadence_hours=24)
+        assert out.startswith("SCANSTALE"), f"live shape must be reported: {out!r}"
+
+
+def test_roaming_message_does_not_assert_a_single_cause():
+    """Staleness here has two candidate causes; naming one is a false diagnosis.
+
+    `last_scan` freshness on a roaming node depends on the owner node scanning
+    AND fleet-sync delivering. An earlier draft said "the owner node has probably
+    stopped -- wake the owner node", which sends the owner to fix a healthy
+    machine whenever the sync clone is what broke.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        ancient = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": ancient}))
+        out = _run_roaming(mod, p, cadence_hours=6)
+        assert "fleet-sync" in out, f"must name the sync as a candidate cause: {out!r}"
+        assert "probably stopped" not in out, f"must not assert one cause: {out!r}"
+        assert "Do NOT scan here" in out, f"must keep the no-double-post constraint: {out!r}"
+
+
 TESTS = [
     test_roaming_node_gate_never_schedules_a_scan,
     test_roaming_node_never_emits_scandue,
@@ -313,6 +362,8 @@ TESTS = [
     test_roaming_node_quiet_while_owner_merely_late,
     test_roaming_node_respects_suspended,
     test_roaming_node_ignores_state_it_does_not_carry,
+    test_real_world_shape_without_suspended_is_reported,
+    test_roaming_message_does_not_assert_a_single_cause,
     test_fresh_scan_is_silent,
     test_overdue_scan_emits_scandue,
     test_grace_absorbs_one_missed_tick,
