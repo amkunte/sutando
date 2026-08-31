@@ -397,6 +397,29 @@ def test_roaming_message_does_not_assert_a_single_cause():
         assert "Do NOT scan here" in out, f"must keep the no-double-post constraint: {out!r}"
 
 
+def test_every_defined_test_is_registered():
+    """This file collects from an explicit TESTS list, so a new test that is
+    defined but not listed is silently skipped -- the suite still prints a
+    green count, just a smaller one than the author thinks.
+
+    Caught live on 2026-08-30: two tests were added, the count stayed at 17,
+    and "17 passed" was read as confirmation that a new guard worked. It had
+    never executed. The tell was that the count did not move when tests were
+    added.
+
+    This file is the only one of ~253 under tests/ that collects this way, so
+    the guard is local rather than a repo-wide convention change.
+    """
+    import re
+    src = Path(__file__).read_text()
+    defined = set(re.findall(r"^def (test_\w+)", src, re.M))
+    block = re.search(r"^TESTS = \[(.*?)^\]", src, re.M | re.S)
+    assert block, "TESTS list not found"
+    listed = set(re.findall(r"(test_\w+)", block.group(1)))
+    missing = sorted(defined - listed)
+    assert not missing, f"defined but never run: {missing}"
+
+
 TESTS = [
     test_roaming_node_gate_never_schedules_a_scan,
     test_roaming_node_never_emits_scandue,
@@ -406,6 +429,7 @@ TESTS = [
     test_roaming_node_ignores_state_it_does_not_carry,
     test_roaming_node_silent_for_scans_whose_state_never_syncs,
     test_roaming_observable_defaults_true,
+    test_every_defined_test_is_registered,
     test_real_world_shape_without_suspended_is_reported,
     test_roaming_message_does_not_assert_a_single_cause,
     test_fresh_scan_is_silent,
@@ -418,6 +442,7 @@ TESTS = [
     test_suspended_beats_blocked,
     test_sources_status_shape_tolerance,
 ]
+
 
 
 if __name__ == "__main__":
