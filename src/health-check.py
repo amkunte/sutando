@@ -1527,7 +1527,24 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
-def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
+def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
+    """True when the owner has intentionally stopped the loop, so idleness is expected.
+
+    Mirrors the proactive-loop skill's own skip conditions (c) and (d): presenter
+    mode, and an explicit future-dated pause. Without this, a deliberate pause
+    would read as a dead loop.
+    """
+    ws = WORKSPACE_DIR if workspace is None else workspace
+    if (ws / "state" / "presenter-mode.sentinel").exists():
+        return True
+    pause = ws / "state" / "loop-paused-until.sentinel"
+    try:
+        return pause.exists() and pause.stat().st_mtime > time.time()
+    except OSError:
+        return False
+
+
+def check_core_proactive_loop(threshold_sec: int = 600, idle_threshold_sec: int = 1800) -> dict:
     """Detect a stuck core proactive loop via stale core-status.json.
 
     The proactive loop writes core-status.json at every state transition
@@ -1552,6 +1569,22 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
         return {"name": name, "status": "ok", "detail": f"core-status.json unreadable: {str(e)[:60]}"}
     state = data.get("status")
     ts = data.get("ts")
+    if state == "idle":
+        # An idle loop that never woke again is indistinguishable from a dead one:
+        # the loop writes "idle" at the END of every pass, so a permanently-stopped
+        # loop leaves a permanently-valid-looking "idle". Only a *fresh* idle is
+        # healthy. Suppressed while the owner has deliberately paused the loop.
+        if not isinstance(ts, (int, float)):
+            return {"name": name, "status": "ok", "detail": "idle, no ts"}
+        idle_age = int(time.time() - ts)
+        if idle_age > idle_threshold_sec and not _loop_deliberately_paused():
+            return {
+                "name": name, "status": "warn",
+                "detail": (f"loop idle for {idle_age}s (> {idle_threshold_sec}s) — "
+                           "last pass completed but no pass has started since; "
+                           "session crons may have expired (CronCreate auto-expires at 7d)"),
+            }
+        return {"name": name, "status": "ok", "detail": f"idle ({idle_age}s ago)"}
     if state != "running":
         return {"name": name, "status": "ok", "detail": f"status={state}"}
     if not isinstance(ts, (int, float)):
@@ -1567,7 +1600,7 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
-def check_core_supervisor() -> dict:
+def check_core_supervisor(supervisor_stale_sec: int = 600) -> dict:
     """Surface the core-supervisor (Agent Shepherd M1) state for OSS users.
 
     The monitor (core-input-watch.py) writes state/core-supervisor.json with
@@ -1590,6 +1623,20 @@ def check_core_supervisor() -> dict:
         data = json.loads(sig_path.read_text())
     except Exception as e:
         return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+    # The payload carries no timestamp, so freshness has to come from the path.
+    # Without this, a monitor that died months ago still reports its last-known
+    # state as though it were current.
+    try:
+        sig_age = int(time.time() - sig_path.stat().st_mtime)
+    except OSError:
+        sig_age = 0
+    if sig_age > supervisor_stale_sec:
+        return {
+            "name": name, "status": "warn",
+            "detail": (f"core-supervisor.json is {sig_age // 3600}h stale — "
+                       "core-input-watch.py is not running; the state below is "
+                       "last-known, not current"),
+        }
     state = data.get("state", "unknown")
     detail = state
     prompt = data.get("prompt")
