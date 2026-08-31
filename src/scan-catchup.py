@@ -68,6 +68,9 @@ SCANS = [
     },
     {
         "name": "karts-air",
+        # roaming_observable=False: state file is gitignored in the fleet repo, so a roaming node
+        # only ever sees its own never-refreshed copy.
+        "roaming_observable": False,
         "state": claude_home_path("skills/karts-air/state/karts-air-data.json"),
         "cadence_hours": 24,
         "hint": "Run the Cirrus SR22T deal-hunter per the karts-air skill's scan-prompt.md; "
@@ -75,6 +78,9 @@ SCANS = [
     },
     {
         "name": "frontier-scan",
+        # roaming_observable=False: no fleet-sync entry at all, so a roaming node
+        # only ever sees its own never-refreshed copy.
+        "roaming_observable": False,
         "state": REPO_DIR / "skills/frontier-scan/state/seen.json",
         "cadence_hours": 168,  # weekly
         "hint": "Run the Frontier Scan per skills/frontier-scan/scan-prompt.md; "
@@ -174,6 +180,12 @@ def _report_owner_node_stall(now: datetime) -> None:
         except (OSError, json.JSONDecodeError):
             continue
         if data.get("suspended"):
+            continue
+        if not s.get("roaming_observable", True):
+            # This scan's state never reaches a roaming node, so the file being
+            # aged here is this node's OWN copy and will never refresh. Ageing it
+            # produces an alert that cannot clear no matter what the owner node
+            # does -- which trains the reader to ignore the whole SCANSTALE class.
             continue
         last = _parse(data.get("last_scan"))
         if last is None:

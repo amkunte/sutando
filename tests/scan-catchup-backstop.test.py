@@ -217,13 +217,14 @@ def test_sources_status_shape_tolerance():
     assert mod._blocked_sources({}) == []
 
 
-def _run_roaming(mod, state_path, cadence_hours=24):
+def _run_roaming(mod, state_path, cadence_hours=24, roaming_observable=True):
     """Drive main() on a node gated OUT of scanning, capturing stdout."""
     mod.SCANS = [{
         "name": "fixture-scan",
         "state": state_path,
         "cadence_hours": cadence_hours,
         "hint": "HINT",
+        "roaming_observable": roaming_observable,
     }]
     mod._node_skips_scans = lambda: True
     buf = io.StringIO()
@@ -311,6 +312,47 @@ def test_roaming_node_ignores_state_it_does_not_carry():
         assert out == "", f"uncarried state must not be flagged: {out!r}"
 
 
+def test_roaming_node_silent_for_scans_whose_state_never_syncs():
+    """A PRESENT-but-never-refreshed file is a different case from a missing one.
+
+    test_roaming_node_ignores_state_it_does_not_carry covers the file this node
+    never pulled: read fails, nothing is emitted. But karts-air's state file is
+    gitignored in the fleet repo and frontier-scan has no fleet entry, so on a
+    roaming node those files EXIST -- as that node's own local copy, frozen at
+    whenever it last scanned there. Ageing them emits a SCANSTALE that cannot
+    clear however healthy the owner node is, which trains the reader to ignore
+    the class.
+
+    Measured 2026-08-30: four reachable copies of karts-air-data.json all read
+    last_scan=2026-06-11 because they are all the same never-synced local file,
+    and that is what produced a "dead 80 days" claim about a scan the owner node
+    had run daily through 07-25.
+    """
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        ancient = (datetime.now(timezone.utc) - timedelta(days=80)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": ancient}))
+        out = _run_roaming(mod, p, cadence_hours=24, roaming_observable=False)
+        assert out == "", f"unsyncable state must not be aged: {out!r}"
+
+
+def test_roaming_observable_defaults_true():
+    """Omitting the flag must preserve the reporting behaviour, not silence it."""
+    mod = _load()
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "s.json"
+        ancient = (datetime.now(timezone.utc) - timedelta(days=80)).isoformat()
+        _write(p, raw=json.dumps({"last_scan": ancient}))
+        mod.SCANS = [{"name": "fixture-scan", "state": p,
+                      "cadence_hours": 24, "hint": "HINT"}]   # no flag at all
+        mod._node_skips_scans = lambda: True
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.main()
+        assert buf.getvalue().strip().startswith("SCANSTALE")
+
+
 def test_real_world_shape_without_suspended_is_reported():
     """The shape that actually exists on disk must reach the owner, not be silently dropped.
 
@@ -362,6 +404,8 @@ TESTS = [
     test_roaming_node_quiet_while_owner_merely_late,
     test_roaming_node_respects_suspended,
     test_roaming_node_ignores_state_it_does_not_carry,
+    test_roaming_node_silent_for_scans_whose_state_never_syncs,
+    test_roaming_observable_defaults_true,
     test_real_world_shape_without_suspended_is_reported,
     test_roaming_message_does_not_assert_a_single_cause,
     test_fresh_scan_is_silent,
