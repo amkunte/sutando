@@ -1527,6 +1527,35 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
+def _core_recently_started(within_s: float, workspace: Optional[Path] = None) -> bool:
+    """True if any core booted less than `within_s` ago.
+
+    core-status.json survives a restart, so a fresh core inherits the previous
+    session's final "idle" and looks stale until its first pass writes. Without
+    this, every restart emits a spurious idle warning that clears itself ~10
+    minutes later — a flap, and --notify-discord would post both transitions.
+
+    Reads `started_at` from the same `state/cores/*.alive` heartbeats that
+    _any_core_alive() uses. Fails OPEN (returns False, i.e. does not suppress)
+    when the directory, the field, or the JSON is missing — a missing heartbeat
+    must never mask a genuinely dead loop.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return False
+    now = time.time()
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            started = json.loads(alive_file.read_text()).get("started_at")
+            if isinstance(started, (int, float)) and 0 <= now - started < within_s:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
     """True when the owner has intentionally stopped the loop, so idleness is expected.
 
@@ -1577,7 +1606,9 @@ def check_core_proactive_loop(threshold_sec: int = 600, idle_threshold_sec: int 
         if not isinstance(ts, (int, float)):
             return {"name": name, "status": "ok", "detail": "idle, no ts"}
         idle_age = int(time.time() - ts)
-        if idle_age > idle_threshold_sec and not _loop_deliberately_paused():
+        if (idle_age > idle_threshold_sec
+                and not _loop_deliberately_paused()
+                and not _core_recently_started(idle_threshold_sec)):
             return {
                 "name": name, "status": "warn",
                 "detail": (f"loop idle for {idle_age}s (> {idle_threshold_sec}s) — "

@@ -95,6 +95,37 @@ def test_supervisor_stale_warns():
     assert "stale" in r["detail"]
 
 
+def _alive(ws, started_ago):
+    d = ws / "state" / "cores"
+    d.mkdir(exist_ok=True)
+    (d / "testhost.alive").write_text(
+        json.dumps({"host": "testhost", "started_at": time.time() - started_ago})
+    )
+
+
+def test_stale_idle_suppressed_right_after_a_core_restart():
+    """core-status.json survives a restart; a fresh core inherits a stale idle."""
+    mod = _load(); ws = _ws(mod)
+    _status(ws, "idle", 5400)
+    _alive(ws, 60)            # core booted a minute ago
+    assert mod.check_core_proactive_loop()["status"] == "ok"
+
+
+def test_stale_idle_still_warns_when_the_core_is_long_running():
+    """The suppressor must not mask a genuinely dead loop on an old core."""
+    mod = _load(); ws = _ws(mod)
+    _status(ws, "idle", 5400)
+    _alive(ws, 86400)         # core up for a day
+    assert mod.check_core_proactive_loop()["status"] == "warn"
+
+
+def test_boot_grace_fails_open_when_heartbeat_is_missing():
+    mod = _load(); ws = _ws(mod)
+    _status(ws, "idle", 5400)
+    # no state/cores at all
+    assert mod.check_core_proactive_loop()["status"] == "warn"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
