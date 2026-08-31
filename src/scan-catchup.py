@@ -23,7 +23,9 @@ Exit 0 always (never break the loop).
 
 Roaming gate: a node that should NOT run skill scans (e.g. Maverick, which roams
 with the owner while Goose stays home and owns the scans) sets SKIP_SKILL_SCANS=1
-(env or .env file). When set, main() returns silently. Mirrors the
+(env or .env file). When set, this node never scans -- but it does still check
+whether the owner node has stopped, emitting `SCANSTALE <name> :: <why>` when the
+state it pulled via fleet-sync has gone far past cadence. Mirrors the
 SKIP_SCHEDULED_DELIVERIES gate in scheduled-catchup.py.
 """
 from __future__ import annotations
@@ -66,6 +68,9 @@ SCANS = [
     },
     {
         "name": "karts-air",
+        # roaming_observable=False: state file is gitignored in the fleet repo, so a roaming node
+        # only ever sees its own never-refreshed copy.
+        "roaming_observable": False,
         "state": claude_home_path("skills/karts-air/state/karts-air-data.json"),
         "cadence_hours": 24,
         "hint": "Run the Cirrus SR22T deal-hunter per the karts-air skill's scan-prompt.md; "
@@ -73,6 +78,9 @@ SCANS = [
     },
     {
         "name": "frontier-scan",
+        # roaming_observable=False: no fleet-sync entry at all, so a roaming node
+        # only ever sees its own never-refreshed copy.
+        "roaming_observable": False,
         "state": REPO_DIR / "skills/frontier-scan/state/seen.json",
         "cadence_hours": 168,  # weekly
         "hint": "Run the Frontier Scan per skills/frontier-scan/scan-prompt.md; "
@@ -81,6 +89,11 @@ SCANS = [
 ]
 
 GRACE = 1.5  # flag only after 1.5x cadence elapsed (absorbs one missed tick)
+
+# Roaming node: only speak when the owner node looks DOWN, not merely late.
+# Deliberately much wider than GRACE -- GRACE absorbs one missed tick, this has
+# to absorb the owner node being legitimately off for a while.
+ROAMING_STALE_MULT = 4
 
 
 def _node_skips_scans() -> bool:
@@ -129,10 +142,68 @@ def _blocked_sources(data: dict) -> list[str]:
     return []
 
 
+def _report_owner_node_stall(now: datetime) -> None:
+    """Roaming node: do not scan, but do not go blind either.
+
+    A roaming node pulls the owner node's scan state via fleet-sync, so it is
+    already holding the evidence that the owner node stopped -- it was simply
+    never allowed to look at it. `main()` returned before reading a single
+    `last_scan`, which is why #orders/#parcels/#travel went dark for three days
+    after the home node's session ended on 2026-08-17: the only node still
+    running was the one node gated out of noticing.
+
+    Emits SCANSTALE, never SCANDUE. This node must not run the scan -- that is
+    what SKIP_SKILL_SCANS exists to prevent, and a second runner double-posts to
+    the channel.
+
+    It reports an OBSERVATION, not a diagnosis. `last_scan` freshness here is a
+    function of two independent systems -- the owner node scanning, and fleet-sync
+    delivering -- and this script can see neither. An earlier draft asserted "the
+    owner node has probably stopped"; kill the fleet-sync clone and that sentence
+    sends the owner to fix a machine that is fine. Naming both candidates costs a
+    clause and cannot be wrong.
+
+    Repetition is the CONSUMER's problem, deliberately. This script stays
+    read-only (see the scan-catchup entry in tests/state-paths-adoption.test.py's
+    ALLOWLIST: it composes skill-local state and owns no workspace runtime-state,
+    so a dedup sentinel does not belong here). The proactive loop already has
+    surface-once-per-changed-set machinery in step 6.5; step 2.6 routes these
+    lines through it.
+
+    A state file this node does not carry is skipped, not flagged. fleet-sync
+    only syncs manifest-listed items, so absence here is a gap in what was
+    pulled, not evidence about the owner node.
+    """
+    for s in SCANS:
+        try:
+            data = json.loads(s["state"].read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("suspended"):
+            continue
+        if not s.get("roaming_observable", True):
+            # This scan's state never reaches a roaming node, so the file being
+            # aged here is this node's OWN copy and will never refresh. Ageing it
+            # produces an alert that cannot clear no matter what the owner node
+            # does -- which trains the reader to ignore the whole SCANSTALE class.
+            continue
+        last = _parse(data.get("last_scan"))
+        if last is None:
+            continue
+        hours = (now - last).total_seconds() / 3600.0
+        if hours > s["cadence_hours"] * ROAMING_STALE_MULT:
+            print(f"SCANSTALE {s['name']} :: last_scan has not advanced in "
+                  f"{hours:.1f}h (cadence {s['cadence_hours']}h, flagged past "
+                  f"{ROAMING_STALE_MULT}x) and this node is gated out of scanning. "
+                  f"Either the owner node stopped or fleet-sync stopped delivering "
+                  f"-- check both. Do NOT scan here (double-post).")
+
+
 def main() -> None:
-    if _node_skips_scans():
-        return
     now = datetime.now(timezone.utc)
+    if _node_skips_scans():
+        _report_owner_node_stall(now)
+        return
     for s in SCANS:
         try:
             data = json.loads(s["state"].read_text())
