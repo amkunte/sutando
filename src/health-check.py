@@ -1556,6 +1556,32 @@ def _core_recently_started(within_s: float, workspace: Optional[Path] = None) ->
     return False
 
 
+def _sentinel_unexpired(path) -> bool:
+    """True when `path` exists AND the ISO-8601 expiry inside it is still future.
+
+    Both sentinels this reads carry their expiry as file CONTENT, not as mtime:
+    `scripts/presenter-mode.sh` writes an ISO timestamp and its header states
+    "Any script reading it must handle a stale sentinel (ignore if expired)";
+    Sutando.app writes `loop-paused-until.sentinel` the same way (see
+    `src/Sutando/main.swift` — "Sentinel format: ISO-8601 expiry timestamp").
+
+    This mirrors `presenter_mode_active()` in src/check-pending-questions.py,
+    including its malformed-content guard: without the leading-digit check,
+    content like "garbage" compares GREATER than any real timestamp
+    ("g" > "2" in ASCII) and the sentinel would read as active forever.
+    """
+    try:
+        if not path.exists():
+            return False
+        expire_iso = path.read_text().strip()
+        if not expire_iso or not expire_iso[0].isdigit():
+            return False
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return now_iso < expire_iso
+    except Exception:
+        return False
+
+
 def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
     """True when the owner has intentionally stopped the loop, so idleness is expected.
 
@@ -1564,13 +1590,8 @@ def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
     would read as a dead loop.
     """
     ws = WORKSPACE_DIR if workspace is None else workspace
-    if (ws / "state" / "presenter-mode.sentinel").exists():
-        return True
-    pause = ws / "state" / "loop-paused-until.sentinel"
-    try:
-        return pause.exists() and pause.stat().st_mtime > time.time()
-    except OSError:
-        return False
+    return (_sentinel_unexpired(ws / "state" / "presenter-mode.sentinel")
+            or _sentinel_unexpired(ws / "state" / "loop-paused-until.sentinel"))
 
 
 def check_core_proactive_loop(threshold_sec: int = 600, idle_threshold_sec: int = 1800) -> dict:
