@@ -126,11 +126,26 @@ def case_b_status_malformed() -> list[str]:
 
 
 def case_c_status_not_running() -> list[str]:
+    """Idle is only benign while it is RECENT.
+
+    This case used to assert "idle should be ok regardless of ts". That was
+    the exact blindness 7f471cb9 removed: a loop that dies right after a pass
+    completes leaves status=idle forever, and "regardless of ts" made that
+    indistinguishable from a healthy pause. Updated with the behaviour change
+    rather than deleted -- both directions are asserted so the suite can still
+    tell "honours the age" from "ignores the field".
+    """
     fails = []
-    # Idle status — even with a very old ts, should be ok.
-    r = with_repo_override({"status": "idle", "ts": int(time.time()) - 86400})
+    # Fresh idle: a pass just finished. Still ok.
+    r = with_repo_override({"status": "idle", "ts": int(time.time()) - 60})
     if r["status"] != "ok":
-        fails.append(f"c) status=idle should be ok regardless of ts, got {r['status']}")
+        fails.append(f"c) fresh idle should be ok, got {r['status']}")
+    # Day-old idle: no pass has STARTED since the last one ended -> warn.
+    r = with_repo_override({"status": "idle", "ts": int(time.time()) - 86400})
+    if r["status"] != "warn":
+        fails.append(f"c) day-old idle should warn (stopped loop), got {r['status']}")
+    elif "idle for" not in r.get("detail", ""):
+        fails.append(f"c) warn detail should name the idle age, got {r.get('detail')!r}")
     return fails
 
 

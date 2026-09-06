@@ -28,6 +28,7 @@ import tempfile
 import socket
 import subprocess
 import sys
+import datetime
 import time
 import urllib.request
 from pathlib import Path
@@ -1527,7 +1528,89 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
-def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
+def _core_recently_started(within_s: float, workspace: Optional[Path] = None) -> bool:
+    """True if any core booted less than `within_s` ago.
+
+    core-status.json survives a restart, so a fresh core inherits the previous
+    session's final "idle" and looks stale until its first pass writes. Without
+    this, every restart emits a spurious idle warning that clears itself ~10
+    minutes later — a flap, and --notify-discord would post both transitions.
+
+    Reads `started_at` from the same `state/cores/*.alive` heartbeats that
+    _any_core_alive() uses. Fails OPEN (returns False, i.e. does not suppress)
+    when the directory, the field, or the JSON is missing — a missing heartbeat
+    must never mask a genuinely dead loop.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    cores_dir = workspace / "state" / "cores"
+    if not cores_dir.is_dir():
+        return False
+    now = time.time()
+    for alive_file in cores_dir.glob("*.alive"):
+        try:
+            started = json.loads(alive_file.read_text()).get("started_at")
+            if isinstance(started, (int, float)) and 0 <= now - started < within_s:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _sentinel_unexpired(path) -> bool:
+    """True when `path` exists AND the ISO-8601 expiry inside it is still future.
+
+    Both sentinels carry their expiry as file CONTENT, not as mtime:
+    `scripts/presenter-mode.sh` writes an ISO timestamp and its header states
+    "Any script reading it must handle a stale sentinel (ignore if expired)";
+    Sutando.app writes `loop-paused-until.sentinel` the same way (see
+    `src/Sutando/main.swift` -- "Format: ISO-8601 expiry timestamp (UTC)").
+
+    Compared as INSTANTS, not as strings. The two writers do not share a
+    serializer: the shell one emits `...Z`, while Swift's ISO8601DateFormatter
+    emits a numeric offset in some configurations. A naive string compare is
+    right for `Z` and `+00:00` but silently wrong for a non-zero offset --
+    `2026-09-06T02:20:05-07:00` is the same instant as `...T09:20:05Z` yet
+    sorts BEFORE it, so a live pause would read as expired. Parsing removes
+    the dependency on which format the app happens to emit.
+
+    Note for py3.9 (the system interpreter here): `datetime.fromisoformat`
+    does not accept a `Z` suffix until 3.11, hence the explicit normalisation.
+    Use `timezone.utc`, never `datetime.UTC` (3.11+).
+
+    Malformed content fails CLOSED (returns False -> the caller warns).
+    A liveness check that cries wolf is recoverable; one muted forever by a
+    junk file is the failure this whole change exists to remove.
+    """
+    try:
+        if not path.exists():
+            return False
+        raw = path.read_text().strip()
+        if not raw or not raw[0].isdigit():
+            return False
+        if raw.endswith(("Z", "z")):
+            raw = raw[:-1] + "+00:00"
+        expiry = datetime.datetime.fromisoformat(raw)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+        return expiry > datetime.datetime.now(datetime.timezone.utc)
+    except Exception:
+        return False
+
+
+def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
+    """True when the owner has intentionally stopped the loop, so idleness is expected.
+
+    Mirrors the proactive-loop skill's own skip conditions (c) and (d): presenter
+    mode, and an explicit future-dated pause. Without this, a deliberate pause
+    would read as a dead loop.
+    """
+    ws = WORKSPACE_DIR if workspace is None else workspace
+    return (_sentinel_unexpired(ws / "state" / "presenter-mode.sentinel")
+            or _sentinel_unexpired(ws / "state" / "loop-paused-until.sentinel"))
+
+
+def check_core_proactive_loop(threshold_sec: int = 600, idle_threshold_sec: int = 1800) -> dict:
     """Detect a stuck core proactive loop via stale core-status.json.
 
     The proactive loop writes core-status.json at every state transition
@@ -1552,6 +1635,24 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
         return {"name": name, "status": "ok", "detail": f"core-status.json unreadable: {str(e)[:60]}"}
     state = data.get("status")
     ts = data.get("ts")
+    if state == "idle":
+        # An idle loop that never woke again is indistinguishable from a dead one:
+        # the loop writes "idle" at the END of every pass, so a permanently-stopped
+        # loop leaves a permanently-valid-looking "idle". Only a *fresh* idle is
+        # healthy. Suppressed while the owner has deliberately paused the loop.
+        if not isinstance(ts, (int, float)):
+            return {"name": name, "status": "ok", "detail": "idle, no ts"}
+        idle_age = int(time.time() - ts)
+        if (idle_age > idle_threshold_sec
+                and not _loop_deliberately_paused()
+                and not _core_recently_started(idle_threshold_sec)):
+            return {
+                "name": name, "status": "warn",
+                "detail": (f"loop idle for {idle_age}s (> {idle_threshold_sec}s) — "
+                           "last pass completed but no pass has started since; "
+                           "session crons may have expired (CronCreate auto-expires at 7d)"),
+            }
+        return {"name": name, "status": "ok", "detail": f"idle ({idle_age}s ago)"}
     if state != "running":
         return {"name": name, "status": "ok", "detail": f"status={state}"}
     if not isinstance(ts, (int, float)):
@@ -1567,7 +1668,7 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
-def check_core_supervisor() -> dict:
+def check_core_supervisor(supervisor_stale_sec: int = 600) -> dict:
     """Surface the core-supervisor (Agent Shepherd M1) state for OSS users.
 
     The monitor (core-input-watch.py) writes state/core-supervisor.json with
@@ -1590,6 +1691,20 @@ def check_core_supervisor() -> dict:
         data = json.loads(sig_path.read_text())
     except Exception as e:
         return {"name": name, "status": "ok", "detail": f"core-supervisor.json unreadable: {str(e)[:60]}"}
+    # The payload carries no timestamp, so freshness has to come from the path.
+    # Without this, a monitor that died months ago still reports its last-known
+    # state as though it were current.
+    try:
+        sig_age = int(time.time() - sig_path.stat().st_mtime)
+    except OSError:
+        sig_age = 0
+    if sig_age > supervisor_stale_sec:
+        return {
+            "name": name, "status": "warn",
+            "detail": (f"core-supervisor.json is {sig_age // 3600}h stale — "
+                       "core-input-watch.py is not running; the state below is "
+                       "last-known, not current"),
+        }
     state = data.get("state", "unknown")
     detail = state
     prompt = data.get("prompt")
