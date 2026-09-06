@@ -66,8 +66,21 @@ def test_stale_idle_warns():
 def test_stale_idle_suppressed_while_deliberately_paused():
     mod = _load(); ws = _ws(mod)
     _status(ws, "idle", 5400)
-    (ws / "state" / "presenter-mode.sentinel").write_text("")
+    # A real presenter sentinel holds an ISO-8601 expiry (scripts/presenter-mode.sh);
+    # an empty file is malformed and must NOT read as paused. See
+    # tests/loop-paused-sentinel-expiry.test.py.
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
+    (ws / "state" / "presenter-mode.sentinel").write_text(future + "\n")
     assert mod.check_core_proactive_loop()["status"] == "ok"
+
+
+def test_stale_idle_still_warns_when_the_pause_has_expired():
+    """A sentinel left behind past its window must not mute the check forever."""
+    mod = _load(); ws = _ws(mod)
+    _status(ws, "idle", 5400)
+    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+    (ws / "state" / "presenter-mode.sentinel").write_text(past + "\n")
+    assert mod.check_core_proactive_loop()["status"] == "warn"
 
 
 def test_stale_running_still_warns():
