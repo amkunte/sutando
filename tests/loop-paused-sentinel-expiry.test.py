@@ -64,3 +64,32 @@ for junk in ("garbage", "", "   ", "not-a-date"):
         f"malformed sentinel {junk!r} must not read as paused ('g' > '2' in ASCII)"
 
 print("loop-paused-sentinel-expiry: 10 assertions passed")
+
+# --- offset-format robustness: the two writers do not share a serializer ----
+# scripts/presenter-mode.sh emits "...Z"; Swift's ISO8601DateFormatter emits a
+# numeric offset in some configurations. All three spellings of the SAME future
+# instant must read identically, and a non-zero offset must not be misread.
+import datetime as _dt
+_utc = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=30)
+for label, text in (
+    ("Z suffix",      _utc.strftime("%Y-%m-%dT%H:%M:%SZ")),
+    ("+00:00 offset", _utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")),
+    ("-07:00 offset", _utc.astimezone(_dt.timezone(_dt.timedelta(hours=-7)))
+                          .strftime("%Y-%m-%dT%H:%M:%S-07:00")),
+    ("+05:30 offset", _utc.astimezone(_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
+                          .strftime("%Y-%m-%dT%H:%M:%S+05:30")),
+):
+    assert paused(ws_with("loop-paused-until.sentinel", text + "\n")) is True, \
+        f"live pause written as {label} ({text}) must read as paused"
+
+# and the same instant in the PAST must read expired in every spelling
+_old = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=1)
+for label, text in (
+    ("Z suffix",      _old.strftime("%Y-%m-%dT%H:%M:%SZ")),
+    ("-07:00 offset", _old.astimezone(_dt.timezone(_dt.timedelta(hours=-7)))
+                          .strftime("%Y-%m-%dT%H:%M:%S-07:00")),
+):
+    assert paused(ws_with("loop-paused-until.sentinel", text + "\n")) is False, \
+        f"expired pause written as {label} ({text}) must read as expired"
+
+print("offset-format robustness: 6 further assertions passed")

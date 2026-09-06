@@ -28,6 +28,7 @@ import tempfile
 import socket
 import subprocess
 import sys
+import datetime
 import time
 import urllib.request
 from pathlib import Path
@@ -1556,6 +1557,47 @@ def _core_recently_started(within_s: float, workspace: Optional[Path] = None) ->
     return False
 
 
+def _sentinel_unexpired(path) -> bool:
+    """True when `path` exists AND the ISO-8601 expiry inside it is still future.
+
+    Both sentinels carry their expiry as file CONTENT, not as mtime:
+    `scripts/presenter-mode.sh` writes an ISO timestamp and its header states
+    "Any script reading it must handle a stale sentinel (ignore if expired)";
+    Sutando.app writes `loop-paused-until.sentinel` the same way (see
+    `src/Sutando/main.swift` -- "Format: ISO-8601 expiry timestamp (UTC)").
+
+    Compared as INSTANTS, not as strings. The two writers do not share a
+    serializer: the shell one emits `...Z`, while Swift's ISO8601DateFormatter
+    emits a numeric offset in some configurations. A naive string compare is
+    right for `Z` and `+00:00` but silently wrong for a non-zero offset --
+    `2026-09-06T02:20:05-07:00` is the same instant as `...T09:20:05Z` yet
+    sorts BEFORE it, so a live pause would read as expired. Parsing removes
+    the dependency on which format the app happens to emit.
+
+    Note for py3.9 (the system interpreter here): `datetime.fromisoformat`
+    does not accept a `Z` suffix until 3.11, hence the explicit normalisation.
+    Use `timezone.utc`, never `datetime.UTC` (3.11+).
+
+    Malformed content fails CLOSED (returns False -> the caller warns).
+    A liveness check that cries wolf is recoverable; one muted forever by a
+    junk file is the failure this whole change exists to remove.
+    """
+    try:
+        if not path.exists():
+            return False
+        raw = path.read_text().strip()
+        if not raw or not raw[0].isdigit():
+            return False
+        if raw.endswith(("Z", "z")):
+            raw = raw[:-1] + "+00:00"
+        expiry = datetime.datetime.fromisoformat(raw)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+        return expiry > datetime.datetime.now(datetime.timezone.utc)
+    except Exception:
+        return False
+
+
 def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
     """True when the owner has intentionally stopped the loop, so idleness is expected.
 
@@ -1564,13 +1606,8 @@ def _loop_deliberately_paused(workspace: Optional[Path] = None) -> bool:
     would read as a dead loop.
     """
     ws = WORKSPACE_DIR if workspace is None else workspace
-    if (ws / "state" / "presenter-mode.sentinel").exists():
-        return True
-    pause = ws / "state" / "loop-paused-until.sentinel"
-    try:
-        return pause.exists() and pause.stat().st_mtime > time.time()
-    except OSError:
-        return False
+    return (_sentinel_unexpired(ws / "state" / "presenter-mode.sentinel")
+            or _sentinel_unexpired(ws / "state" / "loop-paused-until.sentinel"))
 
 
 def check_core_proactive_loop(threshold_sec: int = 600, idle_threshold_sec: int = 1800) -> dict:
