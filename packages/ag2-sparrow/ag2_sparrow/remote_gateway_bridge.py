@@ -42,6 +42,7 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
 """
@@ -50,8 +51,10 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import json
 import os
+import stat
 import uuid
 import re
 import shlex
@@ -59,41 +62,21 @@ import signal
 import socket
 import sys
 import tempfile
+import select
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 # Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
 # publishes AAAA records, but some hosts have IPv6 black-holed at the network
-# (the SYN is silently dropped, not refused). Python's getaddrinfo returns v6
-# first, so each fresh urllib connection — this bridge opens one per long-poll
-# AND one per outbound send, with no keep-alive — hangs on the dead v6 address
-# for the full TCP connect timeout (~26s observed) before falling back to v4,
-# which connects in <1s. That timeout is added to EVERY inbound message and
-# EVERY reply, so the owner sees ~26s each way and messages look dropped. We
-# filter getaddrinfo to A (v4) records for the gateway host so the dead v6 path
-# is never tried; we keep the original result when there is no v4 address, so a
-# genuinely v6-only destination still resolves. Opt out with
-# REMOTE_GATEWAY_ALLOW_IPV6=1 (hosts with working v6 lose nothing either way).
-# DNS resolution has NO native timeout: getaddrinfo blocks the caller until the
-# resolver answers or the OS gives up (which can be minutes, or never on a
-# captive portal / dropped link mid-query). urllib's socket timeout covers
-# connect+read but NOT name resolution — so without a bound, a hung resolver
-# wedges the long-poll loop indefinitely with no "reconnecting" status write and
-# no self-recovery (observed on a tester's machine 2026-07-25: gateway process
-# stuck, DNS for space.ag2.space failing, UI showing "reconnecting" forever).
-# Bounding it lets the loop raise → emit gateway-status reconnecting → back off →
-# retry, so the connection self-heals the moment DNS recovers. Override the bound
-# with REMOTE_GATEWAY_DNS_TIMEOUT (seconds); 0/negative disables it.
 _DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
 _PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
 # Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
 # already our wrapper — capturing it blindly makes _resolve_bounded call itself
-# (RecursionError). The installed wrapper carries the TRUE original on its
-# `_ag2_orig_getaddrinfo` attribute, so re-executions pick that up instead.
 _orig_getaddrinfo = getattr(socket.getaddrinfo, "_ag2_orig_getaddrinfo", socket.getaddrinfo)
 
 
@@ -110,11 +93,6 @@ class _InflightResolve:
 
 # Single-flight registry: at most ONE resolver thread exists per distinct
 # (host, args) key. While a call is outstanding — including one wedged on a
-# hung system resolver — every retry for the same key attaches to it instead
-# of spawning another thread, so a persistently hung resolver pins exactly
-# one thread no matter how many times the poll loop retries. The worker
-# removes its slot when the underlying call finally returns, so recovery
-# drains cleanly and the next call starts fresh.
 _INFLIGHT: dict = {}
 _INFLIGHT_LOCK = threading.Lock()
 
@@ -167,8 +145,140 @@ def _resolve_bounded(host, *args, **kwargs):
     return call.result
 
 
+# Resolver fallback: the OS cache can hold a stuck negative answer for the relay
+# host while the configured nameserver still resolves it — ask that one directly.
+_FALLBACK_TTL_S = float(os.environ.get("REMOTE_GATEWAY_DNS_FALLBACK_TTL") or "300")
+_FALLBACK_QUERY_TIMEOUT_S = 2.0
+_RESOLV_CONF = "/etc/resolv.conf"
+_fallback_cache: dict = {}  # host -> (expires_at_monotonic, [ip, ...])
+_fallback_lock = threading.Lock()
+
+
+def _system_nameservers(path=None):
+    """IPv4 nameservers from resolv.conf in file order; [] when unreadable.
+    IPv6 entries are skipped: the query socket is AF_INET only."""
+    out = []
+    try:
+        with open(path or _RESOLV_CONF) as fh:
+            for ln in fh:
+                parts = ln.split()
+                if len(parts) >= 2 and parts[0] == "nameserver" and ":" not in parts[1]:
+                    out.append(parts[1])
+    except OSError:
+        pass
+    return out
+
+
+def _skip_name(data, i):
+    while True:
+        n = data[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += 1 + n
+
+
+def _encode_qname(host):
+    out = b""
+    for label in host.rstrip(".").split("."):
+        b = label.encode("idna")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _parse_a_records(data, qid, qname=None):
+    """A-record IPs from one DNS response; [] unless id, QR bit, RCODE and
+    the echoed question all match what was asked."""
+    import struct
+    try:
+        rid, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", data[:12])
+        if rid != qid or not flags & 0x8000 or flags & 0x000F:
+            return []
+        i = 12
+        for _ in range(qd):
+            end = _skip_name(data, i)
+            if qname is not None and data[i:end].lower() != qname.lower():
+                return []
+            i = end + 4
+        ips = []
+        for _ in range(an):
+            i = _skip_name(data, i)
+            rtype, _cls, _ttl, rdlen = struct.unpack("!HHIH", data[i:i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(data[i:i + 4]))
+            i += rdlen
+        return ips
+    except (IndexError, struct.error, OSError):
+        return []
+
+
+def _dns_a_query(host, nameserver, timeout=None, port=53):
+    """One UDP A query (RFC 1035), stdlib only; [] on any failure."""
+    import secrets
+    import struct
+    qid = secrets.randbelow(0xFFFF) + 1
+    qname = _encode_qname(host)
+    q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(_FALLBACK_QUERY_TIMEOUT_S if timeout is None else timeout)
+        # connect(): the kernel then drops datagrams from any other peer.
+        s.connect((nameserver, port))
+        s.send(q)
+        data = s.recv(4096)
+    except OSError:
+        return []
+    finally:
+        s.close()
+    return _parse_a_records(data, qid, qname)
+
+
+def _fallback_resolve(host):
+    """IPs for host via the system nameservers, cached; [] when none answers."""
+    now = time.monotonic()
+    with _fallback_lock:
+        hit = _fallback_cache.get(host)
+        if hit and hit[0] > now:
+            return list(hit[1])
+    for ns in _system_nameservers():
+        ips = _dns_a_query(host, ns)
+        if ips:
+            with _fallback_lock:
+                _fallback_cache[host] = (now + _FALLBACK_TTL_S, ips)
+            _log(f"system resolver failed for {host}; nameserver {ns} answered "
+                 f"{ips[0]} — using it for {_FALLBACK_TTL_S:.0f}s")
+            return ips
+    return []
+
+
+def _is_ip_literal(host):
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(fam, host)
+            return True
+        except (OSError, TypeError, ValueError):
+            pass
+    return False
+
+
 def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-    infos = _resolve_bounded(host, *args, **kwargs)
+    try:
+        infos = _resolve_bounded(host, *args, **kwargs)
+    except socket.gaierror as err:
+        ips = []
+        if isinstance(host, str) and host and not _is_ip_literal(host):
+            try:
+                ips = _fallback_resolve(host)
+            except Exception:  # noqa: BLE001 — fallback must never mask the gaierror
+                ips = []
+        if not ips:
+            raise err
+        infos = []
+        for ip in ips:
+            # A literal IP never touches DNS: this only shapes the tuples.
+            infos.extend(_orig_getaddrinfo(ip, *args, **kwargs))
     if _PREFER_V4 and host and "ag2.space" in str(host):
         v4 = [i for i in infos if i[0] == socket.AF_INET]
         return v4 or infos
@@ -180,43 +290,57 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 
 # resolve_workspace lives alongside this file in src/ — put THIS directory on
 # the path (no repo-walking; the old triple-parent form predated the move into
-# src/ and pointed outside the repo).
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
+from .local_task_protocol import find_archived_task
 from . import local_task_protocol
-from .result_markers import parse_markers
+from .result_markers import parse_markers, render_skill_prelude
+from . import undelivered_quarantine
+from .team_guardrail import (team_guardrail_lines, engage_rulebook,
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+from . import team_result_guard
+from .outbox import DeliveryOutcome, record_delivered
+from .outbox_adapter import classify_response
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
+from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
+                            RetryPolicy)
+from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
+from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 
 TASKS_DIR = _task_dir()
+# Written by THIS bridge on replay, not by an agent — the guard must not
+# mistake its own dedup control for collaborator output.
+GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
+
+
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
+_WITHHELD_TASK_OUTPUT: "dict[str, tuple]" = {}
+_WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
+_WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
+_GATEWAY_OWNER_DM_HINT = ""
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
-# Terminal resting place for proactive nudges that can never be delivered
-# (e.g. a body too large for any Matrix event). Kept separate from `archive/`
-# so "delivered" and "given up on" are never confused when auditing.
-UNDELIVERABLE_RESULTS_DIR = ARCHIVE_RESULTS_DIR / "undeliverable"
+# Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
+# retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
+_PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
+# tids THIS process redelivered. Not a file: the collaborator path has full
+# workspace write, so any sidecar it can create is provenance it can forge.
+_REDELIVERED: "set[str]" = set()
+try:  # pragma: no cover - exercised by whichever context imports it
+    from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
+except ImportError:  # pragma: no cover - flat src/ import path
+    from send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
+
+# Terminal resting place for proactive nudges that can never be delivered.
+# results/undelivered/ is the repo-wide quarantine convention — health-check's
+UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
-# via its own REMOTE_TASK_TOKEN env. GATEWAY_INSTANCE names this process's
-# instance; it suffixes the per-BRIDGE state files below and the singleton lock
-# role, so two instances never clobber each other's ledgers or contend one
-# lock. Unset (default) keeps every filename byte-identical to before — the
-# single-bridge install sees zero change. Deliberately NOT suffixed:
-# tasks/ + results/ (the shared task bus — the core is one consumer),
-# last-owner-activity.json (owner presence is one signal regardless of which
-# door the message came through), and core-status.json (the core's, not ours).
-# THE instance-name contract — single source of truth. The import guard below
-# and _LOCAL_TID_RE both derive from this pattern, because every drift between
-# them has produced the same bug class (queue + ACK + silently-stranded
-# results): first a length mismatch (>32 chars, review P1 round 5), then a
-# charset mismatch (str.isalnum() accepts Unicode letters the ASCII regex
-# rejects — GATEWAY_INSTANCE=é imported fine and stranded results, round 6).
-# ASCII [A-Za-z0-9_-], 1-32 chars, and nothing else — if this ever needs to
-# change, it changes HERE and both consumers follow.
 _INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
 GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
@@ -272,39 +396,40 @@ def _valid_local_tid(tid: str) -> bool:
     m = _LOCAL_TID_RE.fullmatch(tid)
     return bool(m) and m.group(1) not in (".", "..")
 
+
+def _task_pending(tid: str) -> bool:
+    """Is this task still live in tasks/, under ANY of its names?
+
+    A pooled task is renamed twice -- unassigned -> `.assigned-<core>` (lead
+    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
+    "is this still being worked?" must accept all three, so the question has
+    one owner: a state missed here reads as finished, which drops a reply
+    mid-flight or re-queues work another core already holds."""
+    return ((TASKS_DIR / f"{tid}.txt").exists()
+            or any(TASKS_DIR.glob(f"{tid}.assigned-*"))
+            or any(TASKS_DIR.glob(f"{tid}.claimed-*")))
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
-# gateway-pulled tasks only — we must NOT blindly POST every results/ file, or we'd
-# cross-send other channels' (Discord/Telegram) results to the gateway. The
-# per-instance suffix is what keeps a second bridge from claiming results this
-# instance delegated (each instance only POSTs ids in ITS OWN ledger).
 INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
-# endpoint (POST /v1/rooms/{room}/media) while text results go to /v1/results
-# (which resolves the room server-side). Separate file — the inflight ledger's
-# list-of-ids format stays untouched for compat.
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
+# Sidecar map {WIRE task id → {"mode": "task-media", "thread_root": …}}, committed
+# BEFORE the task is published: nothing else survives a restart to route the upload.
+TASK_MEDIA_FILE = _STATE / f"remote-task-media{_INST_SUFFIX}.json"
+# Acks the gateway has not confirmed yet, with the durability each one may claim.
+# The outbound worker retries them; a closed lease retires the record.
+PENDING_ACK_FILE = _STATE / f"remote-task-acks{_INST_SUFFIX}.json"
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
-# sutando-ctl.sh) reads this to show connected-vs-reconnecting instead of
-# guessing from tmux-window presence. Written on every poll outcome: connected
-# after a healthy round-trip, reconnecting in the backoff branches.
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
-# SUTANDO_SUPERVISED=1, and _log stays stdout-only — byte-identical to before.
-# Launched any other way ("bare": a hand-run of the script, a debug shell, an
-# app spawn that forgot the redirect), stdout persists nowhere — the exact
-# diagnostic hole of the 2026-07-25 tester wedge (bridge stuck 21h, zero logs
-# or discoverable status to read). So a bare launch ALSO appends every _log
-# line to <state-parent>/logs/gateway-bridge.log (<workspace>/logs/ when
-# sutando injects dirs, ~/.ag2-sparrow/logs/ under defaults), size-capped with
-# a single .1 rotation, best-effort — log I/O must never break the bridge.
 _LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
 _LOG_DIR = _STATE.parent / "logs"
 _LOG_FILE = _LOG_DIR / "gateway-bridge.log"
@@ -316,34 +441,31 @@ _EVENT_CHANNEL = None
 
 # Back-compat: instances onboarded before the AG2_REMOTE_* → REMOTE_TASK_*
 # rename still export the legacy names in their .env. Honor them as DEPRECATED
-# aliases for one release (remove next), with a one-line migration nudge, so the
-# bridge keeps connecting under any launcher. New onboards use REMOTE_TASK_*.
 _warned_legacy = set()
+
+
+def _unquote_env(v):
+    """Whitespace and surrounding quotes off a credential value.
+
+    The ONE definition every reader uses, so the env tier cannot disagree with
+    the file tiers about a quoted `.env` line.
+    """
+    return v.strip().strip("'\"") if v else v
+
+
 def _env_compat(new, old):
     v = os.environ.get(new)
     if v:
-        return v
+        return _unquote_env(v)
     v = os.environ.get(old)
     if v and old not in _warned_legacy:
         _warned_legacy.add(old)
         print(f"[remote-gateway-bridge] {old} is deprecated — rename to {new} in your .env",
               file=sys.stderr, flush=True)
-    return v
+    return _unquote_env(v)
 
 # One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
-# inside the token — nothing service-specific lives in this repo); a bare
-# secret needs REMOTE_TASK_URL alongside it.
-# The combined onboarding form is "<url>|<secret>" — the URL travels inside the
-# token. The separator is a literal "|", OR a "%7C"/"%7c" when the desktop connect
-# flow URL-encodes it (ag2space-cinny-desktop#231): "https://<gateway>/relay%7C<secret>".
-# A %7C-separated token carries no literal "|", so a naive split leaves it a bare
-# secret with an empty URL and the bridge FATALs at startup — the core looks
-# "connected" (device-connect completed) but never responds, the Vidhu-onboarding
-# failure 2026-07-24. A literal "|" is PREFERRED over %7C/%7c when both appear:
-# a raw pipe cannot legally occur inside a URL, so when one exists it IS the
-# separator — keeps a URL half carrying an encoded %7C intact (#2679; same
-# rule as the shared credential contract until PR3 delegates this parser).
 _ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
 
 
@@ -372,7 +494,6 @@ def _parse_onboarding_token(raw):
 
 # Which channels/<dir>/ this instance reads (.env fallback + access.json).
 # Env-only — the .env file can't name its own directory. Default preserves the
-# historical single-instance layout.
 CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
 
@@ -400,7 +521,7 @@ def _channel_env_candidates():
             if not ln or ln.startswith("#") or "=" not in ln:
                 continue
             key, _, val = ln.partition("=")
-            vals[key.strip()] = val.strip().strip('"').strip("'")
+            vals[key.strip()] = _unquote_env(val)
         out.append((path, vals))
     return out
 
@@ -455,30 +576,14 @@ def _token_from_ag2space_env():
                   file=sys.stderr, flush=True)
             # Carry the file's REMOTE_TASK_URL too. A combined url|secret token
             # embeds the URL (parsed downstream), but a SPLIT layout (bare token +
-            # separate REMOTE_TASK_URL) does not — and in the fallback case the env
-            # is empty, so without this the URL chain has nothing and the bridge
-            # fatals on "no gateway URL" in the exact scenario this fix targets.
             url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
             # Carry REMOTE_MEDIA_MARKER from the same file too. The bridge derives
             # its marker tag from os.environ at import (MEDIA_MARKER_TAG below), and
-            # a bare/desktop launch reaches config ONLY through this file — it never
-            # sees startup.sh's env exports, which is the one place the AG2 default
-            # is otherwise set. Without this, such a launch falls back to the
-            # provider-neutral default, the marker never matches the gateway's
-            # `[ag2space-media: …]`, and inbound image/file URLs stay unresolved in
-            # the task body — the core can't see owner-sent screenshots (owner-
-            # reported 2026-08-03). This runs at import, before MEDIA_MARKER_TAG is
-            # computed, so the tag picks it up. Provider-neutral: the VALUE lives in
-            # the channel .env, not in this generic package; and a real env var
-            # still wins (we only fill it when unset).
             _mm = vals.get("REMOTE_MEDIA_MARKER")
             if _mm and not os.environ.get("REMOTE_MEDIA_MARKER"):
                 os.environ["REMOTE_MEDIA_MARKER"] = _mm
             # Return the source file path too (main #2323): it is the durable token
             # source the auth-recovery path re-reads on rejection. In the desktop-
-            # spawned case this is the ONLY thing that arms recovery —
-            # REMOTE_TASK_TOKEN_FILE is unset there, so without carrying `path` into
-            # TOKEN_FILE the bridge keeps the historical FATAL/crash-loop behavior.
             return tok, url, path
     return "", "", ""
 
@@ -504,16 +609,7 @@ def _token_from_vault_ag2space(vault_get=None):
     without touching a real Keychain.
     """
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("channel_token.py")
         if not src:
             return ""
         if src not in sys.path:
@@ -531,7 +627,669 @@ def _token_from_vault_ag2space(vault_get=None):
     return tok
 
 
+def _team_guard_fns():
+    """Load the BUNDLED guard; an installed wheel has no monorepo src/."""
+    from .team_result_guard import (
+        classify_result_for_tier,
+        is_guarded_tier,
+        is_suppression_only,
+        journal_suppressed_result,
+        materialize_withheld_verdict,
+        resolve_access_tier,
+        sensitive_data_filter_enabled,
+        withheld_review_path,
+    )
+    return (classify_result_for_tier, materialize_withheld_verdict,
+            resolve_access_tier, sensitive_data_filter_enabled,
+            withheld_review_path, journal_suppressed_result,
+            is_suppression_only, is_guarded_tier)
+
+
+def _atomic_private_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _stage_durable(path: Path, text: str) -> "Path | None":
+    """Write `text` to a sibling temp file and fsync it; None when nothing
+    reached the disk. Staging is separate from publishing because a sidecar the
+    published file refers to has to commit in between."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Per-INVOCATION, not per-PID: the poll loop and the outbound worker both
+        # publish through here, and a shared temp name lets one rename the other's bytes.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return tmp
+    except Exception as exc:  # noqa: BLE001
+        _log(f"durable stage failed for {path.name} ({exc})")
+        return None
+
+
+def _publish_staged(tmp: Path, path: Path) -> bool:
+    """Rename a staged file into place and fsync the directory entry, so the
+    publication is durable the moment it becomes visible."""
+    try:
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"durable publish failed for {path.name} ({exc})")
+        return False
+
+
+def _durable_write(path: Path, text: str) -> bool:
+    """write temp → fsync file → rename → fsync parent directory. False when the
+    bytes did not commit, so the caller can withhold whatever they gate."""
+    tmp = _stage_durable(path, text)
+    if tmp is None:
+        return False
+    if _publish_staged(tmp, path):
+        return True
+    tmp.unlink(missing_ok=True)
+    return False
+
+
+def _read_private_json(path: Path) -> "dict | None":
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _gateway_owner() -> str:
+    global _GATEWAY_OWNER_DM_HINT
+    _GATEWAY_OWNER_DM_HINT = ""  # a lookup that never reaches a row leaves no reading behind for the caller
+    identity = _reenroll_identity()
+    answer = _req("GET", "/v1/agents")
+    agents = answer.get("agents") if isinstance(answer, dict) else None
+    if not isinstance(agents, list):
+        return ""
+    row = next((row for row in agents
+                if isinstance(row, dict) and row.get("id") == identity), None)
+    owner = str((row or {}).get("owner") or "")
+    hint = str((row or {}).get("owner_dm_room") or "")
+    _GATEWAY_OWNER_DM_HINT = hint if hint.startswith("!") else ""
+    return owner if owner.startswith("@") and ":" in owner else ""
+
+
+def _owner_review_dm(owner: str) -> str:
+    if _GATEWAY_OWNER_DM_HINT:
+        _atomic_private_json(_WITHHELD_DM_CACHE,
+                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
+        return _GATEWAY_OWNER_DM_HINT
+    cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
+    room = str(cached.get("room_id") or "")
+    if cached.get("owner") == owner and room.startswith("!"):
+        return room
+    answer = _req("POST", "/v1/room", {
+        "op": "create", "invite": [owner], "is_direct": True,
+        "name": "Private result reviews",
+        "topic": "Owner-only review of results withheld from shared rooms.",
+    }, timeout=20)
+    room = str((answer or {}).get("room_id") or "")
+    if not room.startswith("!"):
+        raise RuntimeError("gateway did not return a private review room")
+    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
+    return room
+
+
+def _review_messages(record: dict) -> list[str]:
+    rid = str(record.get("review_id") or "")
+    context = record.get("context") or {}
+    origin = _one_line(context.get("channel_id") or "").strip()
+    room_name = _one_line(context.get("room_name") or "").strip()
+    # Keep room-controlled values in code spans and neutralize backticks so
+    # room metadata cannot alter the review message's Markdown structure.
+    origin_label = origin.replace("`", "'")
+    room_label = room_name.replace("`", "'")
+    room_info = (
+        f"`{origin_label}` (name: `{room_label}`)" if room_label else f"`{origin_label}`"
+    )
+    body = str(record.get("withheld_body") or "")
+    header = (
+        f"**Private result review `{rid}`**\n\n"
+        "This result was withheld from the shared room because it may contain "
+        "sensitive information or delivery-control markers.\n\n"
+        f"Original room: {room_info}\n\n")
+    decision = (
+        "Reply directly to this message with **Yes** to confirm it should stay "
+        "private, or **No** to mark it as a false positive and publish it to the "
+        f"original room. You can also reply `Yes {rid}` or `No {rid}`."
+    )
+    # Keep each /v1/room event below the homeserver ceiling. The last event is
+    # the decision prompt and bare Yes/No reply anchor.
+    chunk_chars = 12000
+    chunks = [body[i:i + chunk_chars] for i in range(0, len(body), chunk_chars)] or [""]
+    if len(chunks) == 1:
+        # The buttons renderer replaces its fallback body; keep the candidate
+        # in a preceding event so it remains visible for review.
+        return [header + "---\n" + chunks[0] + "\n---", decision]
+    messages = [header + f"Candidate result follows in {len(chunks)} parts."]
+    messages.extend(
+        f"**`{rid}` — part {index}/{len(chunks)}**\n\n{chunk}"
+        for index, chunk in enumerate(chunks, 1))
+    messages.append(f"**`{rid}` — review decision**\n\n{decision}")
+    return messages
+
+
+def _review_buttons(review_id: str) -> dict:
+    """A2UI button macros for the existing owner-decision grammar."""
+    return {
+        "version": "0.9",
+        "type": "buttons",
+        "prompt": "Does this result contain sensitive information?",
+        "options": [
+            {"label": "Yes — keep private", "action": f"Yes {review_id}"},
+            {"label": "No — publish to room", "action": f"No {review_id}"},
+        ],
+    }
+
+
+def _route_withheld_review(path: Path) -> bool:
+    record = _read_private_json(path)
+    if not record:
+        return False
+    if record.get("status") != "pending_dm":
+        return True
+    owner = _gateway_owner()
+    if not owner:
+        raise RuntimeError("gateway returned no registered owner")
+    room = _owner_review_dm(owner)
+    answer = None
+    messages = _review_messages(record)
+    for index, message in enumerate(messages, 1):
+        payload = {
+            "op": "message", "room_id": room, "body": message,
+            "mentions": [owner] if index == len(messages) else [],
+            "dedupe_key": f"withheld-review:{record['review_id']}:{index}",
+        }
+        if index == len(messages):
+            # Same additive content mechanism as the existing room-invite card.
+            # Non-AG2 clients ignore it and retain the typed Yes/No fallback.
+            payload["extra_content"] = {
+                "space.ag2.a2ui": _review_buttons(str(record["review_id"]))}
+        answer = _req("POST", "/v1/room", payload, timeout=20)
+        if not isinstance(answer, dict) or not answer.get("ok"):
+            raise RuntimeError(f"private review DM part {index}/{len(messages)} was not accepted")
+    record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
+                   "dm_event_id": str(answer.get("event_id") or ""),
+                   "dm_sent_at": time.time()})
+    _atomic_private_json(path, record)
+    return True
+
+
+_REVIEW_DECISION_RE = re.compile(
+    r"^(yes|no)(?:\s+(wr_[0-9a-f]{16}))?[.!]?$", re.IGNORECASE)
+
+
+def _pending_review_records() -> list[tuple[Path, dict]]:
+    out = []
+    directory = _STATE / "withheld-team-results"
+    try:
+        paths = sorted(directory.glob("wr_*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        record = _read_private_json(path)
+        if record and record.get("status") in (
+                "awaiting_owner", "publish_pending", "kept_private", "published",
+                "publish_failed"):
+            out.append((path, record))
+    return out
+
+
+def _archive_resolved_review(path: Path, record: dict) -> bool:
+    if record.get("status") not in ("kept_private", "published", "publish_failed"):
+        return False
+    if record.get("card_resolution_pending"):
+        return False
+    archive = path.parent / "archive"
+    try:
+        archive.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(archive, 0o700)
+        path.replace(archive / path.name)
+    except OSError:
+        return False
+    return True
+
+
+def _decision_text(task: dict) -> str:
+    text = str(task.get("task") or "").strip()
+    # Button replies can follow the broker's quoted context envelope; only text
+    # after its exact closing marker is the decision.
+    text = re.sub(
+        r"^\[AG2 Space reply context;[^\]]*\].*?"
+        r"\[End AG2 Space reply context\]\s*",
+        "", text, count=1, flags=re.DOTALL)
+    text = re.sub(r"^\[AG2Space\s+[^\]]+\]\s*", "", text, count=1)
+    return text.strip()
+
+
+def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
+    # Re-resolve the owner tier, require the private room, and bind bare Yes/No
+    # to its review message. An explicit review id is still room-bound.
+    tier = _tier_for(task.get("user_id"), _normalized_tier(task.get("access_tier")))
+    if tier != "owner":
+        return None
+    match = _REVIEW_DECISION_RE.fullmatch(_decision_text(task))
+    if not match:
+        return None
+    answer, explicit_id = match.group(1).lower(), match.group(2)
+    room = str(task.get("channel_id") or "")
+    reply_to = str(task.get("reply_to_event") or "")
+    candidates = []
+    for path, record in _pending_review_records():
+        if room != str(record.get("dm_room_id") or ""):
+            continue
+        if str(task.get("user_id") or "") != str(record.get("owner") or ""):
+            continue
+        if explicit_id:
+            if explicit_id == record.get("review_id"):
+                candidates.append((path, record))
+        elif reply_to and reply_to == str(record.get("dm_event_id") or ""):
+            candidates.append((path, record))
+    return (*candidates[0], answer) if len(candidates) == 1 else None
+
+
+def _released_review_body(raw: str) -> str:
+    """Room text for an owner-released result. Markers are stripped, never executed:
+    the release posts to the original room only and uploads nothing."""
+    parsed = parse_markers(raw)
+    dropped = sum(1 for action in parsed.actions if action.kind == "attach")
+    if not dropped:
+        return parsed.body
+    note = f"({dropped} attachment{'' if dropped == 1 else 's'} not published)"
+    return f"{parsed.body}\n\n{note}" if parsed.body else note
+
+
+def _publish_review(path: Path, record: dict) -> bool:
+    context = record.get("context") or {}
+    room = str(context.get("channel_id") or "")
+    body = _released_review_body(str(record.get("withheld_body") or ""))
+    if not room.startswith("!") or not body:
+        record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
+                       "card_resolution_pending": True})
+        _atomic_private_json(path, record)
+        return False
+    answer = _req("POST", "/v1/room", {
+        "op": "message", "room_id": room, "body": body,
+        "dedupe_key": f"withheld-publish:{record['review_id']}",
+    }, timeout=20)
+    if not isinstance(answer, dict) or not answer.get("ok"):
+        return False
+    record.update({"status": "published", "published_at": time.time(),
+                   "published_event_id": str(answer.get("event_id") or ""),
+                   "card_resolution_pending": True})
+    _atomic_private_json(path, record)
+    return True
+
+
+def _resolved_review_body(record: dict) -> str:
+    rid = str(record.get("review_id") or "")
+    decision = str(record.get("decision") or "")
+    status = str(record.get("status") or "")
+    if decision == "sensitive":
+        outcome = "Kept private — the owner confirmed it contains sensitive information."
+    elif status == "published":
+        outcome = "Published to the original room — the owner marked it as a false positive."
+    elif status == "publish_failed":
+        outcome = "False positive recorded, but publication failed and requires attention."
+    else:
+        outcome = "False positive recorded; publication to the original room is pending."
+    return f"**Private result review `{rid}` resolved**\n\n✓ {outcome}"
+
+
+def _resolve_review_card(path: Path, record: dict) -> bool:
+    room = str(record.get("dm_room_id") or "")
+    event_id = str(record.get("dm_event_id") or "")
+    if not room.startswith("!") or not event_id.startswith("$"):
+        return False
+    answer = _req("POST", "/v1/room", {
+        "op": "edit", "room_id": room, "event_id": event_id,
+        "body": _resolved_review_body(record),
+    }, timeout=20)
+    if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
+        return False
+    record.update({"card_resolution_pending": False,
+                   "card_resolved_at": time.time(),
+                   "card_resolution_event_id": str(answer.get("event_id") or "")})
+    _atomic_private_json(path, record)
+    _archive_resolved_review(path, record)
+    return True
+
+
+def _handle_hitl_action(task: dict):
+    """An owner card click delivered on the task relay (its `hitl_action`, or a
+    reply to the card whose text is an action label). Applied to the HITL
+    store here so a click never becomes a chat task; the caller closes the
+    task with a [no-send] control result. False = an ordinary message."""
+    task_id = str(task.get("id") or "")
+    # The control record exists only for a task already consumed here (either
+    # click form, or a review decision); its form must not be re-derived.
+    if task_id and _control_result_path(task_id).is_file():
+        return "redelivered"
+    if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
+        return False
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    handler = _hitl_reply_handler(owner, log=_log) if owner else None
+    if handler is None:
+        return False  # no owner or no store on this host: the click stays an ordinary task
+    try:
+        out = handler.offer_task(task)
+    except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
+        _log(f"hitl: task-relay click {task_id} not applied: {e}")
+        return False
+    if out == "rejected":
+        return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "applied" and getattr(handler, "last_turn", False):
+        # Recorded, and the requirement asked for a turn: the same relay task goes on to
+        # the core (idempotent by id) with a header saying it is a click, not an order.
+        task["hitl_click"] = "true"
+        return False
+    if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
+        # A non-owner typed a label as a reply: that is a message, not a click
+        # to decline; it must reach _write_task like any other text.
+        return False
+    # A non-owner's real click stays consumed on purpose: a card press is not
+    # prose, so it closes [no-send] and is only logged, never a chat task.
+    return out or False
+
+
+def _handle_review_decision(task: dict) -> bool:
+    task_id = str(task.get("id") or "")
+    if task_id and _control_result_path(task_id).is_file():
+        return True
+    matched = _match_review_decision(task)
+    if matched is None:
+        return False
+    path, record, answer = matched
+    if record.get("status") in ("kept_private", "published"):
+        _queue_review_control_result(task)
+        if record.get("card_resolution_pending"):
+            _resolve_review_card(path, record)
+        return True  # delivery retry of the same owner decision
+    if answer == "yes":
+        record.update({"status": "kept_private", "resolved_at": time.time(),
+                       "decision": "sensitive", "card_resolution_pending": True})
+        _atomic_private_json(path, record)
+        _queue_review_control_result(task)
+        try:
+            _resolve_review_card(path, record)
+        except Exception as exc:  # noqa: BLE001 — durable pending state retries
+            _log(f"withheld review {record.get('review_id')} card edit deferred: {exc}")
+        return True
+    # Persist release before the network call; pending retries use a stable
+    # dedupe key so they cannot duplicate the disclosure.
+    record.update({"status": "publish_pending", "resolved_at": time.time(),
+                   "decision": "false_positive", "card_resolution_pending": True})
+    _atomic_private_json(path, record)
+    _queue_review_control_result(task)
+    try:
+        _resolve_review_card(path, record)
+        if _publish_review(path, record):
+            _resolve_review_card(path, record)
+    except Exception as exc:  # noqa: BLE001 — durable pending state retries
+        _log(f"withheld review {record.get('review_id')} publish deferred: {exc}")
+    return True
+
+
+def _retry_pending_publications() -> None:
+    for path, record in _pending_review_records():
+        if record.get("status") != "publish_pending":
+            continue
+        try:
+            if not _publish_review(path, record):
+                _log(f"withheld review {record.get('review_id')} publish still pending")
+        except Exception as exc:  # noqa: BLE001 — next poll retries
+            _log(f"withheld review {record.get('review_id')} publish retry failed: {exc}")
+
+
+def _retry_review_card_resolutions() -> None:
+    for path, record in _pending_review_records():
+        if not record.get("card_resolution_pending"):
+            _archive_resolved_review(path, record)
+            continue
+        try:
+            if not _resolve_review_card(path, record):
+                _log(f"withheld review {record.get('review_id')} card edit still pending")
+        except Exception as exc:  # noqa: BLE001 — next poll retries
+            _log(f"withheld review {record.get('review_id')} card edit retry failed: {exc}")
+
+
+def _control_result_path(task_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)[:160]
+    return _WITHHELD_CONTROL_DIR / f"{safe}.json"
+
+
+def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return
+    path = _control_result_path(task_id)
+    if not path.is_file():
+        _atomic_private_json(path, {"id": task_id, "body": body})
+
+
+def _retry_review_control_results() -> None:
+    try:
+        paths = sorted(_WITHHELD_CONTROL_DIR.glob("*.json"))[:512]
+    except OSError:
+        return
+    for path in paths:
+        record = _read_private_json(path)
+        if not record or not record.get("id"):
+            continue
+        try:
+            _req("POST", "/v1/results", {
+                "id": record["id"], "body": record.get("body") or "[no-send]"})
+            path.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 — next poll retries
+            _log(f"review control result {record.get('id')} retry deferred: {exc}")
+
+
+def _is_redelivery_control(body: str) -> bool:
+    """Compare on stripped text: `read_ready_result` strips, the constant ends
+    in a newline, so a raw `==` never matches a body that came off disk."""
+    return (body or "").strip() == GATEWAY_REDELIVERY_RESULT.strip()
+
+
+def _guarded_result_body(tid: str, body: str):
+    """Scan a non-owner result BEFORE any marker is interpreted.
+
+    Returns (safe_body, withheld_reason), or (None, reason) when the guard
+    cannot be loaded — the caller leaves the file for retry rather than
+    honouring redirect/attach actions on unscanned collaborator output.
+    """
+    # Body equality is NOT provenance; only this process's record is. Reading must
+    # not consume it — a deferred POST retries and needs the same provenance.
+    if tid in _REDELIVERED and _is_redelivery_control(body):
+        return body, None
+    if tid in _WITHHELD_TASK_OUTPUT:
+        return _WITHHELD_TASK_OUTPUT[tid]
+    try:
+        (classify, materialize, resolve, filter_enabled, review_path,
+         journal_suppression, suppression_only, guarded_tier) = _team_guard_fns()
+        from .chat_secret_filter import filter_chat_secrets
+    except Exception as exc:
+        return None, f"team_result_guard unavailable: {exc}"
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    # Absence is not owner provenance: a month-archived Team task is exactly the
+    # case that would otherwise fall open.
+    tier = resolve(tfile) if tfile is not None else "guest"
+    scan_sensitive_data = filter_enabled(tfile, tier) if tfile is not None else True
+    context = {}
+    if tfile is not None:
+        try:
+            headers = local_task_protocol.parse_task_headers_trusted(
+                tfile.read_text(encoding="utf-8", errors="replace")).headers
+            context = {key: headers.get(key, "") for key in (
+                "source", "channel_id", "room_name", "reply_to_event",
+                "source_message_id", "user_id")}
+        except OSError:
+            pass
+    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from the DELIVERY
+    # task's `<results>/<id>/` (a dedup requeue carries the original's instruction).
+    attach_roots: tuple = ()
+    if tier == "team":
+        _delivery_for_media = _delivery_tid(tid)
+        _media_modes = _load_task_media() if _delivery_for_media is not None else None
+        if (_media_modes is not None
+                and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
+                == "task-media"):
+            attach_roots = (str(RESULTS_DIR / _delivery_for_media),)
+    verdict = classify(
+        body, tier, None, secret_filter=filter_chat_secrets,
+        scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)
+    is_leak = verdict.kind == "leak"
+    agent_id = _reenroll_identity()
+    verdict = materialize(
+        verdict, body, _STATE, tid, context=context, agent_id=agent_id,
+        now=time.time())
+    if guarded_tier(tier) and suppression_only(body):
+        # Honouring a guarded close without recording it is the accountability
+        # gap the guard used to answer with a refusal.
+        verdict = journal_suppression(
+            verdict, body, _STATE, tid, context=context, agent_id=agent_id,
+            now=time.time())
+    if is_leak:
+        artifact = review_path(_STATE, tid)
+        if not artifact.is_file():
+            return None, verdict.reason
+        try:
+            if not _route_withheld_review(artifact):
+                return None, f"{verdict.reason}; private owner review unavailable"
+        except Exception as exc:  # noqa: BLE001 — retain result file for retry
+            return None, f"{verdict.reason}; private owner review failed: {exc}"
+    result = (verdict.body, verdict.reason)
+    if verdict.reason is not None:
+        _WITHHELD_TASK_OUTPUT[tid] = result
+        if len(_WITHHELD_TASK_OUTPUT) > 512:
+            _WITHHELD_TASK_OUTPUT.pop(next(iter(_WITHHELD_TASK_OUTPUT)))
+    return result
+
+
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
+
+
+def _monorepo_src(marker: str) -> str:
+    """The monorepo `src/` that holds `marker`, walking up from this file;
+    '' when sparrow runs standalone (pyproject install, no monorepo around it)."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.isfile(os.path.join(cur, "src", marker)):
+            return os.path.join(cur, "src")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+# `project()` assigns retry cadence to its caller and the worker drives this
+# every ~1s. Skip-until-deadline, not sleep: other drains share this thread.
+_HITL_BACKOFF = {"until": 0.0, "delay": 0.0}
+_HITL_BACKOFF_MAX_S = 60.0
+
+
+def _hitl_backoff_bump(log=print) -> None:
+    d = min((_HITL_BACKOFF["delay"] or 0.5) * 2, _HITL_BACKOFF_MAX_S)
+    _HITL_BACKOFF["delay"] = d
+    _HITL_BACKOFF["until"] = time.monotonic() + d
+    log(f"hitl: projection refused — backing off {d:g}s")
+
+
+def _hitl_backoff_reset() -> None:
+    _HITL_BACKOFF["delay"] = 0.0
+    _HITL_BACKOFF["until"] = 0.0
+
+
+def _project_hitl(log=print) -> int:
+    """Push every un-projected HITL requirement out as a card, or 0 when
+    `src/hitl` is absent (standalone sparrow) — same optional tier as the
+    reply handler, and the outbound half of the same card.
+
+    The projector owns idempotency (a projection ledger per requirement), so
+    calling this every pulse re-sends nothing; it is the driver that was
+    missing, not the machinery.
+    """
+    if GATEWAY_INSTANCE:
+        return 0  # only the primary gateway (launched without GATEWAY_INSTANCE) projects the owner's cards
+    room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
+    if not room:
+        _held("the runtime prompt card")
+        return 0
+    if time.monotonic() < _HITL_BACKOFF["until"]:
+        return 0
+    try:
+        src = _monorepo_src(os.path.join("hitl", "projector.py"))
+        if not src:
+            return 0
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.projector import pending_ids, project
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
+        log(f"hitl: projector unavailable ({e}); cards will not be delivered")
+        return 0
+    workspace = _STATE.parent
+    manager = HitlManager(HitlStore(default_store(workspace)))
+    if not pending_ids(manager):
+        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
+        return 0
+    try:
+        done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
+                       room)
+    except Exception:
+        _hitl_backoff_bump(log)  # a raising sender is a refusal too
+        raise
+    if not done:
+        _hitl_backoff_bump(log)
+        return 0
+    _hitl_backoff_reset()
+    for req_id, event_id in done:
+        log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    return len(done)
+
+
+def _hitl_reply_handler(owner_mxid: str, log=print):
+    """Owner card-click handler for HITL cards, or None when `src/hitl` is not
+    around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
+    try:
+        src = _monorepo_src(os.path.join("hitl", "replies.py"))
+        if not src:
+            return None
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.replies import HitlReplyHandler
+        workspace = _STATE.parent
+        return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
+                                workspace=workspace, log=log)
+    except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
+        log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
+        return None
 
 
 def _vault_intercept_fns():
@@ -541,16 +1299,7 @@ def _vault_intercept_fns():
     if _VAULT_INTERCEPT_FNS is not None:
         return _VAULT_INTERCEPT_FNS
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "vault_intercept.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("vault_intercept.py")
         if not src:
             _VAULT_INTERCEPT_FNS = (None, None)
             return _VAULT_INTERCEPT_FNS
@@ -584,71 +1333,422 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# A read timeout on the long poll is indistinguishable from the documented
+# `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
+POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
-# gateway message (POST /v1/room op:message) and archived. This is the
-# transport half of the repo's long-standing "write proactive-{ts}.txt to
-# speak to the user" contract — historically drained only by the Discord/
-# Telegram bridges, so on a gateway-only host those files were dead letters
-# (observed live: a pending-questions DM nudge sat undrained forever while
-# only its macOS notification fired). Unset → no scan, no behavior change.
-# Deliberately an EXPLICIT room id, not auto-learned from recent task
-# channel_ids: a proactive nudge is often owner-private, and auto-targeting
-# the last active room could deliver it to a shared room.
-# An explicit empty export is a decision (startup.sh blanks it per named
-# instance); only an ABSENT var falls through to this deployment's .env.
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
 PROACTIVE_ROOM = (
     _PROACTIVE_ROOM_ENV
     if _PROACTIVE_ROOM_ENV is not None
     else _config_from_channel_env("REMOTE_PROACTIVE_ROOM")
 )
+# Host-injected claim gate (Path -> bool), consulted per file before the claim
+# rename; None (standalone default) claims every routable file unchanged.
+PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
+# connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
+                  "held_logged": 0.0}
+ROUTING_REFRESH_S = 300.0
+ROUTING_RETRY_S = 30.0
+OWNER_PRIVATE = "owner_private"
+CURRENT_ROOM = "current_room"
+SELECTED_MEMBERS = "selected_members"
+SYSTEM = "system"
+
+
+def _routing_file() -> Path:
+    return _STATE / f"owner-routing{_INST_SUFFIX}.json"
+
+
+def _load_routing() -> None:
+    if _ROUTING["loaded"]:
+        return
+    _ROUTING["loaded"] = True
+    _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
+    try:
+        d = json.loads(_routing_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    # another agent's reading, or this agent's reading from another gateway, authorizes nothing
+    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+        _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
+
+
+def refresh_routing(force: bool = False) -> None:
+    """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    _load_routing()
+    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
+        _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
+    elif (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]):  # re-enrolled while running
+        _ROUTING.update(owner_dm="", persisted="", loaded=False)
+        _load_routing()
+        force = True
+    now = time.time()
+    if not force and now < _ROUTING["next"]:
+        return
+    try:
+        _gateway_owner()
+    except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _GATEWAY_OWNER_DM_HINT:
+        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
+    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
+        try:
+            f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
+                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
+            os.replace(tmp, f)
+            _ROUTING["persisted"] = _ROUTING["owner_dm"]
+        except OSError:
+            _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
+            return
+    _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
+
+
+def _held(what: str) -> None:
+    """An owner-private message with no owner DM reading is held, and the log says so once per window."""
+    now = time.time()
+    if now - _ROUTING["held_logged"] >= ROUTING_REFRESH_S:
+        _ROUTING["held_logged"] = now
+        _log(f"holding {what}: no owner DM reading from the gateway yet (never the pinned room)")
+
+
+def resolve_destination(audience: str, *, room_id: str | None = None,
+                        recipients: list | None = None) -> str | list[str]:
+    """The one place an outbound room is chosen. OWNER_PRIVATE is the gateway's owner DM, the last
+    reading kept identity-bound on disk across restarts and outages; with no reading it is "" and the
+    caller holds the message, never the pinned room. CURRENT_ROOM is the triggering room;
+    SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
+    configured destination. Eligibility is the instance, never the pin: only the primary (launched
+    without GATEWAY_INSTANCE) owns unaddressed nudges and projects cards."""
+    if audience == OWNER_PRIVATE:
+        refresh_routing()
+        return _ROUTING["owner_dm"]
+    if audience == CURRENT_ROOM:
+        return room_id or ""
+    if audience == SELECTED_MEMBERS:
+        return list(recipients or [])
+    if audience == SYSTEM:
+        return PROACTIVE_ROOM or ""
+    raise ValueError(f"unknown audience {audience!r}")
+
+
+def proactive_room() -> str:
+    """Owner-directed by default: a proactive message or an owner-private card goes to the owner."""
+    return resolve_destination(OWNER_PRIVATE)
+
+# Runtime self-report (#3279 verification layer 3): a host loader may inject
+# {build_sha, entrypoint} BEFORE exec'ing this source; standalone stays empty.
+RUNTIME_IDENTITY: dict = globals().get("RUNTIME_IDENTITY") or {}
+_ENGINE_COUNTS = {"core_confirmed": 0, "legacy_sends": 0}
+
+
+def _engine_desc() -> str:
+    c = _DELIVERY_CORE
+    if c is None:
+        return "DeliveryCore(unbuilt)"
+    return (f"DeliveryCore({type(c.backend).__name__}"
+            f"->{type(c.provider).__name__})")
+# Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
+# event_id: trust the bare ok as delivered (at-least-once beats never).
+_PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
+PROACTIVE_TRUST_OK = (
+    _PROACTIVE_TRUST_OK_ENV
+    if _PROACTIVE_TRUST_OK_ENV is not None
+    else _config_from_channel_env("REMOTE_PROACTIVE_TRUST_OK")
+) == "1"
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
-# rotation (_reload_rotated_token) propagates to their next request without a
-# restart. _req() itself reads the TOKEN global per call and needs no dict.
 _AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+OUTBOUND_SCAN_S = float(os.environ.get("REMOTE_OUTBOUND_SCAN_S") or "1.0")
+# Outbound worker: decouples outbound progress from inbound long-poll
+# progress; delivery machinery untouched — owns ONLY lifecycle/scheduling.
+_OUTBOUND_WAKE = threading.Event()
+_OUTBOUND_STOP = threading.Event()
+_INFLIGHT_MUTEX = threading.RLock()
+# True when the in-flight restore FAILED rather than finding no file. Both cases
+# yield an empty set, but only the second one means "nothing is in flight".
+_INFLIGHT_DEGRADED = False
+# Same hazard as the in-flight set: both ledgers are read-modify-written by the
+# poll loop and the outbound worker, so each load->mutate->write runs under a lock.
+_TASK_MEDIA_MUTEX = threading.RLock()
+_PENDING_ACK_MUTEX = threading.RLock()
+
+
+def wake_outbound() -> None:
+    """Kick the outbound worker (e.g. right after a local result write)."""
+    _OUTBOUND_WAKE.set()
+
+
+def _outbound_worker(inflight: "set[str]") -> None:
+    first_seen: "dict[str, float]" = {}
+    while not _OUTBOUND_STOP.is_set():
+        _OUTBOUND_WAKE.wait(OUTBOUND_SCAN_S)
+        _OUTBOUND_WAKE.clear()
+        if _OUTBOUND_STOP.is_set():
+            break                        # graceful: stop taking new items
+        # tuple(): kept distinct from the drain's test anchor — redundant once
+        # the anchor is line-bounded, load-bearing until then.
+        for tid in tuple(inflight):
+            rfile = RESULTS_DIR / f"{tid}.txt"
+            if tid not in first_seen and rfile.exists():
+                first_seen[tid] = time.monotonic()
+        try:
+            _post_ready_results(inflight)
+        except Exception as e:  # noqa: BLE001 — failure isolation per cycle
+            _log(f"outbound worker: results drain error (isolated): {e}")
+        try:
+            _post_proactive()
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: proactive drain error (isolated): {e}")
+        try:
+            _project_hitl(log=_log)
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: hitl projection error (isolated): {e}")
+        try:
+            _retry_pending_acks(inflight)
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: pending-ack retry error (isolated): {e}")
+        for tid in [t for t in first_seen if t not in inflight]:
+            ms = (time.monotonic() - first_seen.pop(tid)) * 1000.0
+            _log(f"outbound worker: {tid} seen->retired {ms:.0f}ms (monotonic)")
+
+
+def _start_outbound_worker(inflight: "set[str]") -> threading.Thread:
+    t = threading.Thread(target=_outbound_worker, args=(inflight,),
+                         name="outbound-worker", daemon=True)
+    t.start()
+    _log(f"outbound worker started (scan {OUTBOUND_SCAN_S}s + wake-on-kick) — "
+         "outbound no longer rides the inbound long-poll")
+    return t
+
+
+OUTBOUND_WATCHER = os.environ.get("REMOTE_OUTBOUND_WATCHER", "auto")  # auto|off
+
+
+def _start_results_watcher() -> "threading.Thread | None":
+    """Darwin kqueue doorbell on RESULTS_DIR: advisory wakeups only, never
+    delivery state. Correctness stays in the durable drain; the bounded scan
+    guarantees progress whenever this thread is degraded or absent."""
+    if OUTBOUND_WATCHER == "off" or not hasattr(select, "kqueue"):
+        return None
+
+    VNODE_GONE = (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+                  | select.KQ_NOTE_REVOKE)
+
+    def run():
+        backoff = 1.0
+        while not _OUTBOUND_STOP.is_set():
+            fd, kq = -1, None
+            try:
+                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                # O_EVTONLY is absent on some supported pythons (Xcode 3.9);
+                # kqueue accepts an O_RDONLY fd — it just pins the mount.
+                fd = os.open(str(RESULTS_DIR),
+                             getattr(os, "O_EVTONLY", os.O_RDONLY))
+                kq = select.kqueue()
+                kq.control([select.kevent(
+                    fd, filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+                    | VNODE_GONE)], 0, 0)
+                backoff = 1.0
+                # Full sweep on every (re)registration: files that landed
+                # before the watch began are the first sweep's job.
+                wake_outbound()
+                while not _OUTBOUND_STOP.is_set():
+                    events = kq.control(None, 1, 1.0)
+                    if not events:
+                        continue
+                    wake_outbound()
+                    if events[0].fflags & VNODE_GONE:
+                        # Rate-cap rebuilds like the exception path: a flapping
+                        # dir must not spin the register loop.
+                        _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
+                        break            # dir vnode gone: rebuild registration
+            except Exception as e:  # noqa: BLE001 — degraded, never fatal
+                _log(f"results watcher degraded (scan remains the floor): {e}")
+                _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                try:
+                    if kq is not None:
+                        kq.close()
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+
+    t = threading.Thread(target=run, name="results-watcher", daemon=True)
+    t.start()
+    _log("results watcher started (kqueue doorbell — advisory; scan is the floor)")
+    return t
+
+
 HEARTBEAT_INTERVAL = 60
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
-# latch would mean a broker that GAINS the endpoint (e.g. a deploy) is never
-# picked up until the worker restarts; time-gating makes it self-healing.
 ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
 _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
 # Auth-rejection recovery: when the gateway rejects the bearer (401/403 — the
 # key was revoked or expired), the historical behavior is an immediate FATAL
-# exit. Under a supervisor that blindly relaunches, that becomes a silent
-# crash-loop hammering the gateway until a human notices. When
-# REMOTE_TASK_TOKEN_FILE names the durable token source (a dotenv-style file
-# with a REMOTE_TASK_TOKEN= line, or the raw onboarding string alone on a
-# line), the bridge instead re-reads that file on rejection: a DIFFERENT token
-# there (the connect/onboarding flow re-ran) is swapped in live — no restart —
-# and an unchanged one holds the bridge in a slow re-check loop until rotation
-# happens. Unset → exactly the pre-existing FATAL-exit behavior.
 TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
+# Registry-loss self-claim (backend #595): the code is device-visible only;
+# binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
+# Does NOT gate _auth_probe() — a token simply being accepted again isn't a relink.
+REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
+REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
+_reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+
+
+def _provision_base() -> str:
+    """Gateway base -> provision-api base (…/relay* -> …/api)."""
+    return URL.split("/relay")[0].rstrip("/") + "/api"
+
+
+def _reenroll_identity() -> str:
+    """Agent mxid: process env, then the channel .env file — the same fallback
+    the token uses (desktop launchers don't export either) — then the durable
+    per-host identity enrolment wrote to state/auth/ag2space.json."""
+    for key in ("AGENT_MXID", "AGENT_ID"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
+        v = _config_from_channel_env(key).strip()
+        if v:
+            return v
+    # Re-read per call, like the channel-env candidates: an identity that
+    # appears mid-episode must take effect without a restart.
+    try:
+        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
+        # Non-string values must read as unknown, not be coerced into a
+        # garbage identity that _reenroll_claim would POST on the cadence.
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:  # absent, unreadable, or malformed — identity unknown
+        return ""
+
+
+def _reenroll_claim() -> None:
+    """Best-effort claim: one live code per episode; failed POSTs retry no
+    sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
+    if not REENROLL_ENABLED or _reenroll_state["code"]:
+        return
+    last = _reenroll_state["last_attempt_at"]
+    # Monotonic: a wall-clock step backward must not suppress claims (review
+    # P2); None = never attempted, so a fresh boot claims immediately.
+    if last is not None and time.monotonic() - last < REENROLL_CLAIM_RETRY_S:
+        return
+    agent_id = _reenroll_identity()
+    if not agent_id or not TOKEN:
+        # No POST issued -> no cadence stamp. The instruction must match what
+        # can actually work: file candidates are re-read every cycle, but the
+        if not agent_id:
+            pointered = os.environ.get("AG2_DEVICE_ENV") \
+                or os.environ.get("CLAUDE_CONFIG_DIR")
+            _log("reenroll: agent identity unknown — write "
+                 "AGENT_MXID=<agent mxid> into the channel .env; retrying "
+                 "(takes effect without restart)" if pointered else
+                 "reenroll: agent identity unknown and no channel-env "
+                 "pointers (AG2_DEVICE_ENV/CLAUDE_CONFIG_DIR) — set "
+                 "AGENT_MXID in the gateway environment and RESTART the "
+                 "wrapper/app; holding the connection wait meanwhile")
+        else:
+            _log("reenroll: no token available — not claiming")
+        return
+    _reenroll_state["last_attempt_at"] = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            _provision_base() + "/connect/reenroll",
+            data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
+            # The prod edge 403s urllib's default UA — same contract as _req().
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read() or b"{}")
+        code = str(body.get("approval_code") or "")
+        if body.get("pending") and code:
+            _reenroll_state["code"] = code
+            _reenroll_state["claimed_at"] = int(time.time())
+            _log("RELINK PENDING — this agent's server-side registration was "
+                 f"lost. RELINK CODE: {code} — the owner approves by DMing the "
+                 f"concierge: relink approve {code}")
+        else:
+            _log(f"reenroll: claim not parked ({str(body)[:200]})")
+    except urllib.error.HTTPError as e:
+        _log(f"reenroll: claim refused HTTP {e.code} ({_http_error_body(e)[:200]})")
+    except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
+        _log(f"reenroll: claim failed: {e}")
+
+
+def _reenroll_clear(recovered: bool = False) -> None:
+    """End the episode; recovered=True (probe-success path only) leaves the
+    explicit terminal — disappearance alone must never read as success."""
+    was_pending = bool(_reenroll_state.get("code"))
+    prior_attempt = _reenroll_state.get("last_attempt_at")
+    _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
+    if not was_pending:
+        # No claim was granted this episode — preserve its cadence, or a
+        # probe-only resume lets every future episode re-claim immediately.
+        _reenroll_state["last_attempt_at"] = prior_attempt
+    if recovered and was_pending:
+        _reenroll_state["recovered_at"] = int(time.time())
+    else:
+        _reenroll_state.pop("recovered_at", None)
+
+
+def _auth_probe() -> bool:
+    """True ONLY on a successful authed response — an error proves nothing
+    about auth, so every failure keeps waiting."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
-_TASK_FIELDS = ("id", "timestamp", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope",
+                # Both ahead of "task": the safe parser stops at the body, so a
+                # field written below it is invisible to every task-last reader.
+                "requested_worker", "priority",
+                # A card click already recorded in the HITL store, passed on for the turn it
+                # causes: the core answers [no-send] and lets its Stop hook do the work.
+                "hitl_click",
+                # Which worker-picker button was pressed. Above "task" for the same
+                # reason: worker_picker_commands reads it with the safe parser.
+                "picker_command", "picker_args",
+                # Also above "task": these carry the picker's authorization, and a
+                # task-last reader cannot see a field written below the body.
+                "source", "channel_id",
+                "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
-                # them (absent for other sources); each newline-stripped by
-                # _one_line so a room/display name can't forge an extra line.
-                "room_name", "sender_name", "reply_to_event", "reply_to_me",
+                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
+                "addressed_to",
+                # Ingress only: the backend inherits the route by task id, so a
+                # reply echoing these back could name a thread it was not asked in.
+                "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
-                "source_message_id", "user_id", "priority", "interaction_type",
+                "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card")
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
-# operating card. The bridge does NOT verify the signature (consumers do, per
-# origin, via skills/agent-room-ops/verify_platform_card.py — fail-closed);
-# it only constrains the shape so the field can't smuggle arbitrary payload.
 _PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
 
 # Interaction-plane vocabulary (interaction-planes refactor step 1). Remote
@@ -660,9 +1760,8 @@ _INTERACTION_TYPES = frozenset({
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
-LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
-if LOCAL_TIER == "other":
-    LOCAL_TIER = "guest"
+LOCAL_TIER = local_task_protocol.canonical_access_tier(
+    _env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner")
 if LOCAL_TIER not in ("owner", "team", "guest"):
     LOCAL_TIER = "guest"
 
@@ -710,9 +1809,7 @@ _TIER_RANK = {"guest": 0, "team": 1, "owner": 2}
 
 
 def _normalized_tier(value):
-    tier = str(value or "").strip().lower()
-    if tier == "other":
-        tier = "guest"
+    tier = local_task_protocol.canonical_access_tier(value)
     return tier if tier in _TIER_RANK else "guest"
 
 _TIER_MAP_CACHE = {"path": None, "ident": None, "map": {}}
@@ -730,10 +1827,112 @@ def _stale_safe(cached):
     local_rank = _TIER_RANK.get(LOCAL_TIER, _TIER_RANK["owner"])
     return {k: v for k, v in cached.items() if _TIER_RANK.get(v, 0) <= local_rank}
 
+# Durable on-disk backup of the last-known-good tierMap, under state/auth/ — the
+# cleanup-exempt per-host install-state dir (per CLAUDE.md; never wiped by
+_TIER_MAP_BACKUP_FILE = _STATE / "auth" / "ag2space-tiermap-backup.json"
+
+
+def _validate_tier_map(raw):
+    """Coerce a raw {who: tier} dict to a validated {mxid: tier} map (drops any
+    entry whose value isn't a recognised tier or whose key isn't a str).
+
+    The accepted set MUST match the live reader's; a tier this drops is a
+    down-tier silently lost on restore."""
+    tm = {}
+    if isinstance(raw, dict):
+        for who, tier in raw.items():
+            t = local_task_protocol.canonical_access_tier(tier)
+            if isinstance(who, str) and t in _TIER_RANK:
+                tm[who.strip()] = t
+    return tm
+
+
+def _backup_tier_map_to_disk(tm):
+    """Persist the tierMap to the durable backup after a SUCCESSFUL parse of
+    access.json. Validates STRUCTURE, not emptiness: a well-formed EMPTY map is a
+    legitimate owner state (they removed every down-tier), so it IS persisted and
+    a later restart restores *that* — not a stale @rick. The good copy is never
+    overwritten by a wipe because a wipe/corrupt access.json never reaches here —
+    _load_tier_map() returns on the read error before calling this. Born 0600
+    (created already-restricted, never written-at-umask-then-narrowed — the backup
+    holds the same authorization data as access.json, so a world-readable copy,
+    even for the write window, would be a new exposure introduced by the fix).
+    Atomic via per-PID tmp +
+    os.replace; best-effort — a backup failure must never break tier resolution
+    (mirrors the slack allowlist backup, cd5c5db1 / #2163).
+
+    CHOSEN TRADEOFF (#2354 review): the good copy is preserved by entering the
+    caller's safe branch on a PARSE failure, not on "the map looks empty". So a
+    zero-byte or truncated access.json (the likely wipe shapes) preserves the
+    backup, but a writer that rewrites access.json as VALID JSON with no
+    `tierMap` key (or `tierMap: {}`) DOES clear it — byte-identical in effect to
+    a deliberate clear. This is unavoidable: "an owner's empty map must persist"
+    and "an empty map must never overwrite the backup" are the SAME input; you
+    cannot satisfy both by shape alone. A shape-independent fix would require
+    PROVENANCE (a generation counter or writer identity), out of scope here. A
+    cleared backup after such a write is therefore BY DESIGN, not a bug."""
+    if not isinstance(tm, dict):
+        return
+    try:
+        # Create state/auth/ owner-only (0700). It holds only 0600 secrets, so
+        # don't rely on the parent's incidental mode: macOS ~/Library/Application
+        _TIER_MAP_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = _TIER_MAP_BACKUP_FILE.with_name(
+            f"{_TIER_MAP_BACKUP_FILE.name}.{os.getpid()}.tmp"
+        )
+        payload = json.dumps(tm, indent=2, sort_keys=True) + "\n"
+        # Born 0600, NOT written-at-umask-then-chmod'd. A write_text()+os.chmod()
+        # sequence leaves a window where the tmp holds the same authorization data
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(payload)
+        os.replace(tmp, _TIER_MAP_BACKUP_FILE)
+    except Exception:
+        pass
+
+
+def _restore_tier_map_from_disk():
+    """Return the last durable-backed tierMap, or {} if absent/unreadable/invalid."""
+    try:
+        raw = json.loads(_TIER_MAP_BACKUP_FILE.read_text())
+    except Exception:
+        return {}
+    return _validate_tier_map(raw)
+
+
+def _last_known_tier_map(path):
+    """The floor returned when access.json is unreadable: the in-memory
+    last-known-good if the process has one, else the durable on-disk backup (so a
+    wipe+restart restores the down-tier floor instead of failing OPEN to {}).
+
+    Two constraints inherited from the live reader, both load-bearing:
+    the backup is NOT restored across a config-path switch (it would reintroduce
+    the cross-install trust leak the path check exists to prevent), and whatever
+    is returned goes through _stale_safe so a stale grant ABOVE LOCAL_TIER is
+    dropped rather than resurrected from disk."""
+    # A cold process has NO prior path — that is not a switch, and treating it as
+    # one refuses the backup on the first request, the exact window this closes.
+    if _TIER_MAP_CACHE["path"] is not None and path != _TIER_MAP_CACHE["path"]:
+        _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
+            path, None, {})
+        return {}
+    _TIER_MAP_CACHE["path"] = path
+    if _TIER_MAP_CACHE["map"]:
+        return _stale_safe(_TIER_MAP_CACHE["map"])
+    backup = _restore_tier_map_from_disk()
+    if backup:
+        _TIER_MAP_CACHE["map"] = backup
+    return _stale_safe(_TIER_MAP_CACHE["map"])
+
 
 def _load_tier_map():
     """Preserve safe caps on same-path faults, but never across path switches.
-    An absent launcher config explicitly clears the cache."""
+    An absent launcher config explicitly clears the cache.
+
+    A fault on the SAME path falls back to the durable on-disk backup when the
+    process is cold, so a wipe + restart restores the down-tier floor instead of
+    failing OPEN to {}; see _last_known_tier_map for the path/stale constraints."""
     path = _ag2space_access_path()
     if not path:
         _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
@@ -747,12 +1946,7 @@ def _load_tier_map():
     except OSError:
         # Keep last-known-good only for the same configured path. Carrying a
         # map across a path switch would leak trust decisions between installs.
-        if path != _TIER_MAP_CACHE["path"]:
-            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
-                "map"
-            ] = (path, None, {})
-            return {}
-        return _stale_safe(_TIER_MAP_CACHE["map"])
+        return _last_known_tier_map(path)
     # Size and inode supplement nanosecond mtime so same-timestamp rewrites are detected.
     ident = (st.st_mtime_ns, st.st_size, st.st_ino)
     # Re-read while an above-default grant is cached so revocation cannot be masked.
@@ -767,25 +1961,17 @@ def _load_tier_map():
     try:
         with open(path) as f:
             raw = (json.load(f) or {}).get("tierMap") or {}
-        tm = {}
-        for who, tier in raw.items():
-            t = str(tier).strip().lower()
-            if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
-                tm[who.strip()] = _normalized_tier(t)
+        tm = _validate_tier_map(raw)
     except Exception:
         # As above, fail closed across config switches but retain the same
         # path's safe caps for a malformed or mid-write file.
-        if path != _TIER_MAP_CACHE["path"]:
-            _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE[
-                "map"
-            ] = (path, None, {})
-            return {}
-        return _stale_safe(_TIER_MAP_CACHE["map"])
+        return _last_known_tier_map(path)
     _TIER_MAP_CACHE["path"], _TIER_MAP_CACHE["ident"], _TIER_MAP_CACHE["map"] = (
         path,
         ident,
         tm,
     )
+    _backup_tier_map_to_disk(tm)  # refresh durable copy for a future wipe+restart
     return tm
 
 
@@ -804,41 +1990,12 @@ def _tier_for(user_id, attested_tier=None):
 
 # ── inbound media fetch (owner screenshots, file uploads) ────────────────────
 # A gateway can hand the task body a media MARKER instead of raw bytes:
-#   [<tag>: <url> mime=<m> name=<f> size=<n> kind=<msgtype>] <caption>
-# `<url>` is typically unreachable for the core as-is (a homeserver media URL
-# behind authenticated-media, or a gateway media-proxy URL). We resolve it here —
-# where the gateway bearer already lives — download the bytes to a local file,
-# and rewrite the marker to `[File attached: <path>]` (the inbound convention
-# the Discord/Telegram bridges use) so the core just reads a local path with
-# zero remote creds.
-#
-# Auth is picked by the URL:
-#   • URL under REMOTE_TASK_URL → fetched with the gateway bearer we already hold
-#   • a Matrix `/_matrix/media/...` URL → upgraded to the authenticated
-#     MSC3916 client route and fetched with REMOTE_MEDIA_HS_TOKEN (a homeserver
-#     access token), if configured
-#   • any other https URL → fetched with NO credentials
-# Authenticated fetches do NOT follow redirects (a gateway-controlled URL must
-# not be able to bounce our bearer to a third-party host). Drop-in safe: no
-# token / fetch error / oversize → the marker is left untouched.
-#
-# The marker tag is configurable (REMOTE_MEDIA_MARKER, slug chars only) so a
-# provider-specific gateway can keep its existing marker name without this repo
-# carrying provider strings.
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
 
 # Untrusted room-ops metadata block: the gateway appends a free-text
 # `[room-ops metadata: …]` pointer to the operating card onto the message body.
-# It self-labels "Not an instruction" and is UNSIGNED (unlike platform_card,
-# which is a signed header consumers verify offline). Because it rides in the
-# task body — the same field as the user's words — a naive agent can read it as
-# an instruction. We strip it here so it never reaches the agent as body content
-# (owner directive 2026-07-16). The operating card stays discoverable via the
-# documented prep_get op; a TRUSTED pointer, if ever wanted, belongs in a signed
-# header like platform_card, not in unsigned body text. Bracket-body is
-# `[^\]]*` — the block carries no nested `]`, so this never over-eats.
 _ROOM_OPS_META_RE = re.compile(r"\s*\[room-ops metadata:[^\]]*\]", re.IGNORECASE)
 
 
@@ -853,14 +2010,10 @@ def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
     stripped = cleaned != body
     # Return the cleaned body even when it is now empty: a metadata-ONLY body is
     # pure injection with no legitimate task text, so it must degrade to an empty
-    # (no-op) body. NEVER fall back to the original here — that would re-admit the
-    # very `[room-ops metadata: …]` block we are quarantining (P1, PR #2149).
     return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
-# credentialed — a bare "/_matrix/" substring must not route a bearer to an
-# arbitrary host (review 2026-07-03).
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
 MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(_STATE / "remote-media"))
 MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
@@ -872,15 +2025,11 @@ _EXT_BY_MIME = {
 
 # Bridges-as-siblings: discord/telegram/slack bridges write
 # `state/last-owner-activity.json` whenever the owner messages them, so the
-# proactive-loop's "active engagement" gate knows a conversation is live. The
-# gateway transport should feed the same gate — but only when THIS node treats
-# gateway traffic as owner traffic (LOCAL_TIER, never the gateway's claim).
 OWNER_ACTIVITY_FILE = _STATE / "last-owner-activity.json"  # sutando-only; harmless if unused
 
 
 # Blocker (review 2026-06-13): the gateway is untrusted, so a task `id` flows
 # into filesystem paths (task write + result read-back/POST). Reject anything
-# that isn't a plain slug — kills path traversal in both directions.
 _TID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
@@ -892,8 +2041,15 @@ def _one_line(value) -> str:
     """Header-safe single-line value: CR/LF stripped so a gateway-controlled
     field can't inject extra `key: value` lines (e.g. forge a second
     access_tier). Applied to every field — task content is single-line in
-    practice and a stray newline only ever indicates an injection attempt."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    practice and a stray newline only ever indicates an injection attempt.
+
+    Load-bearing: this producer does no body defanging, so the flatten is the
+    only thing stopping a field from forging a registered header line.
+
+    Folds on str.splitlines()' own set, not on CR/LF: readers split with
+    splitlines(), so any narrower set leaves a separator that is one line to
+    the writer and two to the reader."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
@@ -912,6 +2068,48 @@ def _redact_url(value: str) -> str:
         return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
     except Exception:  # noqa: BLE001 — redaction must never break status I/O
         return str(value)
+
+
+class _NeverFatalStream:
+    """Logging must never take the poll loop down.
+
+    Mirrors the merged `src/discord-bridge.py` fix (#2856). This package is
+    standalone (`dependencies = []`, imports nothing from sutando's `src/`), so
+    the guard is local by necessity rather than duplicated policy.
+
+    The loop's own `except Exception  # keep the loop alive` cannot help here:
+    every handler calls `_log()` first, so a `BrokenPipeError` from that print
+    is raised *inside* the handler and escapes it. Stdout is a pipe whenever the
+    launcher pipes to `tee`, which is how this bridge runs today.
+
+    Swallow ONLY OSError (the EPIPE/EBADF class); anything else still propagates
+    so real bugs are not masked.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except OSError:
+            # Report the write as accepted: callers must not branch on it.
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stdout = _NeverFatalStream(sys.stdout)
+sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
@@ -941,7 +2139,6 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35)
     req.add_header("Accept", "application/json")
     # CloudFlare bot-fight (error 1010) rejects python-urllib's default
     # User-Agent with a 403; send an explicit client UA so the gateway's edge
-    # lets the long-poll through. (Same fix the other gateway callers carry.)
     req.add_header("User-Agent", "sutando-gateway-client/1.0")
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -972,11 +2169,6 @@ def _read_token_file(path: str) -> str:
         return ""
     # Collect BOTH alias assignments across the WHOLE file, then apply the
     # documented precedence REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN regardless of
-    # line order (review P1: a migration-era env with a stale legacy line
-    # ABOVE the current canonical one made recovery hot-swap back to the stale
-    # legacy secret — first-match-in-file-order inverted startup.sh's
-    # precedence). Last assignment of a repeated key wins, matching shell
-    # sourcing semantics.
     found: dict = {}
     for line in text.splitlines():
         line = line.strip()
@@ -984,7 +2176,7 @@ def _read_token_file(path: str) -> str:
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
             if line.startswith(key + "="):
-                found[key] = line[len(key) + 1:].strip().strip("'\"")
+                found[key] = _unquote_env(line[len(key) + 1:])
     for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
         if found.get(key):
             return found[key]
@@ -1016,7 +2208,7 @@ def _read_token_file_url(path: str) -> str:
             line = line[len("export "):].lstrip()
         for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
             if line.startswith(key + "="):
-                found[key] = line[len(key) + 1:].strip().strip("'\"")
+                found[key] = _unquote_env(line[len(key) + 1:])
     return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
 
 
@@ -1042,16 +2234,9 @@ def _reload_rotated_token() -> bool:
         return False
     # Route through the SAME parse used at import time (_parse_onboarding_token)
     # so a rotation written in the URL-encoded form (https://gw/relay%7C<secret>,
-    # the desktop connect flow) splits correctly. A literal "|" split treated the
-    # encoded form as a bare secret and set the bearer to the whole URL string,
-    # so a valid rotation kept failing auth (regression caught on #2323 once
-    # #2307's %7C onboarding parser reached main).
     url_from_token, secret = _parse_onboarding_token(raw)
     # The URL guard must cover BOTH layouts: the combined url|secret form
     # (url_from_token) AND the split form (bare secret + a separate
-    # REMOTE_TASK_URL line, which _read_token_file drops). Without the split
-    # fallback, a split file re-pointed by connect to a new gateway sends the
-    # new bearer to the OLD running URL — the credential split this guards.
     file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
     if file_url and file_url != URL:
         _log(f"token file names a DIFFERENT gateway ({file_url}) "
@@ -1073,31 +2258,105 @@ def _recover_auth(code: int) -> bool:
     the token file rotates. Returns True once a rotated token is live; False
     when no TOKEN_FILE is configured (caller keeps the historical FATAL
     exit)."""
+    # A new rejection episode invalidates any prior recovered terminal.
+    _reenroll_state.pop("recovered_at", None)
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
+        _reenroll_clear()
         return True
-    if not TOKEN_FILE:
+    _reenroll_claim()
+    if not TOKEN_FILE and not _reenroll_state["code"] \
+            and not (REENROLL_ENABLED and TOKEN):
+        # Historical FATAL contract survives ONLY where recovery is truly
+        # impossible: reenroll off, or no bearer to claim with (#2924).
         return False
-    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation in "
-         f"{TOKEN_FILE} (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    _log(f"gateway auth rejected (HTTP {code}) — waiting for token rotation"
+         + (f" in {TOKEN_FILE}" if TOKEN_FILE else "")
+         + (" or re-link approval" if _reenroll_state["code"]
+            else " or re-link identity/claim")
+         + f" (re-check every {AUTH_RECHECK_INTERVAL}s)")
+    cycle = 0
     while True:
+        pending = _reenroll_state["code"]
+        # `backoff_s` means "retryable TRANSPORT backoff"; this loop is waiting on
+        # a human, so it stays 0 — the re-check cadence is not a reconnect estimate.
         _emit_gateway_status(False,
-                             error=f"auth rejected HTTP {code} — waiting for re-connect",
-                             backoff_s=AUTH_RECHECK_INTERVAL)
+                             error=(f"auth rejected HTTP {code} — relink pending "
+                                    f"(code {pending})" if pending else
+                                    f"auth rejected HTTP {code} — waiting for re-connect"))
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
         if _reload_rotated_token():
             _log("rotated token detected — resuming")
+            _reenroll_clear()
+            return True
+        if not pending:
+            # A transient failure isn't a lost episode: retry stays in the
+            # loop, cadence-bounded internally (safe while nothing is parked).
+            _reenroll_claim()
+        cycle += 1
+        if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            # Re-read: `pending` above predates this iteration's own claim,
+            # which can park a code the log line must not miss (review).
+            fresh_pending = bool(_reenroll_state["code"])
+            _log("token accepted again — resuming"
+                 + (" (re-link approved)" if fresh_pending else ""))
+            # _reenroll_clear re-reads current state for was_pending, so this
+            # is correct whether or not a code was parked when we got here.
+            _reenroll_clear(recovered=True)
             return True
 
 
-def _post_task_ack(tid: str) -> bool:
-    """Tell the gateway a task made it safely into the local queue."""
+def _load_pending_acks() -> "dict[str, bool]":
+    """Acks the gateway never confirmed, mapped to the durability each may
+    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
+    try:
+        data = json.loads(PENDING_ACK_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        _log(f"pending-ack file unreadable ({e}) — starting empty")
+        return {}
+    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _record_pending_acks(pending: "list[tuple[str, bool]]") -> bool:
+    """Commit this round's acks before any of them is posted, so a crash between
+    ack and confirmation still leaves a ledger to retry from."""
+    with _PENDING_ACK_MUTEX:
+        acks = _load_pending_acks()
+        acks.update(dict(pending))
+        return _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
+
+
+def _forget_pending_ack(tid: str) -> None:
+    with _PENDING_ACK_MUTEX:
+        acks = _load_pending_acks()
+        if acks.pop(tid, None) is not None:
+            _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
+
+
+def _retry_pending_acks(inflight: "set[str]") -> None:
+    """Re-post acks the gateway never confirmed. An id no longer in flight had
+    its lease closed by the result POST, so its record is retired unposted.
+    That inference needs a TRUSTWORTHY in-flight set. When the restore degraded
+    the set is empty-because-unknown, so post instead and let the gateway's
+    'not leased' 404 retire the lease it actually closed."""
+    for tid, durable in sorted(_load_pending_acks().items()):
+        if tid not in inflight and not _INFLIGHT_DEGRADED:
+            _forget_pending_ack(tid)
+            continue
+        _post_task_ack(tid, durable)
+
+
+def _post_task_ack(tid: str, durable: bool = False) -> bool:
+    """Tell the gateway a task made it safely into the local queue. `durable`
+    says the task file, its media sidecar and the in-flight set are all fsync'd,
+    which is the only thing that lets the relay call the task accepted."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
-    # the local form stranded queued results while the gateway waited forever.
     if not _valid_tid(_broker_tid(tid)):
         return False
     if _ack_disabled_until and time.time() < _ack_disabled_until:
@@ -1105,22 +2364,19 @@ def _post_task_ack(tid: str) -> bool:
     try:
         wire_tid = _broker_tid(tid)
         safe_tid = urllib.parse.quote(wire_tid, safe="")
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": wire_tid}, timeout=10)
+        body = {"id": wire_tid}
+        if durable:
+            body["durable"] = True
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
+        _forget_pending_ack(tid)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
-            # later, so a broker that deploys /ack afterward is picked up without a
-            # restart. But the DEPLOYED broker returns a PER-TASK
-            # 404 {"error":"not leased to you"} when THIS task's lease expired /
-            # was re-served / isn't ours — routine under churn. That must NOT
-            # disable acking for every OTHER task (one stale lease would blind the
-            # whole host's `received` state), so treat it as a single-task negative
-            # ack: skip this one, leave global acking enabled. (Per qingyun-001,
-            # broker-half author — the deployed 404 is per-task, not "no route".)
             if e.code == 404 and "not leased" in _http_error_body(e).lower():
+                _forget_pending_ack(tid)  # terminal: the lease is gone for good
                 return False   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
             _log(f"gateway does not support task ack — retrying in "
@@ -1172,6 +2428,255 @@ def _read_core_status() -> tuple[str | None, str | None]:
         return (status, None if status == "idle" else step)
     except Exception:  # noqa: BLE001 — best-effort; never stall the main loop
         return (None, None)
+
+
+_POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
+# A roster row is ~100 bytes, so this is >10k workers; past it the loop would
+# re-read and re-parse a runaway file every pass before it can poll for tasks.
+_POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
+_workers_pushed_identity = ""
+_workers_push_retry_at = 0.0
+_advertisement_unavailable_logged = False
+
+# 404/405/501 are the broker saying "this endpoint does not exist here"; every
+# other status is a live endpoint failing, which a short retry can clear.
+_UNSUPPORTED_ENDPOINT_STATUS = frozenset({404, 405, 501})
+
+
+def _read_pool_advertisement() -> "tuple[str, dict | None]":
+    """The pool's roster-derived advertisement -> (identity, record), or
+    ("", None) when the record is UNAVAILABLE — absent, unreadable, mid-write,
+    malformed, or carrying only one of its two halves.
+
+    The identity is a digest of the record's canonical content and is the ONE
+    change signal both publications key on. mtime is not: a restore that lands
+    below the prior file's mtime is new content the picker must see, and the
+    two halves keyed on different signals disagreed on exactly that record.
+
+    Availability is a tri-state, and None is the only "cannot read it" value: a
+    record whose maps are empty is AVAILABLE and means "the pool is empty", an
+    intentional clear the callers must push. Collapsing the two (the pre-fix
+    (0.0, {})) is what let a deleted or half-written file PUT a profile card
+    with no `workers`, and the broker REPLACES that document.
+
+    Both halves are validated from this one read so a one-sided record cannot
+    POST a status map whose labels never ship. This runs in the task loop
+    BEFORE the /v1/tasks poll and may never raise: the outer handler backs off
+    and retries the same file, so any exception here — a RecursionError from a
+    deeply nested value, not only OSError/ValueError — would stall intake for
+    as long as that file stays. The path is opened ONCE, non-blocking, and
+    everything is decided on that descriptor: a FIFO with no writer would park
+    a blocking open forever, and a size read from a second lookup can be
+    stale by the time the content is read, so the bound is enforced on the
+    bytes actually read (MAX+1: one more than allowed proves the overflow)."""
+    fd = -1
+    try:
+        fd = os.open(str(_POOL_ADVERTISEMENT_FILE), os.O_RDONLY | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ("", None)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            data = fh.read(_POOL_ADVERTISEMENT_MAX_BYTES + 1)
+        if len(data) > _POOL_ADVERTISEMENT_MAX_BYTES:
+            return ("", None)
+        rec = json.loads(data.decode("utf-8"))
+        canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 — a parser/resource failure is UNAVAILABLE, never a stalled poll
+        return ("", None)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(rec, dict):
+        return ("", None)
+    if not isinstance(rec.get("workers"), dict):
+        return ("", None)
+    if not isinstance(rec.get("profile_workers"), dict):
+        return ("", None)
+    return (hashlib.sha256(canonical.encode()).hexdigest(), rec)
+
+
+def _advertisement_or_none() -> "tuple[str, dict | None]":
+    """_read_pool_advertisement, logging the availability edge once per edge so
+    an absent producer cannot fill the log at the loop's cadence."""
+    global _advertisement_unavailable_logged
+    identity, rec = _read_pool_advertisement()
+    if rec is None:
+        if not _advertisement_unavailable_logged:
+            _advertisement_unavailable_logged = True
+            _log(f"pool advertisement unavailable ({_POOL_ADVERTISEMENT_FILE.name}"
+                 " missing or unreadable) — keeping the last pushed pool state")
+    elif _advertisement_unavailable_logged:
+        _advertisement_unavailable_logged = False
+        _log("pool advertisement readable again")
+    return (identity, rec)
+
+
+def _defer_push(what: str, e: "urllib.error.HTTPError", now: float) -> float:
+    """The retry taxonomy both pushes share -> the absolute retry-at."""
+    if e.code in _UNSUPPORTED_ENDPOINT_STATUS:
+        _log(f"{what} deferred 1h: broker has no such endpoint (HTTP {e.code})")
+        return now + 3600
+    _log(f"{what} failed, retrying in 5m: endpoint exists, HTTP {e.code}")
+    return now + 300
+
+
+# The broker's copy is a replica: a broker restart empties it, and nothing on
+# our side changes, so resend both halves on a cadence even when unchanged.
+_REPUSH_EVERY_S = 600.0
+_last_full_push_at = 0.0
+_now = time.monotonic
+
+
+_PUSH_THREAD: "threading.Thread | None" = None
+_PUSH_LOCK = threading.Lock()
+# The profile PUT is unversioned and REPLACES the broker document, so a request
+# landing after a successor took the lock overwrites the successor's card.
+_OWNERSHIP_RELINQUISHED = threading.Event()
+
+
+def _publication_permitted() -> bool:
+    """False once ownership is being handed over: no request may START, because
+    its completion could land after a successor owns the document."""
+    return not _OWNERSHIP_RELINQUISHED.is_set()
+
+
+def _push_pool_advertisement() -> None:
+    """Hand the beat's publications to a daemon thread and return at once: both
+    requests carry 15 s timeouts and the intake poll must never wait on them.
+    A push still in flight from the last beat is left to finish; this beat's is
+    skipped, not queued, since the next beat re-reads the advertisement."""
+    global _PUSH_THREAD
+    with _PUSH_LOCK:
+        if _PUSH_THREAD is not None and _PUSH_THREAD.is_alive():
+            return
+        _PUSH_THREAD = threading.Thread(target=_push_pool_advertisement_now,
+                                        name="pool-advertisement", daemon=True)
+        _PUSH_THREAD.start()
+
+
+def _join_push_thread(timeout: float = 5.0) -> bool:
+    """A normal exit finishes the snapshot+card pair (bounded): the broker must
+    not be left holding a snapshot and a card from different revisions.
+
+    True when nothing is in flight — ownership may only be handed over then.
+    """
+    t = _PUSH_THREAD
+    if t is None or not t.is_alive():
+        return True
+    t.join(timeout)
+    return not t.is_alive()
+
+
+atexit.register(_join_push_thread)
+
+
+def _push_pool_advertisement_now() -> None:
+    """One read of the advertisement per beat, handed to BOTH publications:
+    two reads let a sibling writer's atomic rename land between them, and the
+    broker would then hold a snapshot and a card from different revisions."""
+    global _workers_pushed_identity, _profile_pushed_identity, _last_full_push_at
+    if _now() - _last_full_push_at >= _REPUSH_EVERY_S:
+        _workers_pushed_identity = ""
+        _profile_pushed_identity = ""
+        _last_full_push_at = _now()
+    try:
+        record = _advertisement_or_none()
+        _maybe_push_workers_snapshot(record)
+        _maybe_push_agent_profile(record)
+    except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
+        _log(f"pool advertisement push failed: {e}")
+
+
+def _maybe_push_workers_snapshot(record) -> bool:
+    """Push-on-change relay of the pool's workers snapshot (the worker
+    picker's read path). An unavailable advertisement pushes NOTHING and
+    leaves the broker holding the last snapshot we sent; an unsupported
+    endpoint backs the push off an hour and any other HTTP status 5m;
+    nothing here may ever break the task loop."""
+    global _workers_pushed_identity, _workers_push_retry_at
+    if not _publication_permitted():
+        return False
+    now = time.time()
+    if now < _workers_push_retry_at:
+        return False
+    identity, ad = record  # one read per beat, shared with the other publication
+    if ad is None:
+        return False
+    if identity == _workers_pushed_identity:
+        return False
+    try:
+        _req("POST", "/v1/workers", ad["workers"], timeout=15)
+    except urllib.error.HTTPError as e:
+        _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _workers_push_retry_at = now + 300
+        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        return False
+    _workers_pushed_identity = identity
+    _log("workers-snapshot pushed")
+    return True
+
+
+_profile_pushed_identity = ""
+_profile_push_retry_at = 0.0
+
+
+def _build_agent_profile(workers: "dict") -> "dict":
+    """The instance's identity card for PUT /v1/agents/{mxid}/profile.
+    Only instance-authoritative fields — appearance is user/platform-owned
+    and the broker drops it from instance PUTs anyway.
+
+    `workers` comes from an advertisement the caller already established is
+    AVAILABLE: the broker REPLACES the profile document, so this function must
+    never be reached with a map it could not read."""
+    name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
+    try:
+        host_id = socket.gethostname().split(".")[0]
+    except OSError:
+        host_id = "unknown-host"
+    return {"display": {"name": name},
+            "host": {"host_id": host_id, "kind": "local"},
+            "workers": workers}
+
+
+def _maybe_push_agent_profile(record) -> bool:
+    """Push-on-change relay of the agent's profile card. An unavailable
+    advertisement pushes NOTHING: the card carries the `workers` map the
+    picker draws and the broker REPLACES the document, so a card built from
+    a record we could not read would erase the pool. Same retry taxonomy as
+    the workers-snapshot push; nothing here may break the task loop."""
+    global _profile_pushed_identity, _profile_push_retry_at
+    if not _publication_permitted():
+        return False
+    now = time.time()
+    if now < _profile_push_retry_at:
+        return False
+    mxid = _reenroll_identity()
+    if not mxid:
+        return False  # identity may appear mid-episode; recheck next loop
+    identity, ad = record  # one read per beat, shared with the other publication
+    if ad is None:
+        return False
+    # The same record identity the workers push keys on, so the two halves
+    # can never disagree on whether a record is new; mxid may change mid-run.
+    key = f"{mxid}\n{identity}"
+    if key == _profile_pushed_identity:
+        return False
+    card = _build_agent_profile(ad["profile_workers"])
+    try:
+        _req("PUT", f"/v1/agents/{urllib.parse.quote(mxid, safe='')}/profile",
+             card, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_push_retry_at = _defer_push("agent-profile push", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _profile_push_retry_at = now + 300
+        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        return False
+    _profile_pushed_identity = key
+    _log(f"agent-profile pushed for {mxid}")
+    return True
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
@@ -1246,10 +2751,25 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway": _redact_url(URL),
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
+            "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
+                        **_ENGINE_COUNTS},
         }
+        # Recovery surface: recovered ONLY via the probe-success terminal; a
+        # missing block means "no episode known", never success.
+        if _reenroll_state.get("code"):
+            payload["reenroll"] = {
+                "pending": True,
+                "approval_code": _reenroll_state["code"],
+                "claimed_at": _reenroll_state["claimed_at"],
+            }
+        elif _reenroll_state.get("recovered_at"):
+            payload["reenroll"] = {
+                "pending": False,
+                "recovered": True,
+                "recovered_at": _reenroll_state["recovered_at"],
+            }
         # AWP P0 per-channel health: the task connection is `connected` above; the
         # additive event channel (if running) reports its own status, so a
-        # supervisor never shows the agent healthy while the event stream is dead.
         _ch = _EVENT_CHANNEL
         if _ch is not None:
             payload["channels"] = {
@@ -1261,7 +2781,6 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         GATEWAY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
         # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
         # but a shared temp name collides if a second sparrow instance ever runs;
-        # a per-PID temp is collision-proof for the cost of one getpid().
         tmp = GATEWAY_STATUS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
         with open(tmp, "w") as f:
             json.dump(payload, f)
@@ -1371,8 +2890,6 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     headers = {"User-Agent": "sutando-gateway-client/1.0"}
     # Credential routing is by PARSED exact origin, never string prefix or
     # substring — `https://relay.example.evil/...` must not receive the
-    # gateway bearer, and a foreign host serving a `/_matrix/` path must not
-    # receive the homeserver bearer (review 2026-07-03).
     try:
         _split = urllib.parse.urlsplit(url)
         _ = _split.port                    # raises ValueError on a malformed port
@@ -1403,7 +2920,6 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
             safe = safe[: -len(ext)]
         # Exclusive create (mkstemp) — two same-name saves in the same
         # millisecond must get distinct paths, never overwrite (review
-        # 2026-07-03).
         fd, path_str = tempfile.mkstemp(prefix=f"{safe}-", suffix=ext, dir=MEDIA_DIR)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -1423,10 +2939,6 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
 
 # Fleet-agent directory cache — peer agents (in the broker's /v1/agents) are
 # NEVER the human owner, so their messages must not set owner-presence. Only the
-# PRESENCE gate consults this; task authority (_tier_for) is deliberately left
-# untouched, so peer-to-peer delegation keeps its access_tier (a peer agent still
-# resolves to owner tier on a tierMap-less node and can still act — the two
-# consumers of _tier_for are decoupled here on purpose).
 _FLEET_AGENTS_TTL_S = 300.0
 _fleet_agents_cache: dict = {"ts": 0.0, "ids": set()}
 
@@ -1479,18 +2991,11 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         }
         # Propagate the routable room id so the core-supervisor relay can escalate
         # BACK into the AG2Space room the owner was last active in (resolve_active_
-        # target requires both `channel` and `channel_id`; without this it degrades
-        # to macOS-only for the gateway surface). Only when present — keeps the
-        # discord-bridge schema compatible for non-message activity.
         _cid = str(task.get("channel_id") or "").strip()
         if _cid:
             payload["channel_id"] = _cid
         # Per-PID staging: last-owner-activity.json is written by FOUR processes
         # (this sparrow bridge + slack/discord/telegram). A shared ".json.tmp"
-        # name lets two concurrent writers truncate and interleave the same temp
-        # file, so the rename can publish torn JSON to the proactive loop's
-        # presence check. A per-PID temp is never shared; os.replace is an atomic
-        # overwrite — last writer wins, cleanly. (sonichi/sutando#2222)
         tmp = OWNER_ACTIVITY_FILE.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
@@ -1498,9 +3003,58 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         _log(f"owner-activity write failed: {e}")
 
 
-def _write_task(task: dict) -> str | None:
+def _fsync_in_place(tid: str, *targets: Path) -> bool:
+    """fsync files (and directories) already on disk. A pre-durability writer
+    left these bytes uncommitted, so nothing may be claimed durable until this
+    lands; False when it did not."""
+    try:
+        for target in targets:
+            fd = os.open(target, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except OSError as exc:
+        _log(f"durability repair failed for {tid} ({exc})")
+        return False
+    return True
+
+
+def _repair_pending_task(tid: str, task: dict) -> bool:
+    """A task the gateway redelivered while it is still queued here: fsync the
+    queued file and its directory and (re)commit the media sidecar, so a task
+    written by a pre-durability client can still earn a `durable` ack."""
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    if not _fsync_in_place(tid, tfile, TASKS_DIR):
+        return False
+    return _record_task_media(tid, task)
+
+
+
+# Signal Room tasks (5G ⑤a-cap), AG2 Space adapter edge: names the ONE directory a
+# Team result may attach from; `attach_markers_confined` withholds anything else.
+def _signal_task_media_lines(media_dir: str) -> list[str]:
+    """Prose lines (no fence, no header-shaped line) appended after the Team
+    guardrail of a Signal Room task, naming the task's own media directory."""
+    output_q = shlex.quote(f"{media_dir}/<name>.png")  # a workspace path may hold spaces
+    return [
+        "",
+        "Signal Room media: this request came from a live Signal Room call. If it asks for "
+        "an image, illustration, chart or diagram, you MAY create ONE with the "
+        "image-generation skill (python3 skills/image-generation/scripts/generate.py "
+        f"--prompt \"...\" --output {output_q}), and you may save images you "
+        f"actually found. Save such files ONLY under {media_dir}/ (create the directory), "
+        f"then reference each on its own line as [file: {media_dir}/<name>.png] -- an "
+        "absolute path, up to 10 files. A file anywhere else is withheld from the room. "
+        "Write the prose answer first; a picture is garnish, never the answer.",
+    ]
+
+def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
-    Returns the task id, or None if it has no id / already present."""
+    Returns (task id, durable) — `durable` says the queue write and its sidecar
+    committed, which is what an ack may claim — or None when nothing was queued."""
     broker_tid = str(task.get("id") or "").strip()
     if not broker_tid:
         _log("dropping task with no id")
@@ -1510,37 +3064,37 @@ def _write_task(task: dict) -> str | None:
         return None
     # Everything from here down — filenames, ledgers, archives, the serialized
     # id: header the core echoes back as the result filename — uses the LOCAL
-    # id; `_broker_tid` restores the wire id at the ack/result POST boundary.
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
-    # Idempotent: don't re-write a task already queued, claimed, or archived.
-    if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
-        return tid
+    # Idempotent: don't re-write a task already queued, claimed, or archived —
+    # but a pre-S1 queue file still has to earn its durability before the ack.
+    if _task_pending(tid):
+        return tid, _repair_pending_task(tid, task)
     # Relay redelivery of already-handled work: on reconnect the gateway replays
     # its unacked pool, including tasks this node long since processed (the
-    # 2026-06-30 and 2026-07-01 500-task floods). If the core already archived
-    # the task file, or the result was already delivered and archived, don't
-    # re-queue — drop a [no-send] result instead so the normal result drain
-    # re-acks it upstream and clears it from inflight.
     _task_archive = TASKS_DIR / "archive"
     task_archived = (
         # legacy flat layout: tasks/archive/<taskId>.txt
         (_task_archive / f"{tid}.txt").exists()
         # active month-partitioned layout: tasks/archive/YYYY-MM/<taskId>.txt
         # (see src/task-bridge.ts). Glob one level of month subdirs for this
-        # exact task id — cheap (one stat per month dir, not a full tree walk).
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
-    if (task_archived
-            or (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists()
-            or next(ARCHIVE_RESULTS_DIR.glob(f"{tid}-[0-9]*.txt"), None)):
+    if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
-            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            rfile.write_text("[no-send] gateway redelivery of already-handled task\n")
+        if rfile.exists():
+            # A reply the local core wrote with a plain write_text: this process
+            # has committed nothing yet, so fsync before claiming durable.
+            durable = _fsync_in_place(tid, rfile, RESULTS_DIR)
+        else:
+            durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
+            # Provenance the result BODY cannot carry: a Team runtime controls
+            # the body and can emit these exact bytes, but not this process's set.
+            if durable:
+                _REDELIVERED.add(tid)
         _log(f"dedup: {tid} already handled — not re-queued")
-        return tid
+        return tid, durable
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest
     # wire tier keeps old nodes restricted and body text cannot opt itself in.
@@ -1555,15 +3109,19 @@ def _write_task(task: dict) -> str | None:
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
     lines = []
+    # Which instance took delivery (shared-room fan-out: each Sutando writes its own
+    # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
+    _recv = _reenroll_identity()
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
-        if f == "source":
+        if f == "session_scope":
+            if task.get(f) == "room":
+                lines.append("session_scope: room")
+        elif f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
             # all current gateway traffic is Matrix room messages. Whitelisted:
-            # the gateway is outside the trust boundary, so an unknown value
-            # degrades to the default instead of landing verbatim in the file.
             it = str(task.get("interaction_type") or "")
             if it not in _INTERACTION_TYPES:
                 it = "message"
@@ -1573,10 +3131,10 @@ def _write_task(task: dict) -> str | None:
             # trusted execution-policy header before all untrusted body text.
             if collaborator_enabled:
                 lines.append("collaborator: true")
+                if task.get("sensitive_data_filter") is False:
+                    lines.append("sensitive_data_filter: false")
             # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
             # reaches the agent as body content (owner directive 2026-07-16) —
-            # see _strip_room_ops_meta. Runs first so the stripped body is what
-            # media-resolution and the header write both see.
             _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
             if _stripped_meta:
                 _log(f"stripped untrusted room-ops metadata from {tid} body")
@@ -1604,10 +3162,6 @@ def _write_task(task: dict) -> str | None:
                 _fetched = _redact_fallback(_fetched)
             # Redact pasted secrets BEFORE the body is persisted (#2267 parity
             # with the discord/slack/telegram bridges): a token pasted into a
-            # room message must never land on disk. Runs AFTER media
-            # resolution (and after any vault interception above consumed a
-            # `vault set` line) so a signed media-proxy URL is consumed intact
-            # and only the resolved text is filtered.
             _filtered = filter_chat_secrets(_fetched)
             if _filtered.secret_types:
                 _secret_types = tuple(_filtered.secret_types)
@@ -1619,9 +3173,6 @@ def _write_task(task: dict) -> str | None:
             task["task"] = _filtered.text
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
-            # alongside the legacy [File attached:] body line (dual-write) via the
-            # shared local_task_protocol helper — same shape the 3 message bridges
-            # emit. has_text = caption present beyond the provider prefix + marker.
             if _media_refs:
                 _txt = re.sub(r"\[(?:File|Photo) attached: [^\]]*\]", "", _fetched).strip()
                 if _txt.startswith("[") and "]" in _txt:
@@ -1629,75 +3180,82 @@ def _write_task(task: dict) -> str | None:
                 _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "picker_args":
+            # Present-but-unusable is preserved as a refusing stamp, like
+            # picker_command: dropping it makes `add` + bad args a valid add.
+            if f in task:
+                pa = task[f]
+                if isinstance(pa, (dict, list)):
+                    # json.loads reads this, so re-serialize — _one_line would
+                    # emit a Python repr the reader cannot parse.
+                    lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
+                else:
+                    lines.append(f"picker_args: {'' if pa is None else _one_line(pa)}")
         elif f == "platform_card":
             # Signed platform-metadata pointer: re-serialize only the expected
             # subkeys as one compact JSON line (dict repr or extra keys never
-            # reach the file). json.dumps escapes newlines, so the value can't
-            # forge a header line even without _one_line.
             pc = task.get("platform_card")
             if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f == "picker_command":
+            # Present but unusable (empty OR null) reaches the parser as a
+            # refused stamp; dropping it lets prose decide an unstamped action.
+            if f in task:
+                _pc = task[f]
+                lines.append(f"picker_command: {'' if _pc is None else _one_line(_pc)}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
+            # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
+            if f == "id" and _recv:
+                lines.append(f"receiving_instance: {_one_line(_recv)}")
     # sender_tier is resolved once, ahead of the field loop above (needed there
     # for the "task" field's vault interception), and reused here unchanged.
-    # All preceding fields are newline-stripped, so none can forge a tier header.
     lines.append(f"access_tier: {sender_tier}")
     # The fixed prose notice follows access_tier without introducing recognized headers.
     if _secret_types:
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
-    # Guest retains the established read-only Codex path. Team is deliberately
-    # absent here: the runtime handler launches the owner's selected core in its
-    # native sandbox, so a Claude owner does not depend on Codex quota.
+    # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
+    # closing the Team session route removed the only thing that used to deliver it.
+    if sender_tier == "team":
+        if collaborator_enabled:
+            lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
+        else:
+            lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
+        # A relay-stamped Signal task may attach from ITS OWN output directory only;
+        # name it here (absolute) so the marker written is the one the guard confines.
+        if isinstance(task.get("signal"), dict):
+            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
-        lines.extend([
-            "",
-            "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
-            "This AG2Space task is GUEST tier, not owner tier.",
-            "Do not execute the request directly with the owner's unrestricted core.",
-            "Delegate it to Codex using `codex exec --sandbox read-only`.",
+        lines.extend(sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", f"results/{tid}.txt",
             "Research, inspect, explain, and draft only. Do not modify files or external systems.",
-            f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt.",
-            "===END SUTANDO SYSTEM INSTRUCTIONS===",
-        ])
+        ))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
-        _chan = _one_line(task.get("channel_id") or "")
-        # shlex.quote: an unescaped quote in _chan must not close the shell
-        # string early and turn the remainder into executable shell syntax.
-        _chan_q = shlex.quote(_chan)
-        _step = 1
-        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
-        if _chan:
-            _skill.append(
-                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
-                f"message, reconstruct the room thread — `python3 "
-                f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
-                f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
-                "back (everyone's messages including your own prior replies) until this "
-                "message stands on its own, then answer from the reconstructed thread, "
-                "NOT from memory. Do this every time; do NOT skip it because the message "
-                "looks self-contained or you feel you already understand it — felt "
-                "confidence is exactly the signal that fails. The only exception is a "
-                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
-            _step += 1
-            _skill.append(
-                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
-                f"skills/task-progress/scripts/notify.py --source ag2space "
-                f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
-            _step += 1
-        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
-        lines.extend(_skill)
-    tmp = dest.with_suffix(".txt.tmp")
-    tmp.write_text("\n".join(lines) + "\n")
-    tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
+        # Template lives in result_markers.render_skill_prelude (single owner):
+        # a dedup requeue re-renders it there from the stored header (#3613).
+        lines.extend(render_skill_prelude(
+            _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
+            _one_line(task.get("addressed_to") or "")))
+    from .local_task_protocol import apply_task_stamper
+    tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
+    if tmp is None:
+        _log(f"task write FAILED for {tid} — not queued, not acked")
+        return None
+    # The sidecar has to be visible BEFORE the task is: the results watcher is
+    # already running, so a sidecar written after the publish can lose the race.
+    if not _record_task_media(tid, task):
+        tmp.unlink(missing_ok=True)
+        _log(f"media sidecar FAILED for {tid} — not queued, not acked")
+        return None
+    if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
+        tmp.unlink(missing_ok=True)
+        return None
     _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
     # returns never reach here), bucketed to this gateway's own "remote" surface
-    # when the source label isn't an allowlisted bucket so activity isn't lost.
     try:
         from telemetry import bucket_source, task_processed
         task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
@@ -1707,7 +3265,7 @@ def _write_task(task: dict) -> str | None:
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
-    return tid
+    return tid, True
 
 
 def _load_dedup_aliases() -> "dict[str, str] | None":
@@ -1799,33 +3357,114 @@ def _forget_task_room(tid: str) -> None:
         _save_task_rooms(rooms)
 
 
-def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
-    """Upload one allowlisted local file to the task's room via the gateway
-    media endpoint. Returns (ok, reason)."""
+def _load_task_media() -> "dict | None":
+    """The per-task media-mode map, or None when it exists but cannot be read.
+
+    None is not the same as empty: guessing "no entry" sends a Signal task's
+    attachment down the room-scoped route, outside the task's own lease.
+    """
+    if not TASK_MEDIA_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(TASK_MEDIA_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"task-media sidecar unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _record_task_media(tid: str, task: dict) -> bool:
+    """Commit this task's media mode, keyed by the WIRE id the media route posts
+    under. True when there is nothing to record (an ordinary relay task)."""
+    if not isinstance(task.get("signal"), dict):
+        return True
+    # A matching entry is re-committed rather than skipped: on the repair path an
+    # entry can be visible from a rename whose directory fsync never landed.
+    with _TASK_MEDIA_MUTEX:
+        media = _load_task_media()
+        if media is None:
+            return False
+        media[_broker_tid(tid)] = {"mode": "task-media",
+                                   "thread_root": str(task.get("thread_root") or "")}
+        return _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
+
+
+def _forget_task_media(tid: str) -> None:
+    """Retire a finished delivery's media mode (best-effort, like the room map)."""
+    delivery = _delivery_tid(tid)
+    if delivery is None:
+        return
+    with _TASK_MEDIA_MUTEX:
+        media = _load_task_media()
+        if media is None:
+            return
+        if media.pop(_broker_tid(delivery), None) is not None:
+            _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
+
+
+def _read_attachment(path_str: str) -> "tuple[str, str, str]":
+    """(basename, base64 bytes, "") for an allowlisted readable file, or
+    ("", "", reason) — the refusals both upload routes report in-band."""
     fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
     if not is_path_sendable(fpath):
-        return False, "path not allowlisted"
+        return "", "", "path not allowlisted"
     try:
         size = os.path.getsize(fpath)
     except OSError as e:
-        return False, f"stat failed: {e}"
+        return "", "", f"stat failed: {e}"
     if size > MAX_MEDIA_BYTES:
-        return False, f"file exceeds {MAX_MEDIA_BYTES} bytes"
+        return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
     try:
         with open(fpath, "rb") as f:
-            content_b64 = base64.b64encode(f.read()).decode("ascii")
+            return os.path.basename(fpath), base64.b64encode(f.read()).decode("ascii"), ""
     except OSError as e:
-        return False, f"read failed: {e}"
+        return "", "", f"read failed: {e}"
+
+
+def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
+    """Upload one allowlisted local file to the task's room via the gateway
+    media endpoint. Returns (ok, reason)."""
+    name, content_b64, reason = _read_attachment(path_str)
+    if reason:
+        return False, reason
     safe_room = urllib.parse.quote(room, safe="")
     try:
         _req("POST", f"/v1/rooms/{safe_room}/media",
-             {"filename": os.path.basename(fpath), "content_b64": content_b64},
-             timeout=60)
+             {"filename": name, "content_b64": content_b64}, timeout=60)
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError) as e:
         return False, f"network error: {e}"
     return True, ""
+
+
+def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple[str, str]":
+    """Upload one attachment against a Signal task's own lease. Returns
+    ("ok"|"note"|"defer", reason).
+
+    "defer" holds the WHOLE result for the next scan rather than collapsing to
+    an in-band note: the retry has to re-offer the same wire id, ordinal and
+    bytes for the relay to resume the upload it may already have recorded.
+    """
+    name, content_b64, reason = _read_attachment(path_str)
+    if reason:
+        return "note", reason
+    safe_tid = urllib.parse.quote(wire_id, safe="")
+    try:
+        _req("POST", f"/v1/tasks/{safe_tid}/media",
+             {"ordinal": ordinal, "filename": name, "content_b64": content_b64},
+             timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return "note", "content conflicts with the recorded upload"
+        if e.code == 423:
+            return "note", "room is encrypted"
+        if e.code >= 500:
+            return "defer", f"HTTP {e.code}"
+        return "note", f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return "defer", f"network error: {e}"
+    return "ok", ""
 
 
 def _archive_result(path: Path, tid: str) -> None:
@@ -1836,11 +3475,6 @@ def _archive_result(path: Path, tid: str) -> None:
         path.unlink(missing_ok=True)
     # The delivered task's queue file comes along too — otherwise served tasks
     # sit in tasks/ forever and the health-check counts them as a stuck queue.
-    # find_task_file resolves the ACTUAL filename: bare `<tid>.txt` or the
-    # claimed variant `<tid>.claimed-core-N.txt` the core renames to while
-    # processing (review catch: probing only the bare name left claimed files
-    # behind, and health-check counts every top-level tasks/*.txt). Archived
-    # under the bare name — the shape _write_task's redelivery dedup checks.
     tfile = find_task_file(TASKS_DIR, tid)
     if tfile is not None:
         archive_dir = TASKS_DIR / "archive"
@@ -1853,55 +3487,21 @@ def _archive_result(path: Path, tid: str) -> None:
 
 # A legacy bare `.sending` claim carries no owner info, so recovery for those
 # falls back to an age guard: younger than this = possibly a live worker's
-# in-flight claim, leave it alone. This guard is DELIBERATELY legacy-only —
-# new claims are pid-scoped, and pid-liveness is a stronger signal than age
-# (it recovers a dead worker's claim immediately instead of after 10 minutes),
-# so it supersedes rather than complements this threshold.
 _ORPHAN_MIN_AGE_S = 600
 
 # An empty body observed right after claiming is a writer mid-flush, so it is
 # always re-queued — and NEVER moved to a terminal resting place.
-#
-# History: this was first an mtime age cutoff, then an observation-time cutoff
-# (_EMPTY_ABANDON_S). Both are unsound for the same reason: NOTHING observable
-# from outside the writer — mtime, size, or how long WE have watched it empty —
-# proves the producer has closed its descriptor. A file held open with no write
-# keeps its creation mtime AND stays empty for as long as the writer is paused,
-# so any finite cutoff dead-letters a still-open writer; its later flush then
-# lands in the moved inode and is silently lost — the exact harm this drain
-# exists to remove (review blocker, air 2026-07-28). So there is no abandonment
-# horizon at all: an empty claim is handed back unconditionally, forever, and a
-# flush at ANY later time is delivered on a subsequent pass. A genuinely
-# orphaned 0-byte file (producer crashed before its first write) is inert — never
-# delivered, never moved by this path, which must not be the thing that decides a
-# producer is done. There is no automatic sweeper for it (checked: neither
-# disk-hygiene.sh nor results-health.sh delete results files — the latter only
-# REPORTS zero-byte counts). It is surfaced by scripts/results-health.sh for
-# deliberate cleanup, and the mtime-keyed archiver excludes it too
-# (archive-stale-results.py, sonichi/sutando#2360) so the never-moved guarantee
-# holds end-to-end. A slowly-accumulating set of 0-byte remnants is the accepted
-# benign cost of never risking a real message.
-#
-# Producers SHOULD publish atomically (write a temp, then rename into
-# proactive-*.txt) so an empty file is never observed at all — but producers are
-# heterogeneous (voice-agent.ts, morning-briefing.py, task-bridge.ts, and the
-# core agent writing ad-hoc), with no single chokepoint to enforce that, so the
-# drain stays correct for the ones that don't.
 
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
-# gains a body (so a later empty re-observation logs again).
 _EMPTY_LOGGED: "set[str]" = set()
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
-# Well under the 64 KiB event ceiling to leave room for envelope overhead.
 _PROACTIVE_MAX_BODY_B = 48 * 1024
 
 # Destination FORMAT validation is this bridge's own job ("the bridge
 # validates the id format for its platform when applying" — result_markers).
-# Matrix room ids only; Discord (17-20 digit) / Slack ([CDG]…) redirect
-# targets belong to their own bridges and their files are left unclaimed.
 _MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
 
 
@@ -1933,6 +3533,38 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return ("send", None, parsed.body)
 
 
+def _own_homeserver() -> str:
+    """The server this lane's agent lives on, from its enrolled identity;
+    "" when the identity is unknown (then nothing below can discriminate)."""
+    mxid = _reenroll_identity()
+    # FIRST colon: the server part may itself carry a port or an IPv6 bracket.
+    return mxid.split(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
+
+
+def _room_is_deliverable_here(room: str) -> bool:
+    """A gateway posts only to rooms on its own homeserver. Another lane's room
+    must be left for that lane: claiming it here fails at the gateway and the
+    retry budget then parks deliverable work as undeliverable."""
+    own = _own_homeserver()
+    if not own:
+        return True  # identity unknown: today's behaviour, deliberately
+    if ":" not in room:
+        return False  # names no server: deliverable nowhere, strands visibly
+    return room.split(":", 1)[1] == own
+
+
+def _record_proactive_receipt(item_id: str, room: str) -> None:
+    """Durable "delivered where" for the proactive leg. The log line naming the
+    room rotates; this outlives it. Fail-open: a receipt write must never
+    unwind a delivery that already happened."""
+    try:
+        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
+                         provider="ag2space-proactive", destination=room)
+    except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
+        _log(f"proactive receipt write failed for {item_id}: {e} "
+             "(delivery unaffected)")
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -1949,9 +3581,8 @@ def _recover_orphan_proactive() -> None:
     claim (review blocker). Claims are pid-scoped (`.sending.<pid>`): a claim
     whose owner pid is alive is left alone; a dead owner's claim recovers
     immediately. Legacy bare `.sending` claims (no owner info) recover only
-    past an age threshold."""
-    if not PROACTIVE_ROOM:
-        return
+    past an age threshold. Runs without PROACTIVE_ROOM: a file naming its own room
+    is now drainable, so its orphan claims must recover too."""
     for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
             + list(RESULTS_DIR.glob("proactive-*.sending")):
         name = f.name
@@ -2001,6 +3632,27 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             pass
 
 
+def _resolve_send_failure(claim, original, exc) -> str:
+    """Bounded retry: decision AND file moves are the shared policy's
+    (send_failure_policy.resolve_failed_send). This binder passes sparrow's
+    pid-scoped claim's real body path — with_suffix() cannot derive it — and
+    the park directory, then renders the bridge's log phrase. Single sends
+    can't partially deliver, so `progressed` stays False here.
+
+    Returns the phrase for the caller's log line.
+    """
+    tried = _PROACTIVE_ATTEMPTS.get(original.name, 0)
+    outcome = resolve_failed_send(
+        claim, exc, _PROACTIVE_ATTEMPTS,
+        body=original, undelivered_dir=UNDELIVERABLE_RESULTS_DIR)
+    if outcome == "retried":
+        return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
+    if outcome == "parked":
+        return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
+                "send attempt(s) — it will NOT be re-sent")
+    return "stuck"
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -2009,21 +3661,34 @@ def _post_proactive() -> None:
     file archives beside task results; a failed POST renames the claim back
     to `.txt` for retry on the next loop pass. Auth errors propagate to the
     caller (the poll loop owns auth handling); everything else is per-file
-    fail-open — one malformed nudge never blocks the rest. No-op without
-    PROACTIVE_ROOM."""
-    if not PROACTIVE_ROOM:
-        return
+    fail-open — one malformed nudge never blocks the rest. A file naming its own
+    Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
+    with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
+    that belongs to another bridge (cross-bridge routing stays host policy)."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
-        # claiming it here would leak the raw body (marker included) to the
-        # gateway room and starve the real consumer (review blocker).
         try:
-            route, _, _ = _proactive_route(f.read_text(encoding="utf-8"))
+            route, peek_room, _ = _proactive_route(f.read_text(encoding="utf-8"))
         except OSError:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if route == "send" and peek_room is not None and not _room_is_deliverable_here(peek_room):
+            continue  # another homeserver's lane owns it; a claim here can only park it
+        # No target of its own AND no default: skip BEFORE claiming. Claiming it
+        # would spin (claim -> no destination -> hand back) on every pass.
+        if route == "send" and peek_room is None and GATEWAY_INSTANCE:
+            continue  # a named secondary never owns unaddressed nudges; the primary runs without GATEWAY_INSTANCE
+        if route == "send" and peek_room is None and not proactive_room():
+            _held(f"owner-directed {f.name}")
+            continue
+        if PROACTIVE_CLAIM_GATE is not None:
+            try:
+                if not PROACTIVE_CLAIM_GATE(f):
+                    continue  # another bridge's file right now; retry next pass
+            except Exception:
+                pass  # a broken gate must not strand owner nudges — claim
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -2033,19 +3698,12 @@ def _post_proactive() -> None:
             continue
         # Re-read and re-route AFTER the claim, and act only on THIS result.
         # The peek above can observe a writer mid-write (file created, body not
-        # yet flushed); acting on that stale empty read is what silently
-        # destroyed a nudge (review blocker). Renaming does not disturb the
-        # writer's descriptor, so the post-claim read sees the flushed body.
         try:
             route, room_override, routed_body = _proactive_route(
                 claim.read_text(encoding="utf-8"))
         except OSError as exc:
             # A TRANSIENT post-claim read failure must not strand the nudge: the
             # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
-            # refuses to steal a LIVE pid's claim, so leaving it here loses the
-            # owner message until THIS bridge process exits (review blocker).
-            # Hand the claim back to the original `.txt` for a later pass; if even
-            # the restore fails, log loudly so the stranded inode is visible.
             try:
                 claim.rename(f)
             except OSError as restore_exc:
@@ -2053,9 +3711,12 @@ def _post_proactive() -> None:
                      f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
-        if route == "foreign":
-            # A foreign destination that only became visible post-claim: hand
-            # the file back to its real consumer rather than eating it.
+        if route == "foreign" or (
+                route == "send" and room_override is not None
+                and not _room_is_deliverable_here(room_override)) or (
+                route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
+            # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
+            # and left an unaddressed body this instance may not own or cannot place.
             try:
                 claim.rename(f)
             except OSError:
@@ -2064,8 +3725,6 @@ def _post_proactive() -> None:
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
-            # an archive failure _retire_proactive hands the claim back rather
-            # than unlinking.
             _log(f"proactive {f.name} carries a skip marker — archiving, no send")
             _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
             continue
@@ -2073,14 +3732,6 @@ def _post_proactive() -> None:
         if not body:
             # An empty claim means the producer has not flushed the body yet.
             # NEVER move this inode: no observable signal proves the writer is
-            # done, so a dead-letter (rename to undeliverable/) would strand a
-            # slow/paused writer's later flush in the moved inode and silently
-            # lose an owner-facing nudge — the exact harm this drain removes.
-            # Hand the claim back UNCONDITIONALLY (no abandonment horizon) so a
-            # flush at any later time is delivered on a subsequent pass; log
-            # once per file so a genuinely orphaned 0-byte remnant (producer
-            # crashed pre-flush, reported by results-health.sh for cleanup) does
-            # not spam every pass.
             if f.name not in _EMPTY_LOGGED:
                 _EMPTY_LOGGED.add(f.name)
                 _log(f"proactive {f.name} claimed empty — producer has not "
@@ -2097,39 +3748,32 @@ def _post_proactive() -> None:
         if len(body.encode("utf-8")) > _PROACTIVE_MAX_BODY_B:
             # Every failure branch below re-queues unconditionally, so a body
             # that can NEVER be delivered would retry and log on every loop
-            # pass forever. An oversized body is exactly that case, and it is
-            # decidable here — dead-letter it once instead (review: retry
-            # ceiling). Undeliverable-for-other-reasons (kicked from the room,
-            # typo'd room id) still retries by design, so a misconfigured room
-            # stays loud.
             _log(f"proactive {f.name} body is "
                  f"{len(body.encode('utf-8'))}B (> {_PROACTIVE_MAX_BODY_B}B) "
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
+        dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
-                         "room_id": room_override or PROACTIVE_ROOM,
+                         "room_id": dest_room,
                          "body": body},
                         timeout=15)
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
             # room-send failure server-side (bad room id, kicked agent,
-            # power-level denial) and still answer 200 (review P1). Archive
-            # ONLY on the positive delivery signal — the event id of the
-            # posted message (the deployed broker returns
-            # {"ok": true, "event_id": "$..."}). Anything else is treated as
-            # a failed send: the claim is renamed back and retried next pass,
-            # loudly, so a misconfigured room is visible instead of silently
-            # eating nudges.
-            if not (isinstance(resp, dict) and resp.get("event_id")):
+            receipt = classify_response(200, resp, id_keys=("event_id",))
+            delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
+                PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
+            )
+            if not delivered:
+                # Accepted but unconfirmed. It may ALSO have been delivered, so
+                # the retry must be bounded — an unbounded one duplicates.
+                outcome = _resolve_send_failure(
+                    claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(response {str(resp)[:120]!r}) — will retry; check "
+                     f"(response {str(resp)[:120]!r}) — {outcome}; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
-                try:
-                    claim.rename(f)
-                except OSError:
-                    pass
                 continue
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -2138,50 +3782,52 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            outcome = _resolve_send_failure(claim, f, e)
+            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
             continue
         except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"proactive send network error for {f.name}: {e} — will retry")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            outcome = _resolve_send_failure(claim, f, e)
+            _log(f"proactive send network error for {f.name}: {e} — {outcome}")
             continue
+        _record_proactive_receipt(f.stem, dest_room)
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError:
             claim.unlink(missing_ok=True)
-        _log(f"delivered proactive {f.name}")
+        _PROACTIVE_ATTEMPTS.pop(f.name, None)
+        _ENGINE_COUNTS["legacy_sends"] += 1
+        _log(f"delivered proactive {f.name} to {dest_room}")
 
 
 def _load_inflight() -> set[str]:
-    """Restore the in-flight set from disk (fail-open to empty)."""
+    """Restore the in-flight set from disk (fail-open to empty).
+    A failed restore also sets _INFLIGHT_DEGRADED: the empty set it returns then
+    means "unknown", which is not what FileNotFoundError's empty set means."""
+    global _INFLIGHT_DEGRADED
     try:
         data = json.loads(INFLIGHT_FILE.read_text())
-        return {str(t) for t in data} if isinstance(data, list) else set()
+        if isinstance(data, list):
+            return {str(t) for t in data}
+        _INFLIGHT_DEGRADED = True
+        _log(f"inflight file is {type(data).__name__}, not a list — starting empty")
+        return set()
     except FileNotFoundError:
         return set()
     except Exception as e:  # noqa: BLE001
+        _INFLIGHT_DEGRADED = True
         _log(f"inflight file unreadable ({e}) — starting empty")
         return set()
 
 
-def _save_inflight(inflight: set[str]) -> None:
-    """Atomically persist the in-flight set. Best-effort (never blocks the loop)."""
-    try:
-        INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
-        # second sparrow instance ever runs. os.replace is atomic overwrite.
-        tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(sorted(inflight)))
-        os.replace(tmp, INFLIGHT_FILE)
-    except Exception as e:  # noqa: BLE001
-        _log(f"inflight persist failed ({e}) — continuing")
+def _save_inflight(inflight: set[str]) -> bool:
+    """Durably persist the in-flight set; False when it did not commit, which
+    withholds the ack that would have claimed it.
+    The mutex covers snapshot+write: the poll loop and the outbound worker both
+    save, and an unguarded interleave could persist a state missing the other
+    thread's mutation (resurrecting a delivered id or dropping a fresh one)."""
+    with _INFLIGHT_MUTEX:
+        return _durable_write(INFLIGHT_FILE, json.dumps(sorted(inflight)))
 
 
 # (tid, path) pairs already uploaded this process — result-POST retry guard.
@@ -2213,8 +3859,137 @@ def _dedup_plan(tid: str, holder_id: str | None):
 
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
+        channel_dir=CHANNEL_DIR)
     return action, payload, room
+
+
+def _lease_close_body(skip) -> str:
+    """Canonical bytes for a lease close — the marker, never the sender's prose.
+
+    The guard decides THAT a result is suppressed; what rides this wire is the
+    transport's own choice, and nobody reads a suppressed body.
+    """
+    if skip.value == "deduped":
+        extra = (skip.extra or "").strip()
+        return (f"[deduped: {extra}]"
+                if local_task_protocol.valid_archive_lookup_id(extra) else "[no-send]")
+    return "[REPLIED]" if skip.value == "REPLIED" else "[no-send]"
+
+
+_DELIVERY_CORE: "DeliveryCore | None" = None
+
+
+def _delivery_core() -> DeliveryCore:
+    """The outbound result leg behind the ClaimBackend/DeliveryProvider seam:
+    claim, retry, ambiguity and crash-recovery semantics live in DeliveryCore;
+    this bridge keeps presentation (guard, markers, attachments) and the
+    resolved dirs. The ceiling is the shared outbound cap, NOT the legacy
+    retry-every-pass behaviour: an unbounded retry is a duplicate generator.
+    The root lives INSIDE the
+    results dir it drains (archive/ and undelivered/ precedent), so every
+    harness that redirects RESULTS_DIR is hermetic for free; the singleton is
+    keyed by that root and recomposes when it moves."""
+    global _DELIVERY_CORE
+    root = RESULTS_DIR / f".outbox{_INST_SUFFIX}"
+    if _DELIVERY_CORE is None or _DELIVERY_CORE.backend.root != root:
+        _DELIVERY_CORE = DeliveryCore(
+            DesignAClaimBackend(root),
+            # Late-bound so token rotation reassigning module globals (and the
+            # test harness's _req double) reach the provider mid-process.
+            AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
+            policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS),
+            worker="gateway-result-drain")
+    return _DELIVERY_CORE
+
+
+def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
+    """Move a result the outbox has finally refused into results/undelivered/,
+    the same quarantine the proactive path uses. Without this the file is
+    rescanned every pass and the refusal is invisible.
+
+    The printed command must carry BOTH ids on a named instance: the record is
+    keyed by the broker id and the body file by the local one, so neither alone
+    recovers both halves.
+    """
+    try:
+        undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
+        _log(f"result {tid}: {why} — quarantined to "
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
+             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"requeue {_broker_tid(tid)} "
+             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+    except OSError as e:
+        _log(f"result {tid}: {why} but quarantine failed ({e}) — "
+             "leaving it in place")
+
+
+def _worker_of(task_id: str) -> str:
+    """Which pool worker finished this task, read from the per-core done-flag.
+    `task_id` is the result stem, which already carries the `task-` prefix."""
+    try:
+        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
+    except OSError:
+        return ""
+    return hits[0].parent.parent.name if len(hits) == 1 else ""
+
+
+def _deliver_result_payload(tid: str, broker_tid: str, body: str,
+                            no_send: bool = False, result_file=None) -> bool:
+    """One outbound result POST through the delivery core. True = the
+    gateway confirmed (server lease closed; caller archives). False = not
+    confirmed this pass; leave the result file for the next one."""
+    core = _delivery_core()
+    # `no_send` is the broker's STRUCTURED suppression field: the lease must
+    # close without a user-facing send. It rides the payload, not the body.
+    doc = {"id": broker_tid, "body": body}
+    if no_send:
+        doc["no_send"] = True
+    # Structured attribution, not the "— core-N" prose in the body: the
+    # signature is for humans and reformatting it must not change routing.
+    worker = _worker_of(tid)
+    if worker:
+        doc["metadata"] = {"worker_id": worker}
+    payload = json.dumps(doc).encode("utf-8")
+    core.backend.publish(broker_tid, payload)   # False = already live: retry pass
+    res = core.deliver_one(broker_tid, payload)
+    if res.status is DrainStatus.TERMINAL:
+        # The outbox has decided this item; no pass will ever claim it again,
+        # so retrying logs forever and hides the failure behind "will retry".
+        why = (f"outbox item is terminal after "
+               f"{core.backend.attempts(broker_tid)} attempt(s)")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} — not retrying")
+        return False
+    if res.status is DrainStatus.NOT_CLAIMED:
+        # A dead prior incarnation's claim; reclaim-TTL recovers it, and
+        # with an idempotent provider nothing parks on ambiguity.
+        _log(f"result {tid}: outbox item not claimable this pass "
+             f"(attempts={core.backend.attempts(broker_tid)}) — will retry")
+        return False
+    if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        _ENGINE_COUNTS["core_confirmed"] += 1
+        # A confirmed send was otherwise silent, so nothing on the happy path
+        # told a live round trip apart from the legacy one it replaces.
+        _log(f"result {tid} delivered via DeliveryCore "
+             f"(provider={type(core.provider).__name__}, "
+             f"backend={type(core.backend).__name__}, worker={core.worker})")
+        return True
+    _log(f"result POST not confirmed for {tid} "
+         f"({res.outcome.value if res.outcome else '?'}) — will retry")
+    return False
+
+
+def _result_tier(tid: str) -> "str | None":
+    """Resolve the task tier; unknown provenance stays on the guarded path."""
+    try:
+        tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+        return (team_result_guard.resolve_access_tier(tfile)
+                if tfile is not None else "guest")
+    except Exception:
+        return None
 
 
 def _post_ready_results(inflight: set[str]) -> None:
@@ -2225,13 +4000,23 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        body = read_ready_result(rfile)
-        if body is None:
+        raw = read_ready_result(rfile)
+        if raw is None:
             continue
+        # The guard honours suppression on every tier now, so there is no stub
+        # to pre-apply; the ordinary guarded path returns the body unchanged.
+        body, _withheld = _guarded_result_body(tid, raw)
+        if body is None:
+            _log(f"result guard unavailable for {tid} — leaving for retry")
+            continue
+        if _withheld:
+            _log(f"withheld non-owner result for {tid}: {_withheld}")
         # Route marker decisions through the unified parser (#873) like the
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        # Every dedup marker routes through the shared plan, malformed included:
+        # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":
             action, payload, room = _dedup_plan(tid, skip.extra)
             if action == "defer":
@@ -2246,80 +4031,110 @@ def _post_ready_results(inflight: set[str]) -> None:
                     if _delivery is None:
                         _log(f"dedup report deferred for {tid} — ledger unreadable")
                         continue
-                    try:
-                        _req("POST", "/v1/results",
-                             {"id": _broker_tid(_delivery), "body": payload})
-                    except (urllib.error.URLError, urllib.error.HTTPError,
-                            TimeoutError) as exc:
-                        # The report IS the delivery here. Archiving now would
-                        # strand the ask exactly as the unreported dedup did.
-                        _log(f"dedup report POST failed for {tid}: {exc} — will retry")
+                    # The report IS the delivery: archiving before confirm
+                    # would strand the ask exactly as the unreported dedup did.
+                    if not _deliver_result_payload(tid, _broker_tid(_delivery),
+                                                  payload):
                         continue
-                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _holder = (skip.extra or "").strip()
+                # An out-of-grammar holder is sender-controlled; name its shape,
+                # never its bytes.
+                _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
+                          else f"<malformed, {len(_holder)} chars>")
+                _log(f"dedup {action} for {tid} (holder {_shown} delivered nothing)")
                 _archive_result(rfile, tid)
                 inflight.discard(tid)
                 _forget_task_room(tid)
+                # A requeue carries the SAME delivery forward under a fresh local
+                # id, so only a retired delivery gives up its media mode.
+                if action != "requeue":
+                    _forget_task_media(tid)
                 _forget_dedup_alias(tid)
                 if action == "requeue":
                     inflight.add(payload)
                 changed = True
                 continue
         if skip:
-            # [no-send]/[REPLIED]/[deduped:] mean "no user-facing reply":
-            # archive without POSTing (match the other bridges' semantics).
+            # Skip markers still POST: only add_result closes the server lease;
+            # the server suppresses their user-facing delivery.
+            _delivery = _delivery_tid(tid)
+            if _delivery is None:
+                _log(f"delivery deferred for {tid} — alias ledger unreadable")
+                continue
+            if not _deliver_result_payload(tid, _broker_tid(_delivery),
+                                           _lease_close_body(skip),
+                                           no_send=True):
+                continue
             _archive_result(rfile, tid)
+            # Retire the provenance WITH the result, never at read: this line is
+            # only reached once the lease-closing POST has actually succeeded.
+            _REDELIVERED.discard(tid)
             inflight.discard(tid)
             _forget_task_room(tid)
+            _forget_task_media(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
         if redirect:
             # Cross-room redirect is handled GATEWAY-side for this transport —
             # re-stitch the marker the parser stripped so the server still
-            # sees it as the first line.
             out_body = f"[channel: {redirect.value}]\n{out_body}"
         attaches = [a.value for a in parsed.actions if a.kind == "attach"]
+        # Resolved before the uploads: a Signal task posts its media under the
+        # DELIVERY id, and an unreadable ledger must defer rather than guess.
+        _delivery = _delivery_tid(tid)
+        if _delivery is None:
+            _log(f"delivery deferred for {tid} — alias ledger unreadable")
+            continue
+        _wire = _broker_tid(_delivery)
         if attaches:
+            _media = _load_task_media()
+            if _media is None:
+                _log(f"delivery deferred for {tid} — media sidecar unreadable")
+                continue
+            task_media = (_media.get(_wire) or {}).get("mode") == "task-media"
             room = _load_task_rooms().get(tid, "")
             sent = 0
-            for fp in attaches:
+            deferred = False
+            for ordinal, fp in enumerate(attaches):
                 # Uploads happen before the result POST (so failures can be
                 # annotated in-band); if that POST then fails and this loop
-                # retries, don't re-upload the same file into the room.
                 if (tid, fp) in _uploaded_attachments:
                     sent += 1
                     continue
-                ok, reason = (_upload_attachment(room, fp) if room
-                              else (False, "origin room unknown"))
-                if ok:
+                if task_media:
+                    status, reason = _upload_task_attachment(_wire, ordinal, fp)
+                else:
+                    ok, reason = (_upload_attachment(room, fp) if room
+                                  else (False, "origin room unknown"))
+                    status = "ok" if ok else "note"
+                if status == "defer":
+                    # A retryable upload failure holds the whole result: the next
+                    # scan re-offers the same wire id, ordinal and bytes.
+                    _log(f"attachment deferred for {tid}: {fp} ({reason})")
+                    deferred = True
+                    break
+                if status == "ok":
                     sent += 1
                     _uploaded_attachments.add((tid, fp))
-                    _log(f"attached {fp} to {room} for {tid}")
+                    _log(f"attached {fp} for {tid}")
                 else:
                     # Keep the information in-band rather than dropping the
                     # file silently — mirrors the other bridges' rejection UX.
                     out_body += f"\n[attachment not sent: {fp} ({reason})]"
                     _log(f"attachment skipped for {tid}: {fp} ({reason})")
+            if deferred:
+                continue
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
-        try:
-            _delivery = _delivery_tid(tid)
-            if _delivery is None:
-                _log(f"delivery deferred for {tid} — alias ledger unreadable")
-                continue
-            _req("POST", "/v1/results",
-                 {"id": _broker_tid(_delivery), "body": out_body})
-        except urllib.error.HTTPError as e:
-            _log(f"result POST failed for {tid}: HTTP {e.code} — will retry")
-            continue
-        except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"result POST network error for {tid}: {e} — will retry")
+        if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)
         _forget_task_room(tid)
+        _forget_task_media(tid)
         _forget_dedup_alias(tid)
         changed = True
         _log(f"delivered result for {tid}")
@@ -2344,9 +4159,9 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
             if _valid_local_tid(tid)
-            and not (TASKS_DIR / f"{tid}.txt").exists()
-            and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
-            and not (RESULTS_DIR / f"{tid}.txt").exists()}
+            and not _task_pending(tid)
+            and not (RESULTS_DIR / f"{tid}.txt").exists()
+            and not _task_archived_recently(tid)}
     confirmed = gone & suspects
     if confirmed:
         for tid in sorted(confirmed):
@@ -2356,16 +4171,195 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     return gone - confirmed
 
 
+# A task archived here minutes ago was completed HERE, not elsewhere — its
+# result may still be seconds away (measured 7-minute gap, sonichi/sutando#3009).
+ARCHIVE_COMPLETION_GRACE_S = 1800.0
+
+
+def _archived_task_file(tid: str):
+    """The archived task file for tid, or None — flat and month-partitioned."""
+    base = TASKS_DIR / "archive"
+    flat = base / f"{tid}.txt"
+    if flat.exists():
+        return flat
+    hits = sorted(base.glob(f"*/{tid}.txt"))
+    return hits[-1] if hits else None
+
+
+def _task_archived_recently(tid: str) -> bool:
+    f = _archived_task_file(tid)
+    if f is None:
+        return False
+    try:
+        return (time.time() - f.stat().st_mtime) < ARCHIVE_COMPLETION_GRACE_S
+    except OSError:
+        return False
+
+
+# ── orphan-result reconciler (sonichi/sutando#3009) ─────────────────────────
+# Results whose tid left the in-flight ledger have no consumer.
+ORPHAN_SWEEP_EVERY_S = 600.0
+ORPHAN_GRACE_S = 600.0
+# Beyond this, an automatic sweep must not replay into a live room.
+ORPHAN_MAX_AGE_S = 86400.0
+_last_orphan_sweep = 0.0
+_orphan_quarantine_logged: set = set()
+
+
+# Exactly what the writers emit after `{tid}`: ONE epoch, optionally tagged,
+# optionally uniquified. A second `-\d+` would re-admit a longer id's entry.
+_ARCHIVE_SUFFIX = re.compile(r"-\d+(?:-late-duplicate)?(?:\.\d+)?\.txt\Z")
+
+
+def _delivered_copy_exists(tid: str) -> bool:
+    """Both archive conventions: flat `<tid>-<ts>.txt` AND month-partitioned
+    `YYYY-MM/<tid>.txt` (bare name) — a flat-only probe mis-routes real
+    replies to re-delivery (peer-measured 4/50 on a live corpus)."""
+    # The id boundary must be unambiguous: a bare `{tid}-*` glob also matches
+    # a LONGER valid id's archive entry, so `task-a` reads as delivered.
+    if any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
+           for p in ARCHIVE_RESULTS_DIR.glob(f"{tid}-*.txt")):
+        return True
+    if (ARCHIVE_RESULTS_DIR / f"{tid}.txt").exists():   # flat bare: retired writer
+        return True
+    if any(ARCHIVE_RESULTS_DIR.glob(f"*/{tid}.txt")):
+        return True
+    return any(_ARCHIVE_SUFFIX.fullmatch(p.name[len(tid):])
+               for p in ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
+
+
+def _move_no_clobber(src, dst) -> bool:
+    """Move src to dst or a uniquified sibling, never over an existing file:
+    os.link fails EEXIST atomically, where exists-then-rename clobbers."""
+    for candidate in (dst, dst.with_name(f"{dst.stem}.{time.time_ns()}{dst.suffix}")):
+        try:
+            os.link(str(src), str(candidate))
+        except FileExistsError:
+            continue
+        except OSError:
+            return False
+        try:
+            src.unlink()
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def _quarantine_orphan(rfile, tid: str, reason: str) -> bool:
+    """Never replaces prior quarantined evidence, under collision."""
+    UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = UNDELIVERABLE_RESULTS_DIR / f"{tid}.{reason}.{int(time.time())}.txt"
+    return _move_no_clobber(rfile, dst)
+
+
+def _reconcile_orphan_results(inflight: "set[str]") -> None:
+    global _last_orphan_sweep
+    now = time.time()
+    if now - _last_orphan_sweep < ORPHAN_SWEEP_EVERY_S:
+        return
+    _last_orphan_sweep = now
+    try:
+        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+    except OSError:
+        return
+    for rfile in candidates:
+        tid = rfile.stem
+        if not _valid_local_tid(tid) or tid in inflight:
+            continue
+        try:
+            age = now - rfile.stat().st_mtime
+        except OSError:
+            continue
+        if age < ORPHAN_GRACE_S:
+            continue                            # young: normal path may claim it
+        if age > ORPHAN_MAX_AGE_S:
+            # A minimum age alone lets an automatic pass replay an unbounded
+            # historical backlog into live rooms; backfill must be deliberate.
+            if _quarantine_orphan(rfile, tid, "too-old"):
+                if tid not in _orphan_quarantine_logged:
+                    _orphan_quarantine_logged.add(tid)
+                    _log(f"orphan sweep: {tid} is {int(age)}s old (>{int(ORPHAN_MAX_AGE_S)}s) "
+                         "— quarantined rather than replayed")
+            continue
+        # Delivered copy = double-write. NEVER re-deliver: the sweep would
+        # post agent narration about having answered into the room.
+        if _delivered_copy_exists(tid):
+            ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            dst = ARCHIVE_RESULTS_DIR / f"{tid}-{int(now)}-late-duplicate.txt"
+            if _move_no_clobber(rfile, dst):
+                _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
+            continue
+        # No task anywhere: nothing resolves a destination — quarantine,
+        # never a labeled re-delivery (permanent sweep error otherwise).
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is None:
+            if not _quarantine_orphan(rfile, tid, "no-task"):
+                continue
+            if tid not in _orphan_quarantine_logged:
+                _orphan_quarantine_logged.add(tid)
+                _log(f"orphan sweep: {tid} has no task file — quarantined")
+            continue
+        # Genuinely undelivered: ONE labeled attempt — at-least-once by
+        # design; the label makes the rare duplicate self-explaining.
+        raw = read_ready_result(rfile)
+        if raw is None:
+            continue
+        delivery = _delivery_tid(tid)
+        if delivery is None:
+            continue                            # alias ledger unreadable: retry later
+        # Recovery is still a delivery: the ordinary path's guard runs BEFORE
+        # any marker is interpreted, so tier + suppression cannot be skipped.
+        body, _withheld = _guarded_result_body(tid, raw)
+        if body is None:
+            _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
+            continue
+        if _withheld:
+            _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
+        parsed = parse_markers(body)
+        if [a for a in parsed.actions if a.kind == "attach"]:
+            # Delivering without the files would silently drop them — park
+            # for a human instead of composing a partial delivery.
+            if _quarantine_orphan(rfile, tid, "has-attachments"):
+                _log(f"orphan sweep: {tid} carries attachments — quarantined")
+            continue
+        skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        if skip and skip.value == "deduped":
+            # _dedup_plan reports or requeues when the holder delivered
+            # nothing; posting here would retire the ask without that check.
+            if _quarantine_orphan(rfile, tid, "deduped-orphan"):
+                _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
+            continue
+        if skip:
+            # A suppression marker moves no data: the canonical close rides the
+            # wire, not the sender's prose, and no_send gates delivery.
+            labeled = _lease_close_body(skip)
+        else:
+            labeled = ("(recovered result — original delivery was lost)\n"
+                       + parsed.body)
+            _r = next((a for a in parsed.actions if a.kind == "redirect"), None)
+            if _r:
+                labeled = f"[channel: {_r.value}]\n{labeled}"
+        # Same outcome owner as the live drain: a 2xx {"ok": false} is a
+        # refusal, and an unconfirmed close must keep its retryable result.
+        _btid = _broker_tid(delivery)
+        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip)):
+            _archive_result(rfile, tid)
+            _log(f"orphan sweep: recovered + delivered {tid}")
+            continue
+        _tries = _delivery_core().backend.attempts(_btid)
+        if _tries >= MAX_TRANSIENT_ATTEMPTS:
+            # Permanent disposition (lease gone or standing refusal): the
+            # bounded-attempts ceiling replaces the raw 4xx probe the core hides.
+            if _quarantine_orphan(rfile, tid, "undeliverable-after-retries"):
+                _log(f"orphan sweep: {tid} unconfirmed after {_tries} attempts "
+                     "— quarantined")
+            continue
+        _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
+
+
 # ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────
 # Exactly one gateway-bridge may poll a given workspace's relay bearer. A second
-# one — an orphaned bridge from a prior install (ppid 1, outlived its parent), or
-# a simultaneous respawn — would double-deliver every task. Acquire a per-
-# (workspace, role) lock before polling; if a LIVE bridge already holds it, exit
-# without polling. The lock is held + heartbeated so a crashed/stale holder is
-# reaped (freshness like state/cores/<host>.alive). FAIL-OPEN by design: any
-# lock-layer error → poll anyway (a lock bug must never silence task delivery;
-# the only risk of a dropped guard is the pre-existing dual-poller). Kill-switch:
-# SUTANDO_BRIDGE_LOCK=0 lets the owner disable it in prod without a redeploy.
 _LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard stays per-gateway
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
@@ -2376,6 +4370,16 @@ def _lock_on() -> bool:
 
 def _release_singleton() -> None:
     if not _lock_on():
+        return
+    # The ORDER is the invariant, not the registration order of two atexit hooks
+    # (atexit runs them in reverse, so that ordering released the lock first).
+    _OWNERSHIP_RELINQUISHED.set()
+    if not _join_push_thread():
+        # Still in flight, and the request cannot be recalled. Holding the lock
+        # costs a successor the stale window; releasing costs it its card.
+        _log("singleton: a publication is still in flight — holding the lock so "
+             "a successor waits for it to go stale instead of having its "
+             "advertisement overwritten by this generation")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
@@ -2423,6 +4427,18 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _react_sender(timeout: int = 10):
+    """The 👀 receipt's room-verb call. Lives here because the room-verb
+    endpoint surface is frozen to this adapter edge, not to sparrow modules."""
+    def _react(room_id, message_id, key) -> None:
+        # safe="" — the default safe="/" would split a room id containing "/"
+        # across path segments and misroute the react.
+        safe_room = urllib.parse.quote(str(room_id), safe="")
+        _req("POST", f"/v1/rooms/{safe_room}/react",
+             {"event_id": message_id, "key": key}, timeout=timeout)
+    return _react
+
+
 def _maybe_start_event_channel() -> None:
     """AWP P0: start the persistent Workspace-Event channel in its OWN daemon
     thread, ISOLATED from task delivery. Opt-in (SPARROW_EVENTS truthy) and
@@ -2446,20 +4462,34 @@ def _maybe_start_event_channel() -> None:
         handler = TaskifyHandler(str(TASKS_DIR), os.environ.get("AGENT_MXID"), log=_log)
         # Human-action bridge (v1 steps 2+3): when an owner + room are configured,
         # route the owner's answers to pending actions BEFORE taskify sees them,
-        # and sweep-post question cards for actions the hook created. Both are
-        # additive — unset env leaves the plain taskify path exactly as before.
         poster = None
         ha_owner = os.environ.get("SPARROW_HA_OWNER")
         ha_room = os.environ.get("SPARROW_HA_ROOM")
         if ha_owner:
             from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
             store = ActionStore(str(_STATE / "human-actions"))
-            handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
+            # HITL card clicks ride the same owner-only chain, ahead of taskify.
+            claimants = [DecisionHandler(store, ha_owner, log=_log)]
+            hitl = _hitl_reply_handler(ha_owner, log=_log)
+            if hitl is not None:
+                claimants.append(hitl)
+            handler = HandlerChain(claimants + [handler])
             if ha_room:
                 poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
                                     include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
                                     .strip().lower() in ("1", "true", "yes", "on"))
+        # 👀 receipt: OPT-IN because it scopes by room_id alone, so default-on
+        # would react in shared rooms. Wrapped OUTERMOST, chain-transparent.
+        if (str(os.environ.get("SPARROW_OBSERVE_REACT", "")).strip().lower()
+                in ("1", "true", "yes", "on")):
+            mxid = os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID")
+            if mxid:
+                from .default_observer import ReactObserverHandler
+                handler = ReactObserverHandler(handler, _react_sender(), mxid,
+                                               log=_log)
+            else:
+                _log("react-observer: AGENT_MXID/AGENT_ID unset — observed-receipt off")
         consumer = EventConsumer(inbox, handler)
 
         def _drain_loop():
@@ -2478,14 +4508,22 @@ def _maybe_start_event_channel() -> None:
         _log(f"event channel start failed (task delivery unaffected): {e}")
 
 
+def _poll_timeout_is_empty(last_ok: float, now: float,
+                           grace: float = POLL_TIMEOUT_GRACE_S) -> bool:
+    """Whether a long-poll read timeout should be read as `{"tasks": []}`.
+
+    False once no poll has succeeded within `grace`, so a wedged relay still
+    reaches the outage path instead of looping quietly forever.
+    """
+    return (now - last_ok) <= grace
+
+
 def main() -> None:
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
     if not URL:
         # A token that starts with a URL scheme but yielded no URL means the
         # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
-        # new encoding we don't handle) — say so, instead of the misleading
-        # "set REMOTE_TASK_TOKEN" when the token is present but malformed.
         _hint = (" — the token carries a gateway URL but the url|secret separator "
                  "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
@@ -2499,44 +4537,85 @@ def main() -> None:
          f"(restored {len(inflight)} in-flight)")
     # Always name where the diagnostics live: after an incident this line is the
     # trailhead (a bare-launched bridge under default dirs writes status to
-    # ~/.ag2-sparrow/state/, where nobody thinks to look).
     _log(f"launched_via={_LAUNCHED_VIA} status={GATEWAY_STATUS_FILE}")
     if _LAUNCHED_VIA == "bare":
         _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
+    last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
+    refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _results_watcher = _start_results_watcher()
+    _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
             if not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
-                # the process that took over. atexit release is a no-op (not ours).
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
+                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
+                _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+                if _results_watcher is not None:
+                    _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
-            resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+            _retry_pending_publications()
+            _retry_review_card_resolutions()
+            _retry_review_control_results()
+            # LAST of the beat's work, on a daemon thread: two optional 15 s
+            # requests never delay the next task poll or a durable retry.
+            _push_pool_advertisement()
+            try:
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+                last_poll_ok = time.time()
+            except (TimeoutError, socket.timeout):
+                # Read timeout only (URLError takes the outage path below).
+                # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
+                if not _poll_timeout_is_empty(last_poll_ok, time.time()):
+                    raise
+                resp = {"tasks": []}
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
-                tid = _write_task(task)
-                if tid:
+                hitl_out = _handle_hitl_action(task)
+                if hitl_out:
+                    body = "[no-send]"
+                    if str(hitl_out).startswith("rejected:"):
+                        body = ("That click did not apply: the card had already moved "
+                                f"({str(hitl_out)[9:]}). Please use the current card.")
+                    _queue_review_control_result(task, body=body)
+                    _retry_review_control_results()
+                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+                    continue
+                if _handle_review_decision(task):
+                    _queue_review_control_result(task)
+                    _retry_review_control_results()
+                    _log(f"consumed private review decision {task.get('id')}")
+                    continue
+                written = _write_task(task)
+                if written:
+                    tid, durable = written
                     if tid not in inflight:
                         inflight.add(tid)
                         added = True
-                    pending_ack.append(tid)
+                    pending_ack.append((tid, durable))
+            # Ack only after task file, in-flight set and ack ledger are durable;
+            # any failure withholds every ack this round, redeliveries included.
+            committed = _save_inflight(inflight) if pending_ack else True
+            if pending_ack and committed:
+                committed = _record_pending_acks(pending_ack)
+            for tid, durable in pending_ack if committed else ():
+                _post_task_ack(tid, durable)
             if added:
-                _save_inflight(inflight)
-            # Ack only after both the task file and local in-flight state are
-            # durable, so a crash after ack does not strand the eventual result.
-            for tid in pending_ack:
-                _post_task_ack(tid)
-            _post_ready_results(inflight)
-            _post_proactive()
+                wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
+            _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
+            # The pool's advertisement rides the same beat: push-on-change, never
+            # raising, so a broker without the endpoints costs one deferred log.
+            _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:

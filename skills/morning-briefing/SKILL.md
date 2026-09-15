@@ -30,6 +30,11 @@ python3 src/write_calendar_cache.py --empty   # ONLY for a genuinely empty day
 Calendar. Step 1 below still runs on every host. See "Calendar source (Google Workspace) —
 activation" for the full contract.
 
+**A missing connector is one line of text, never a card.** If `composio_find` reports the owner's
+calendar or mail app `connected: false`, say so in the briefing ("Google Calendar isn't connected;
+connect it in AG2 Space") and move on. The briefing is not an owner request: never post a connect
+card or start a `connect-apps` wait from it.
+
 **Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**
 
 ```bash
@@ -51,17 +56,15 @@ python3 src/morning-briefing.py
 
 4. **System status** — Run `python3 src/health-check.py`. Report any issues.
 
-5. **Daily insight** — Run `python3 src/daily-insight.py --stdout-only`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
+5. **Friction check** — Run `python3 src/friction-detector.py --stdout-only`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
 
-6. **Friction check** — Run `python3 src/friction-detector.py --stdout-only`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
+6. **SutandoWIRE** — Run `python3 src/wire_briefing.py`. If it prints a line (it only does so when a NEW WIRE episode has appeared since the last briefing), include that line verbatim — it's already a fully-formed `📺 New SutandoWIRE: <title> — <url>`. Silent output = no new episode; skip the line. The script is a clean no-op without `YOUTUBE_API_KEY` (env or vault) and tracks last-seen in `state/wire-briefing.json`, so each episode is announced exactly once across both briefing paths.
 
-7. **SutandoWIRE** — Run `python3 src/wire_briefing.py`. If it prints a line (it only does so when a NEW WIRE episode has appeared since the last briefing), include that line verbatim — it's already a fully-formed `📺 New SutandoWIRE: <title> — <url>`. Silent output = no new episode; skip the line. The script is a clean no-op without `YOUTUBE_API_KEY` (env or vault) and tracks last-seen in `state/wire-briefing.json`, so each episode is announced exactly once across both briefing paths.
-
-> **Why `--stdout-only`:** these scripts default to writing `results/insight-*.txt` / `results/friction-*.txt`, which the Telegram/Discord bridge polls and delivers as SEPARATE DMs — fragmenting the briefing into 3 messages. `--stdout-only` prints the content (for you to fold inline here) without writing a deliverable file, so the owner gets ONE consolidated briefing. Do NOT remove the flag.
+> **Why `--stdout-only`:** friction-detector defaults to writing `results/friction-*.txt`, which the Telegram/Discord bridge polls and delivers as a SEPARATE DM — fragmenting the briefing. `--stdout-only` prints the content (for you to fold inline here) without writing a deliverable file, so the owner gets ONE consolidated briefing. Do NOT remove the flag.
 
 ## How to deliver
 
-Run `python3 src/morning-briefing.py` first — it is the single source of truth for the base data (weather, calendar, reminders, overnight Discord, pending questions, health). Fold the augmentation from steps 1–8 into ONE message.
+Run `python3 src/morning-briefing.py` first — it is the single source of truth for the base data (weather, calendar, reminders, overnight Discord, pending questions, health). Fold the augmentation from steps 1–6 into ONE message.
 
 > **Delivery on this host differs from upstream's default.** Upstream's version of
 > this section tells you to append a follow-up `results/proactive-<ts>.txt`. Do NOT
@@ -79,7 +82,6 @@ Good morning. Here's your briefing:
 💬 Discord: [summary of overnight activity]
 📋 Tasks: [pending items]
 🖥️ System: [health status]
-💡 Insight: [behavioral pattern from daily-insight.py, if available]
 ```
 
 Deliver via:
@@ -127,4 +129,4 @@ The canonical daily schedule produces the Google-calendar cache first, then runs
 }
 ```
 
-Calling `/morning-briefing` manually runs the same script plus the MCP email/calendar and insight augmentation in steps 1–7.
+Calling `/morning-briefing` manually runs the same script plus the MCP email/calendar augmentation in steps 1–6.

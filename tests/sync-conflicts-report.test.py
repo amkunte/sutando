@@ -201,6 +201,21 @@ class TestSyncConflictsReport(unittest.TestCase):
         self.assertNotIn("wrap2.md", r.stdout)
         self.assertNotIn("indent2.md", r.stdout)
 
+    def test_unique_lines_against_a_large_single_section_haystack_finish_fast(self):
+        """The runaway: a 2 MB one-section live file and thousands of saved lines
+        absent from it cost 18 ms each through a per-line regex — 30+ CPU-minutes
+        over the real corpus. A bounded find is 0.13 ms; the bar below is 30x
+        slack over that and 40x under the regex."""
+        import time
+        live = "\n".join(f'{{"ts": {i}, "k": "v{i}"}}' for i in range(40000))
+        saved = "\n".join(f'{{"ts": {i}, "k": "w{i}"}}' for i in range(3000))
+        t = time.time()
+        out = MOD._new_content(saved, live)
+        dt = time.time() - t
+        self.assertEqual(len(out), 3000, "every saved line is genuinely absent")
+        self.assertLess(dt, 4.0, f"_new_content took {dt:.1f}s for 3000 lines against a "
+                                 f"{len(live)//1024} KB haystack — the per-line regex is back")
+
     def test_mixed_batch_reports_only_the_lossy_file(self):
         """The discrimination, exercised in one run rather than three."""
         self._pair("lost.md", "# a\n", "# a\n" + "\n".join(f"n{i}" for i in range(9)) + "\n")
@@ -394,6 +409,35 @@ class TestSyncConflictsReport(unittest.TestCase):
         r = self._main(str(d))
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertNotIn("no unmerged peer content", r.stdout)
+
+    def test_a_live_path_that_became_a_DIRECTORY_stays_in_the_report(self):
+        """Non-comparable is not reconciled: dropping the row reads as 'nothing to do'."""
+        d = self.batch / "memory"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "became-dir.md").write_text("# a\nline1\npeer-only\n")
+        (self.ws / "memory").mkdir(exist_ok=True)
+        (self.ws / "memory" / "became-dir.md").mkdir()      # live path is now a DIRECTORY
+
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("became-dir.md", r.stdout)
+        self.assertIn("NOT A FILE", r.stdout)
+        self.assertNotIn("no unmerged peer content", r.stdout)
+
+    def test_the_directory_disposition_is_DISTINCT_from_a_missing_live_file(self):
+        """Two different states must not print the same line — `None` already means absent."""
+        d = self.batch / "memory"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "gone.md").write_text("# a\npeer-only\n")
+        (d / "isdir.md").write_text("# a\npeer-only\n")
+        (self.ws / "memory").mkdir(exist_ok=True)
+        (self.ws / "memory" / "isdir.md").mkdir()           # exists, not a file
+        # gone.md is deliberately never created live -> the None branch
+
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("live file MISSING", r.stdout)
+        self.assertIn("NOT A FILE", r.stdout)
 
 
 if __name__ == "__main__":

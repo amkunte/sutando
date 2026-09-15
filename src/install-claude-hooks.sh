@@ -8,7 +8,7 @@
 # context, not in unrelated sessions.
 #
 # Hooks installed (4):
-#   PreCompact  → cp $TRANSCRIPT_PATH ~/Desktop/sutando-conversations/...
+#   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
@@ -25,9 +25,8 @@
 # turn-end (after every assistant response), NOT session-end — so the
 # PID-kill block killed the live Monitor watcher every turn, triggering an
 # exit-143 + Monitor-restart cycle.  Watcher orphan-cleanup is handled by
-# the `Reap any stale watch-tasks-stream watcher` block in
-# `src/startup.sh` (defense-in-depth: PID-file + cmdline-check before
-# kill), which runs at every session start.  See the original #1061 /
+# `reap_stale_task_watcher` in `src/startup-runtime.sh`, which runs at every
+# session start.  See the original #1061 /
 # #1063 / #1065 thread for the orphan-watcher background.
 #
 # Idempotent: re-running is safe.  Existing hook entries with the same
@@ -94,11 +93,44 @@ shq() {
 # ~/Desktop, so every hook installed by the old script pointed at a directory
 # that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|sutando-conversations/|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\""
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
+  # Without this the Stop gate spends its one reminder and never re-arms:
+  # begin_turn is the only reset and nothing else in the lifecycle calls it.
+  "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
 )
+
+# The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
+# The location is not what keeps transcripts out of the vault: sync is a whitelist
+# (see .git/info/exclude -- `*` then the include list), so a workspace path is
+# unsynced until vault.sync.include names it. Omitting it
+# drops it from HOOKS, which every phase iterates, so a registered one is untouched.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
+  _kept=()
+  for _h in "${HOOKS[@]}"; do
+    case "$_h" in
+      "PreCompact|sutando-conversations/|"*) ;;
+      *) _kept+=("$_h") ;;
+    esac
+  done
+  HOOKS=("${_kept[@]}")
+fi
+
+# Parallel to HOOKS by index, not another `|` field: CMD must stay last to hold a
+# `|`, and a second path-bearing field cannot also be last. Sized from HOOKS.
+HOOK_PRIOR=()
+for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); done
+
+# Skill-declared hooks via src/skill_hooks.py (the same discovery the health probe reads).
+# NUL-framed (-d '') because two of the four fields embed the repo path.
+while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
+   && IFS= read -r -d '' _cmd && IFS= read -r -d '' _prior; do
+  [ -n "${_ev:-}" ] || continue
+  HOOKS+=("$_ev|$_tok|$_cmd")
+  HOOK_PRIOR+=("$_prior")
+done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
@@ -112,12 +144,25 @@ DEPRECATED_HOOKS=(
   "Stop|watch-tasks-stream.pid"
 )
 
+# This PR changed the archiver's command: phase 0 cannot migrate the old one (it
+# embeds no repo path) and phase 1 matches exactly, so both would fire.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
+  # SCOPE, not egress: the flag already dropped the archiver from HOOKS, so an
+  # ungated removal here would delete a registered hook and install no successor.
+  DEPRECATED_HOOKS+=(
+    "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  )
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for atomic settings.json edit" >&2
   exit 2
 fi
 
 mkdir -p "$REPO_DIR/.claude"
+# The PreCompact archive hook is a bare `cp`, which cannot create its own
+# destination; without this the archiver fails on every compaction, silently.
+mkdir -p "$HOME/Desktop/sutando-conversations"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
@@ -159,7 +204,8 @@ re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
 #
 # Sweeping a *different clone's* entry is intended — that shape is
 # installer-generated, just not by this checkout.
-for entry in "${HOOKS[@]}"; do
+for i in "${!HOOKS[@]}"; do
+  entry="${HOOKS[$i]}"
   EVENT="${entry%%|*}"
   REST="${entry#*|}"
   MARKER="${REST%%|*}"
@@ -226,22 +272,31 @@ for entry in "${HOOKS[@]}"; do
   CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
   SHAPE="^$(re_escape "$CMD_WORD") [\"']?[^ -].*$(re_escape "$MARKER")[\"']?$(re_escape "$CMD_TAIL")\$"
 
-  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" \
+  # SHAPE cannot match the runner-first entry (its first word is `[`), so match the
+  # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
+  LEGACY_SHAPE=""
+  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+
+  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
-       | map(contains($marker) and (. != $cmd) and test($shape))
+       | map(contains($marker) and (. != $cmd)
+             and (test($shape) or ($legacy != "" and test($legacy))))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
   fi
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
-  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" '
+  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
-          and ((.command // "") | test($shape))
+          and ((.command // "")
+               | test($shape) or ($legacy != "" and test($legacy)))
           | not
         ))
       )

@@ -62,8 +62,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
-from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
+from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
+                                release_claim)
+from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+
+
+def _slack_claims_name(name: str) -> bool:
+    """Filename-level claim decision — the policy lives in proactive_routing;
+    this adapter only binds its channel."""
+    return fallback_claims_name(name, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+import slack_access  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -73,14 +82,17 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
+from policy.egress.unfurl import should_unfurl  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
@@ -160,7 +172,7 @@ if not BOT_TOKEN or not APP_TOKEN:
 # silently dropped files other bridges would send). Slack extends it with its
 # OWN inbound dir so an uploaded file can be echoed back; that root stays
 # Slack-local rather than becoming global.
-from send_allowlist import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
 
 
 def _is_path_sendable(fpath: str) -> bool:
@@ -181,25 +193,14 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     )
 
 
-def archive_file(src: Path, kind: str, task_id: str) -> None:
-    """Move src into archive/<tasks|results>/YYYY-MM/ instead of deleting.
-    Matches the behavior of telegram-bridge.py / discord-bridge.py."""
-    try:
-        if not src.exists():
-            return
-        from datetime import datetime
-        import shutil
-        ym = datetime.now().strftime("%Y-%m")
-        base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-        dest_dir = base / ym
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dest_dir / f"{task_id}.txt"))
-    except Exception as e:
-        print(f"[Slack] archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+def archive_file(src: Path, kind: str, task_id: str) -> bool:
+    """Adapter: inject this bridge's archive roots + logger into the shared
+    never-delete policy. It used to unlink the source when the move failed,
+    which destroyed the only copy of the task."""
+    return _shared_archive_file(
+        src, kind, task_id,
+        tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
+        log=lambda m: print(f"[Slack]{m}", flush=True))
 
 
 ACCESS_FILE = channel_access_path("slack")
@@ -315,14 +316,12 @@ def load_allowed():
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        _update_access_cache(data)
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    access = slack_access.read_access(ACCESS_FILE)
+    # Only a record the shared reader accepted is worth caching; a malformed one
+    # would overwrite a good backup with a document nobody can authenticate from.
+    if access.record is not None:
+        _update_access_cache(access.record)
+    return access.allowed
 
 
 def load_tier_map() -> dict:
@@ -541,8 +540,13 @@ def _set_pending_reply(task_id: str, info: dict) -> None:
         _atomic_write_pending_replies(dict(pending_replies))
 
 
-def _dedup_recover(task_id: str, holder_id, target) -> None:
-    """Route the shared dedup-recovery plan; Slack owns only the send."""
+def _dedup_recover(task_id: str, holder_id, target) -> str:
+    """Route the shared dedup-recovery plan; Slack owns only the send.
+
+    Returns the shared disposition: "archive" once the exchange is terminal,
+    "retain" when the asker was never told and a later pass must retry.
+    """
+    action, delivered = "defer", None
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
@@ -551,11 +555,15 @@ def _dedup_recover(task_id: str, holder_id, target) -> None:
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
         elif action == "report" and target:
-            _send_reply(target["channel"], target.get("thread_ts"), payload,
-                        task_id=task_id, access_tier=target.get("access_tier", "unknown"))
+            # The boolean is the whole point: an unsent report tells the asker
+            # nothing, so retiring on the attempt loses the question.
+            delivered = bool(_send_reply(
+                target["channel"], target.get("thread_ts"), payload,
+                task_id=task_id, access_tier=target.get("access_tier", "unknown")))
             print(f"  [dedup] unresolved for {task_id}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - never block the skip path
+    except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return report_disposition(action, delivered)
 
 
 def _pop_pending_reply(task_id: str):
@@ -578,6 +586,13 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
     """Persist the Slack route before exposing its task file to the core."""
     _set_pending_reply(task_id, info)
     try:
+        # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+        # fail-open so a stamping error costs the stamp and never the task.
+        try:
+            from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+            content = stamp_text(content, REPO)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception:
         _pop_pending_reply(task_id)
@@ -590,7 +605,7 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
 # may have hit a limit" reply so the failure is visible instead of silent.
 # The pending entry is KEPT after notifying, so if the core later recovers and
 # writes a result, the real answer still gets delivered. 0 disables.
-TASK_TIMEOUT_SEC = int(os.environ.get("SLACK_TASK_TIMEOUT_SEC", "600"))
+TASK_TIMEOUT_SEC = int(config_get("SLACK_TASK_TIMEOUT_SEC", "600"))
 
 # Username cache — users.info is rate-limited (Tier 4 = 100/min). One
 # cache lookup per known user saves a network hop on every DM. Cache
@@ -609,6 +624,95 @@ _event_count_lock = threading.Lock()
 
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
 app = App(token=BOT_TOKEN)
+
+# Handler reference so the heartbeat writer can read LIVE socket state; the
+# heartbeat thread starts first, so main() wires this just before handler.start().
+_socket_handler = None
+
+
+def _socket_connected() -> bool:
+    """True only when the Socket Mode WSS connection is actually up.
+
+    A wedged socket (the BrokenPipeError reconnect-fail loop) reports False, so
+    gating the heartbeat write on this makes the heartbeat file go stale during
+    a wedge — the exact signal health-check needs to tell 'wedged' (process
+    alive but deaf) apart from 'process alive and healthy'. Before the handler
+    is wired (early boot) this returns False and the heartbeat simply starts a
+    beat or two late; health-check's staleness threshold is generous enough
+    that the short boot gap never reads as a wedge.
+    """
+    handler = _socket_handler
+    try:
+        client = getattr(handler, "client", None)
+        return bool(client is not None and client.is_connected())
+    except Exception:
+        return False
+
+
+# A wedge can hold is_connected() True while thrashing sessions, so CHURN is the
+# discriminator: >= _CHURN_MAX_SESSIONS id changes in _CHURN_WINDOW_S is unhealthy.
+_CHURN_WINDOW_S = 300
+_CHURN_MAX_SESSIONS = 3
+_session_changes: deque = deque()  # timestamps of observed session-id changes
+_last_session_id = None
+_churn_logged = False
+
+
+def _note_session_sample(now=None):
+    """Sample the live socket's session id; record a change timestamp.
+
+    Called from the result_watcher loop (~1s cadence), so sampling is far
+    faster than the ~9s session lifetime seen in the wedge repro. A None id
+    (between sessions, or handler not wired yet) is skipped rather than
+    counted — only id -> different-id transitions are churn. The first
+    observed id after boot is baseline, not churn.
+    """
+    global _last_session_id
+    handler = _socket_handler
+    try:
+        client = getattr(handler, "client", None)
+        sid = client.session_id() if client is not None else None
+    except Exception:
+        sid = None
+    if sid is None:
+        return
+    if now is None:
+        now = time.time()
+    if _last_session_id is not None and sid != _last_session_id:
+        _session_changes.append(now)
+    _last_session_id = sid
+
+
+def _reconnect_churning(now=None) -> bool:
+    """True when the socket is thrashing through sessions (wedge shape #2)."""
+    global _churn_logged
+    if now is None:
+        now = time.time()
+    while _session_changes and now - _session_changes[0] > _CHURN_WINDOW_S:
+        _session_changes.popleft()
+    churning = len(_session_changes) >= _CHURN_MAX_SESSIONS
+    if churning and not _churn_logged:
+        print(
+            f"[Slack] reconnect churn: {len(_session_changes)} new socket "
+            f"sessions in {_CHURN_WINDOW_S}s — suppressing heartbeat so "
+            "health-check flags the wedge",
+            flush=True,
+        )
+        _churn_logged = True
+    elif not churning and _churn_logged:
+        print("[Slack] reconnect churn subsided — heartbeat resumes", flush=True)
+        _churn_logged = False
+    return churning
+
+
+def _socket_healthy() -> bool:
+    """Heartbeat gate: the socket is up AND not thrashing through sessions.
+
+    Both wedge shapes must suppress the heartbeat: is_connected() False
+    (half-open socket, the original repro) and is_connected() True under
+    reconnect churn (the 2026-07-31 repro).
+    """
+    return _socket_connected() and not _reconnect_churning()
 
 
 def _download_slack_file(file_dict: dict) -> str | None:
@@ -1031,15 +1135,16 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         f"{_identity_note}{_context_note}"
     )
     if access_tier != "owner":
-        user_task_text = (
-            f"{user_task_text}\n\n"
-            f"===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            f"This Slack task is from a {access_tier.upper()} tier sender, NOT the owner. "
-            f"You MUST delegate to a sandboxed agent (e.g. `codex exec --sandbox read-only`) "
-            f"and NEVER process it with full core-agent capabilities. "
-            f"For 'team' tier: information lookups OK, no system mutations. "
-            f"For 'other' tier: information-only replies about Sutando itself. "
-            f"Write the sandboxed output to `results/{{task_id}}.txt` as the user-facing reply.\n"
+        # One owner for this policy; only the tier scope is Slack-specific.
+        from policy.guardrail import sandboxed_delegation_lines  # noqa: E402
+        _scope = ("For 'team' tier: information lookups OK, no system mutations. "
+                  "For 'other' tier: information-only replies about Sutando itself.")
+        user_task_text = "{}\n{}\n".format(
+            user_task_text,
+            "\n".join(sandboxed_delegation_lines(
+                "Slack", f"from a {access_tier.upper()} tier sender", "`results/{task_id}.txt`",
+                _scope,
+            )),
         )
 
     ts = int(time.time() * 1000)
@@ -1057,9 +1162,20 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     _transcribe_py = claude_home_path("skills", "audio-transcribe", "scripts", "transcribe.py")
     _claude_config_dir = claude_home_path()
     skill_hints = ""
-    if access_tier == "owner" and (_notify_py.exists() or _transcribe_py.exists()):
+    # CONTEXT-FIRST is a correctness step, not a skill hint: it must not be
+    # gated on optional skills. The steps that need them stay conditional inside.
+    if access_tier == "owner":
         hints_lines = ["===SKILL INSTRUCTIONS (follow before any other action)==="]
         step = 1
+        hints_lines.append(
+            f'{step}. CONTEXT-FIRST: if this message is not self-contained '
+            f'(terse — "y", "no", a pronoun — a reply, or refers to something not '
+            f'stated here), reconstruct context BEFORE interpreting. Slack has no '
+            f'channel-history fetch in this bridge, so use the embedded thread/reply '
+            f'context above (if present) plus the session transcript, and answer from '
+            f'that, not from memory.'
+        )
+        step += 1
         if _notify_py.exists():
             notify_thread_arg = (
                 f" --thread-ts {shlex.quote(str(reply_thread_ts))}"
@@ -1305,7 +1421,7 @@ def _send_file(channel: str, thread_ts: str | None, fpath: str) -> bool:
         return False
 
 
-def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> None:
+def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | None = None, access_tier: str = "unknown") -> bool:
     """Post a reply via chat.postMessage with marker extraction.
 
     Honors the unified marker protocol from `src/result_markers.py` (#873):
@@ -1318,9 +1434,22 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
 
     Long text chunked at 4000 chars per Slack message (40k hard cap, but
     readability suffers above ~4k).
+
+    Returns True when the caller may CONSUME the source (delivered, or there
+    was nothing to send) and False when a send was attempted and Slack refused.
+    `chat_postMessage` failures are caught in here and recorded as an error
+    event rather than raised, so a caller gating cleanup on "did not raise"
+    never sees the common failure — it has to consult this value. Purely
+    additive: the annotation was `-> None` and no existing caller reads it.
     """
     if not text:
-        return
+        # Unreachable from every current caller: both the task-reply and
+        # proactive drains guard empty text before calling (slack
+        # `if not text: claim.unlink()`, telegram :928). Kept as a contract
+        # statement rather than removed, because a future caller without that
+        # guard must get "consume it" — returning False would release an empty
+        # file, re-claim it, and loop forever.
+        return True  # pragma: no cover — see above; no caller reaches this
 
     parsed = parse_markers(text)
     clean_text = parsed.body
@@ -1351,8 +1480,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # at each boundary so every chunk renders as a well-formed block.
     if clean_text:
         all_chunks_sent = True
+        # Decided on the whole body, not per chunk: a digest split at 4000
+        # chars must not unfurl piecewise just because a chunk holds one link.
+        unfurl = should_unfurl(clean_text)
         for chunk in chunk_message(clean_text, 4000):
-            kwargs = {"channel": channel, "text": chunk}
+            kwargs = {"channel": channel, "text": chunk,
+                      "unfurl_links": unfurl, "unfurl_media": unfurl}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:
@@ -1394,8 +1527,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file access denied: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # The deny notice can be the ONLY user-visible output: a body of
+                # just `[file: /blocked]` posts no text chunk, so if this refusal
+                # is swallowed the caller consumes the source and nobody is told.
+                print(f"[Slack] deny-notice chat_postMessage failed: {e}", flush=True)
+                delivered_ok = False
             print(f"  BLOCKED file: {fpath}", flush=True)
         else:
             try:
@@ -1404,8 +1541,10 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
                     text=f"(file not found: {fpath})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Same reasoning as the deny branch above.
+                print(f"[Slack] not-found notice chat_postMessage failed: {e}", flush=True)
+                delivered_ok = False
 
     # Observability: one delivered-reply event. outcome reflects whether the
     # text chunks + file uploads actually succeeded (the helpers swallow API
@@ -1437,6 +1576,8 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             )
         except Exception:  # pragma: no cover  (defensive: result_audit import is safe + record() never raises)
             pass
+
+    return delivered_ok
 
 
 def _record_skip_audit(task_id: str, skip_value: str) -> None:
@@ -1531,20 +1672,29 @@ def result_watcher():
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
                     if _skip_action.value == "deduped":
-                        _dedup_recover(task_id, _skip_action.extra, target)
+                        if _dedup_recover(task_id, _skip_action.extra,
+                                          target) == "retain":
+                            print(f"  [dedup] report not delivered for {task_id} "
+                                  f"— keeping for retry", flush=True)
+                            continue
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     # §7 audit ledger: skip-marked results are resolved deliveries
                     # (no_send / deduped), not silent voids. One line per result.
                     _record_skip_audit(task_id, _skip_action.value)
                 else:
                     try:
-                        _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
-                        print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
+                        delivered = _send_reply(target["channel"], target.get("thread_ts"), reply_text, task_id=task_id, access_tier=target.get("access_tier", "unknown"))
                     except Exception as e:
                         print(f"[Slack] reply error: {e}", flush=True)
                         # Keep both the durable route and result file so the
                         # next poll (or restarted bridge) can retry delivery.
                         continue  # pragma: no cover - watcher loop retry; helper state is unit-tested
+                    if not delivered:
+                        # Slack refuses without raising, so the except never sees it;
+                        # archiving here would destroy an undelivered reply.
+                        print(f"[Slack] reply refused, keeping {task_id} for retry", flush=True)
+                        continue
+                    print(f"  Replied to {target['channel']}: {reply_text[:80]}...", flush=True)
 
                 _pop_pending_reply(task_id)
                 archive_file(result_file, "results", task_id)
@@ -1565,42 +1715,52 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: skip Discord-targeted proactive files.
-                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                    # claiming it here dumps the literal text to Slack DM instead.
-                    # Leave it for discord-bridge to claim. (#1401)
+                    # Peek before claiming: a body addressed to another bridge
+                    # is delivered by that bridge, not dumped here as literal text.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if peek.startswith("[channel:") and \
-                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                    if not body_claimable_by(peek, "slack"):
                         continue
-                    claim = f.with_suffix(".sending")
-                    try:
-                        f.rename(claim)
-                    except FileNotFoundError:
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
                         continue
-                    text = read_ready_result(claim)
-                    if text is None:
-                        release_claim(claim)
-                        continue
+                    # Resolve the owner BEFORE claiming: a claim this bridge
+                    # cannot deliver hides the file from the poller that can.
                     try:
                         access_data = json.loads(ACCESS_FILE.read_text())
                     except Exception:
                         access_data = {}
                     owner_id = resolve_proactive_owner_id(access_data)
+                    # The shared helper owns "no recipient -> do not claim"; this
+                    # adapter contributes only the owner it resolved.
+                    claim = claim_for_delivery(f, owner_id)
+                    if claim is None:
+                        continue
+                    text = read_ready_result(claim)
+                    if text is None:
+                        release_claim(claim)
+                        continue
                     if owner_id is not None:
                         # Open a DM channel to the owner (idempotent).
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            _send_reply(dm_channel, None, text, access_tier="owner")  # proactive → owner
-                            mark_proactive_delivered(STATE_DIR, delivery_id)
-                            print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                            if _send_reply(dm_channel, None, text, access_tier="owner"):
+                                mark_proactive_delivered(STATE_DIR, delivery_id)
+                                print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                                claim.unlink(missing_ok=True)
+                            else:
+                                # Slack refused WITHOUT raising, which is the ordinary
+                                # failure; the except below never sees it.
+                                print(f"  [proactive] send refused, releasing {claim.name}", flush=True)
+                                release_claim(claim)
                         except Exception as e:
-                            print(f"  [proactive] failed: {e}", flush=True)
-                        claim.unlink(missing_ok=True)
+                            # Release, never delete: pollers scan `.txt`, so a kept or
+                            # deleted claim is a message no bridge can ever retry.
+                            print(f"  [proactive] failed, releasing {claim.name}: {e}", flush=True)
+                            release_claim(claim)
                     else:
                         from proactive_retention import (
                             retain_dir_for, retain_undeliverable,
@@ -1611,9 +1771,11 @@ def result_watcher():
                         else:
                             print(f"  [proactive] no owner in allowFrom, could NOT retain {claim.name}", flush=True)
 
-            # Heartbeat (used by health-check.py)
+            # Written ONLY while the socket is up and not churning: this thread is independent
+            # of the WSS loop, so an unconditional write would stay fresh through a wedge.
+            _note_session_sample()
             now = time.time()
-            if now - last_heartbeat >= 60:
+            if now - last_heartbeat >= 60 and _socket_healthy():
                 try:
                     heartbeat_file.write_text(str(int(now)))
                     last_heartbeat = now
@@ -1693,6 +1855,8 @@ def main():  # pragma: no cover
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
+    global _socket_handler
+    _socket_handler = handler  # let the heartbeat thread read live socket state
     handler.start()  # blocks
 
 

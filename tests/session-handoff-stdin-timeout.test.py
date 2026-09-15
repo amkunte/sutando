@@ -38,6 +38,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "session-handoff.sh"
+# The guarded read moved into the shared resolver (both session-handoff.sh and
+# archive-transcript.sh read one hook payload; two copies drift). The behaviour
+# under test is unchanged — assert it where it now lives, and separately assert
+# session-handoff still delegates there.
+HELPER = REPO / "src" / "hook_transcript_path.sh"
 
 # Upper bound for the guarded read. The shipped default window is 2s; allow generous
 # headroom for slow CI while still being far below the "hangs forever" failure.
@@ -59,10 +64,11 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def extract_stdin_program() -> str:
     """Pull the python program out of the stdin guard in session-handoff.sh."""
-    src = SCRIPT.read_text()
-    m = re.search(r"TRANSCRIPT=\"\$\((?:\w+=\S+\s+)?python3 -c '(.*?)'\s*2>/dev/null", src, re.S)
+    src = HELPER.read_text()
+    m = re.search(r"(?:\w+=\S+\s+)?python3 -c '(.*?)'\s*2>/dev/null", src, re.S)
     if not m:
-        raise AssertionError("could not locate the stdin-parsing python block in session-handoff.sh")
+        raise AssertionError(
+            "could not locate the stdin-parsing python block in hook_transcript_path.sh")
     return m.group(1)
 
 
@@ -99,6 +105,16 @@ def run(program: str, mode: str, timeout: float = MAX_WAIT):
 
 def main() -> int:
     program = extract_stdin_program()
+
+    # The guard only protects session-handoff while session-handoff actually
+    # uses it. Without this, deleting the delegation leaves every behavioural
+    # check above still green against a helper nothing calls.
+    _sh = SCRIPT.read_text()
+    check(
+        "session-handoff.sh delegates to the shared resolver",
+        "resolve_hook_transcript_path" in _sh and "hook_transcript_path.sh" in _sh,
+        "session-handoff.sh no longer sources/calls the shared resolver",
+    )
 
     out, elapsed = run(program, "idle_pipe")
     check(

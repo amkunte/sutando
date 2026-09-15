@@ -10,15 +10,37 @@
 # alive for the lifetime of the CLI session.
 #
 # Output format per event:
-#   TASK_FILE: <basename>
-# Plus an INITIAL_SCAN block at startup for any pre-existing files:
-#   TASK_FILE: <basename>  (one per line)
+#   TASK_FILE: <name>   a basename, or an ABSOLUTE path when a resolver is set.
+#   INITIAL_SCAN block at startup for pre-existing files, same shape.
 #
 # The agent reads the named files via the Read tool when notifications
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
 
+# fd 9 is a stable dup of the real stdout, taken before anything can rebind fd 1.
+# A shutdown emit invoked one $( ) deep writes to the capture pipe, not to stdout.
+exec 9>&1
+
 set -u
+
+# Defined above the runner because the runner is where a worker can put its name
+# down BEFORE the handler publishes the result that record attributes.
+record_worker_done() {
+  local task_id="${1%.txt}" stage="$2" ws="$3"
+  # Only a pool recipient has a claim to record, and the core cannot locate the
+  # writer: its spawner injects one, so unset means "not a worker", not an error.
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
+  [ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
+  # `-f` not `-x`: we hand it to the interpreter below, so the execute bit is
+  # the wrong property to require of a script the pool may ship non-executable.
+  [ -f "${SUTANDO_POOL_DELIVERY_SCRIPT}" ] || return 1
+  # The RESOLVED interpreter, never the shebang: a worker's PATH python3 may be
+  # the macOS CLT stub, which is why the launcher forwards one at all.
+  [ -n "${SUTANDO_PY_BIN:-}" ] || return 1
+  "$SUTANDO_PY_BIN" "$SUTANDO_POOL_DELIVERY_SCRIPT" \
+    --workspace "$ws" --recipient "$SUTANDO_INSTANCE_ID" \
+    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
+}
 
 if [ "${1:-}" = "--handler-runner" ]; then
   handler="$2"
@@ -29,13 +51,21 @@ if [ "${1:-}" = "--handler-runner" ]; then
   repo="$7"
   events_fifo="$8"
   filename="$9"
-  if "$handler" \
+  # `pending` before the result so a result the drain can see always has
+  # attribution beside it; an injected-but-broken writer fails the task instead.
+  if ! record_worker_done "$filename" pending "$workspace"; then
+    echo "watch-tasks-stream: could not record ownership of $filename for ${SUTANDO_INSTANCE_ID:-}; not running its handler" >&2
+    handler_rc=1
+  elif "$handler" \
       --runtime "$runtime" \
       --workspace "$workspace" \
       --task-file "$task_path" \
       --results-dir "$results" \
       --repo "$repo" >/dev/null; then
     handler_rc=0
+    # Promote only after the result is visible: `.flag` is the sole stage the
+    # sweep retires on, so it must never precede the thing it attributes.
+    record_worker_done "$filename" done "$workspace" || handler_rc=1
   else
     handler_rc=$?
   fi
@@ -44,6 +74,12 @@ if [ "${1:-}" = "--handler-runner" ]; then
 fi
 
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=watcher_sentinel.sh
+source "$__SCRIPT_DIR/watcher_sentinel.sh"
+# shellcheck source=task-emit.sh
+source "$__SCRIPT_DIR/task-emit.sh"
+# shellcheck source=inbox-resolve.sh
+source "$__SCRIPT_DIR/inbox-resolve.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -57,6 +93,10 @@ __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 # into its env). Single resolution path = no divergence.
 if [ -n "${1:-}" ]; then
   TASKS_DIR="$1"
+elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
+  # An instance whose inbox is not <workspace>/tasks/ carries it in env, so the
+  # same `/startup` serves it with no argument change.
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
 elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
   __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
   TASKS_DIR="$__WS/tasks"
@@ -71,7 +111,9 @@ mkdir -p "$TASKS_DIR"
 # `dirname "$path"` == `$TASKS_DIR_ABS` fails when /tmp is symlinked to
 # /private/tmp — which is the default.
 TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
-WORKSPACE_DIR="$(dirname "$TASKS_DIR_ABS")"
+# A watcher on <ws>/deliveries/<id> must not infer the workspace from its
+# inbox; whoever named that inbox names the workspace too.
+WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # Optional task handlers are injected by runtime adapters. Two provider workers
@@ -79,6 +121,9 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # of spawning an unbounded process fanout. Unhandled work still emits its
 # TASK_FILE event immediately, even while the provider queue is full.
 TASK_HANDLER_WORKERS=2
+# shellcheck source=../scripts/python-binary.sh
+. "$__REPO_ROOT/scripts/python-binary.sh"
+SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 DISPATCH_DIR=""
 WATCH_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sutando-task-watch.XXXXXX")"
 mkfifo "$WATCH_RUNTIME_DIR/events"
@@ -86,7 +131,12 @@ FSWATCH_PID=""
 CLEANING_UP=0
 GROUP_TERM_SENT=0
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-FALLBACKS_DIR="$WORKSPACE_DIR/state/task-event-handler-fallbacks"
+# Per instance: this receipt says "MY optional handler declined this task", and
+# a shared one makes another instance bypass its own handler. Owner: util_paths.
+FALLBACKS_DIR="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/util_paths.py" handler-fallbacks-dir "$WORKSPACE_DIR/state")" || {
+  echo "watch-tasks-stream: could not resolve the fallback receipt dir" >&2
+  exit 1
+}
 WATCHER_ID="$$-${RANDOM:-0}"
 
 claim_is_live() {
@@ -168,17 +218,45 @@ claim_disposition() {
   esac
 }
 
+# 0 = the task is settled (failure published, or a real answer already exists).
+# 1 = NOT settled: another writer may own the destination, so nothing was touched.
+# One place for "this delivery is over", so every terminal publication settles the
+# record rather than each call site remembering to.
+settle_worker_record() {
+  record_worker_done "$1" done "$WORKSPACE_DIR" || true
+}
+
 publish_terminal_failure() {
-  local filename="$1" reason="$2" result temporary rc
+  # $3 is the resolved payload: a sentinel entry's FAILED row must key on the
+  # body the resolver named, never the sentinel a basename alone would resolve.
+  local filename="$1" reason="$2" payload="${3:-$TASKS_DIR/$1}" result temporary rc
   result="$RESULTS_DIR/$filename"
-  [ -f "$result" ] && return 0
+  # The shared readiness contract, not -f/-s: an empty OR whitespace-only body
+  # is the undeliverable placeholder state and must not suppress this failure.
+  if handler_result_exists "$filename"; then
+    settle_worker_record "$filename"
+    return 0
+  fi
   mkdir -p "$RESULTS_DIR"
   temporary="$(mktemp "$RESULTS_DIR/.$filename.XXXXXX.tmp")" || return 1
   chmod 600 "$temporary" 2>/dev/null || true
-  printf '%s\n' "I could not safely process this Team-tier task because the restricted runtime $reason. No unrestricted fallback was used." > "$temporary"
-  ln "$temporary" "$result" 2>/dev/null || [ -f "$result" ]
-  rc=$?
+  printf '%s\n' "I $TERMINAL_REFUSAL_MARK this Team-tier task because the restricted runtime $reason. No unrestricted fallback was used." > "$temporary"
+  # `ln` is the only write to the destination: it establishes ownership or fails.
+  # Reading then mutating a path a provider can still claim has no safe ordering.
+  if ln "$temporary" "$result" 2>/dev/null; then
+    rc=0
+    # The scheduler's FAILED: the task ends here, whatever a provider observed.
+    ( "${SUTANDO_PY_BIN:-python3}" "$__SCRIPT_DIR/activity_bus.py" transition FAILED --task-file "$payload" --reason "$reason" >/dev/null 2>&1 & ) 2>/dev/null || true
+  elif handler_result_exists "$filename"; then
+    rc=0
+  else
+    echo "watch-tasks-stream: $filename holds an unready result this watcher does not own; leaving it and the claim unsettled rather than publishing a failure over a provider that may still be writing" >&2
+    rc=1
+  fi
   rm -f "$temporary"
+  # A terminal publication settles the delivery, so the record must reach its
+  # published stage or `residue` reads `completed` forever and nothing retires it.
+  [ "$rc" -eq 0 ] && settle_worker_record "$filename"
   return "$rc"
 }
 
@@ -209,8 +287,9 @@ release_dispatch_lock() {
 }
 
 finish_handler_task() {
-  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt
+  local marker="$1" task_path="$2" rc="$3" filename settled worker_receipt claim_settled announce verdict
   filename="$(basename "$task_path")"
+  announce="$(task_announce "$task_path")"
   worker_receipt="$DISPATCH_DIR/workers/$filename"
   settled="$DISPATCH_DIR/settled/$filename.worker"
   # Cleanup and the completion path race by atomically moving the same receipt.
@@ -219,22 +298,33 @@ finish_handler_task() {
   # event during cleanup, but it cannot strand the task without either path.
   if mv "$marker" "$settled" 2>/dev/null; then
     if [ "$rc" -ne 0 ] && claim_is_ours "$filename"; then
-      claim_disposition "$filename"
-      case $? in
+      claim_settled=1
+      # THIS run's own terminal code outranks a disposition fixed back at probe
+      # time: 4 is the handler saying the live core must not inherit the task.
+      if [ "$rc" -eq 4 ]; then
+        verdict=0
+      else
+        claim_disposition "$filename"
+        verdict=$?
+      fi
+      case $verdict in
         0)
           echo "watch-tasks-stream: required Team handler failed for $filename (exit $rc); publishing safe terminal failure" >&2
-          publish_terminal_failure "$filename" "failed" || true
+          # An unsettled publish leaves the claim held rather than clobbering a
+          # destination this watcher does not own; cross-restart retry is separate.
+          publish_terminal_failure "$filename" "failed" "$task_path" || claim_settled=0
           ;;
         1)
           printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
           echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          printf 'TASK_FILE: %s\n' "$filename" || true
+          record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
+          emit_fallback_task_file "$announce"
           ;;
         *)
           echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
           ;;
       esac
-      release_task_claim "$filename" || true
+      [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
     elif [ "$rc" -eq 0 ]; then
       release_task_claim "$filename" || true
     fi
@@ -244,17 +334,68 @@ finish_handler_task() {
   drain_dispatch_queue
 }
 
+# Our own terminal-refusal wording, shared by the writer and the reader below so
+# a reworded refusal cannot silently stop counting as one.
+TERMINAL_REFUSAL_MARK="could not safely process"
+
+handler_result_is_answer() {
+  # Our own refusal means the handler was interrupted and a restart MUST
+  # re-dispatch; an archived result belongs to the reap path, not to this guard.
+  local filename="$1" live="$RESULTS_DIR/$1" first
+  [ -f "$live" ] || return 1
+  handler_result_exists "$filename" || return 1
+  # The FIRST line, anchored: an answer that merely mentions the phrase is an
+  # answer, and mistaking it for a refusal re-runs work that already completed.
+  IFS= read -r first < "$live" || first=""
+  case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
+  return 0
+}
+
+handler_result_exists() {
+  # Readiness is delivery/readiness's contract (rejects whitespace-only too) and the
+  # live-then-archive lookup is local_task_protocol's; this must not re-decide either.
+  local filename="$1" task_id="${filename%.txt}"
+  [ -n "$SUTANDO_PY_BIN" ] || return 1
+  "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" <<'PYEOF' 2>/dev/null
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
+from local_task_protocol import find_result
+from delivery.readiness import read_ready_result
+found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
+raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
+PYEOF
+}
+
 drain_dispatch_queue() {
   local marker candidate task_path running_marker worker_receipt running_count=0
+  local filename worker_pid
+  # finish_handler_task ends by calling this function, and the dispatch lock is
+  # a mkdir spinlock with no timeout — a nested call would deadlock on it.
+  [ -n "${DRAIN_ACTIVE:-}" ] && return
   [ -n "$DISPATCH_DIR" ] && [ ! -e "$DISPATCH_DIR/shutting-down" ] || return
   acquire_dispatch_lock || return
   if [ -e "$DISPATCH_DIR/shutting-down" ]; then
     release_dispatch_lock
     return
   fi
+  DRAIN_ACTIVE=1
   shopt -s nullglob
+  # Count LIVE workers, not marker files: a worker that died before emitting
+  # HANDLER_DONE leaves its marker and would retire the slot permanently.
   for marker in "$DISPATCH_DIR/running/"*; do
-    running_count=$((running_count + 1))
+    filename="$(basename "$marker")"
+    worker_pid="$(cat "$DISPATCH_DIR/workers/$filename" 2>/dev/null)"
+    if [ -n "$worker_pid" ] && kill -0 "$worker_pid" 2>/dev/null; then
+      running_count=$((running_count + 1))
+      continue
+    fi
+    # rc decides whether the sender gets a terminal-failure reply — only when
+    # the worker died before producing a deliverable result.
+    if handler_result_exists "$filename"; then
+      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 0
+    else
+      finish_handler_task "$marker" "$(cat "$marker" 2>/dev/null)" 1
+    fi
   done
   while [ "$running_count" -lt "$TASK_HANDLER_WORKERS" ]; do
     marker=""
@@ -272,7 +413,7 @@ drain_dispatch_queue() {
     task_path="$(cat "$running_marker")"
     worker_receipt="$DISPATCH_DIR/workers/$(basename "$marker")"
     : > "$worker_receipt"
-    /bin/bash "$0" --handler-runner \
+    SUTANDO_PY_BIN="$SUTANDO_PY_BIN" /bin/bash "$0" --handler-runner \
       "$SUTANDO_TASK_EVENT_HANDLER" \
       "${SUTANDO_CORE_RUNTIME:-}" \
       "$WORKSPACE_DIR" \
@@ -282,10 +423,12 @@ drain_dispatch_queue() {
       "$WATCH_RUNTIME_DIR/events" \
       "$(basename "$marker")" &
     printf '%s\n' "$!" > "$worker_receipt"
+    activity_transition RUNNING "$task_path"  # keys on the real payload, resolved or not
     running_count=$((running_count + 1))
   done
   shopt -u nullglob
   release_dispatch_lock
+  DRAIN_ACTIVE=""
 }
 
 queue_handler_task() {
@@ -308,11 +451,40 @@ queue_handler_task() {
   drain_dispatch_queue
 }
 
+# A name is read relative to the reader's own inbox: a body that resolution
+# moved OUT of that inbox must be announced by its full path, not a bare name.
+
+# Shared by dispatch_task's own emit and the queued-handler completion and
+# shutdown-recovery paths, which only have the resolved path to work from.
+task_announce() {
+  local path="$1" dir
+  dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)"
+  if [ "$dir" = "$TASKS_DIR_ABS" ]; then
+    basename "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 dispatch_task() {
-  local task_path="$1" rc filename
+  local task_path="$1" rc filename announce resolved
+  # Resolve before anything observes it: claim, handler and emit must all name
+  # the body, never the sentinel that merely pointed at it.
+  resolved="$(resolve_inbox_entry "$task_path")" || return 0
+  announce="$(task_announce "$resolved")"
+  task_path="$resolved"
   filename="$(basename "$task_path")"
+  # A sentinel nothing retires is re-swept after every restart, and resolution
+  # turns that from re-reading an empty file into RE-RUNNING the real task.
+  if handler_result_is_answer "$filename"; then
+    printf 'already answered, not dispatching again: %s\n' "$announce" >&2
+    return 0
+  fi
+  # By announce, not filename: a resolved entry's activity row must key on
+  # the real payload, never the sentinel that basename alone would resolve.
+  queued_activity_row "$announce"
   if [ -z "$DISPATCH_DIR" ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$announce"
     return
   fi
   "$SUTANDO_TASK_EVENT_HANDLER" \
@@ -325,22 +497,22 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      printf 'TASK_FILE: %s\n' "$filename" || exit 0
+      emit_dispatch_task_file "$announce"
       return
     fi
-    queue_handler_task "$task_path" "fallback" || printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    queue_handler_task "$task_path" "fallback" || emit_dispatch_task_file "$announce"
   elif [ "$rc" -eq 4 ]; then
     # A required handler is a security boundary. Remove any legacy fallback
     # receipt and never make this task visible to the unrestricted live core.
     rm -f "$FALLBACKS_DIR/$filename"
     if ! queue_handler_task "$task_path" "must-handle"; then
-      publish_terminal_failure "$filename" "could not be queued" || true
+      publish_terminal_failure "$filename" "could not be queued" "$task_path" || true
     fi
   elif [ "$rc" -eq 3 ]; then
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$announce"
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    printf 'TASK_FILE: %s\n' "$filename" || exit 0
+    emit_dispatch_task_file "$announce"
   fi
 }
 
@@ -350,13 +522,15 @@ dispatch_task() {
 # the session and turn into an orphan. The trap below removes the file on a
 # clean exit; the Stop hook removes it after the kill on dirty exits.
 #
-# Same workspace resolution as TASKS_DIR (above): M0 cutover routes through
-# the canonical loader. Living under state/ matches the workspace contract
-# in CLAUDE.md (loose status/state files belong there). Post-v0.8 the legacy
-# env-var + hardcoded fallbacks are gone — fail-loud if helper missing.
-STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
+# Derived from WORKSPACE_DIR like CLAIMS_DIR and FALLBACKS_DIR, never re-resolved:
+# an argv tasks dir moves every other state path but left this one on the checkout.
+STATE_DIR="$WORKSPACE_DIR/state"
 mkdir -p "$STATE_DIR"
-PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+# Per instance: N watchers on one host each stamped the same file, so the
+# readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
+PID_FILE="$(sentinel_path_for "$STATE_DIR")"
+# In place, never write-elsewhere-then-mv: mv preserves mtime, and
+# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
 # PID-file cleanup is folded into the unified `cleanup` function below so a
 # single trap covers both responsibilities (rm + kill children). An earlier
@@ -412,7 +586,7 @@ _tmux_wake() {
 #   to re-send to ourselves closes that window; the process is exiting
 #   either way so nothing downstream needs to observe them again.
 fallback_outstanding_handlers() {
-  local marker task_path filename settled made_progress found claim owner_id cleanup_ready
+  local marker task_path filename announce settled made_progress found claim owner_id cleanup_ready claim_settled
   local worker_receipt worker_pid job_pid
   [ -n "$DISPATCH_DIR" ] && [ -d "$DISPATCH_DIR" ] || return
   : > "$DISPATCH_DIR/shutting-down"
@@ -429,23 +603,28 @@ fallback_outstanding_handlers() {
       mv "$marker" "$settled" 2>/dev/null || continue
       task_path="$(cat "$settled")"
       filename="$(basename "$task_path")"
+      announce="$(task_announce "$task_path")"
       if claim_is_ours "$filename"; then
+        claim_settled=1
         claim_disposition "$filename"
         case $? in
           0)
             echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-            publish_terminal_failure "$filename" "was interrupted" || true
+            # As above: hold the claim rather than publish over a destination this
+            # watcher does not own.
+            publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
             ;;
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            printf 'TASK_FILE: %s\n' "$filename" || true
+            record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
+            emit_task_file "$announce"
             ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
             ;;
         esac
-        release_task_claim "$filename" || true
+        [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
       fi
       rm -f "$settled"
       made_progress=1
@@ -463,22 +642,27 @@ fallback_outstanding_handlers() {
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     [ -n "$task_path" ] || continue
     filename="$(basename "$task_path")"
+    announce="$(task_announce "$task_path")"
+    claim_settled=1
     claim_disposition "$filename"
     case $? in
       0)
         echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-        publish_terminal_failure "$filename" "was interrupted" || true
+        # Hold the claim rather than release: a task that is neither delivered nor
+        # failed must keep its last record. Cross-restart retry is separate work.
+        publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
         ;;
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" || true
+        record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
+        emit_task_file "$announce"
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
         ;;
     esac
-    release_task_claim "$filename" || true
+    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
   done
 
   # Claims and fallback events are durable now. TERM the whole process group,
@@ -531,6 +715,11 @@ fallback_outstanding_handlers() {
 cleanup() {
   [ "${CLEANING_UP:-0}" -eq 0 ] || return
   CLEANING_UP=1
+  # FIRST, before any release/kill/sweep work: the drain and queue guards read
+  # this file, so anything they do before it exists can still promote a worker.
+  if [ -n "${DISPATCH_DIR:-}" ] && [ -d "$DISPATCH_DIR" ]; then
+    : > "$DISPATCH_DIR/shutting-down"
+  fi
   # EXIT and signal traps share this function. Disarm EXIT before spawning
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
@@ -538,9 +727,7 @@ cleanup() {
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
-  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
-    rm -f "$PID_FILE"
-  fi
+  sentinel_release_if_owner "$PID_FILE" "$$"
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
@@ -623,6 +810,11 @@ while IFS= read -r path; do
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
+        # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
+        # emitting one mid-shutdown would orphan it.
+        if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
+          continue
+        fi
         dispatch_task "$path"
       fi
       ;;

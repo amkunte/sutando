@@ -1,10 +1,19 @@
 #!/bin/bash
 # Graceful core-restart orchestrator. Flow, flags and rationale live in
-# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred.
+# notes/graceful-restart-design.md. Exit: 0 ok · 3 prep failed · 4 deferred ·
+# 5 dry-run (nothing killed or restarted).
 set -euo pipefail
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+[ "${1:-}" = "--dry-run" ] && { DRY_RUN=1; shift; }
+# Args after `--` reach start-cli.sh. The menu-bar restart needs --visible to
+# survive the handoff, or its relaunch silently becomes detached.
+[ "${1:-}" = "--" ] && shift
+RESTART_ARGS=("$@")
+# Log-only form: "${arr[@]}" inside a larger quoted string splits across log()'s
+# parameters and is correct only by accident of `$*`.
+RESTART_ARGS_STR=""
+[ "${#RESTART_ARGS[@]}" -gt 0 ] && RESTART_ARGS_STR=" ${RESTART_ARGS[*]}"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 WS="${GR_WS:-$(bash "$REPO/scripts/sutando-config.sh" workspace)}"   # GR_WS: test-only workspace override
@@ -17,9 +26,36 @@ ALIVE="$WS/state/cores/$HOST.alive"
 STATUS="$WS/state/core-status.json"
 STALE_S=90                                     # matches core_heartbeat's documented liveness threshold
 STATUS_TTL_S="${GR_STATUS_TTL_S:-900}"         # "running" older than this = wedged, not busy (test override)
+STATUS_REREADS="${GR_STATUS_REREADS:-5}"       # empty-read retries before treating the status as absent
 POLL_S="${GR_POLL_S:-2}"                       # test override
 
-log() { echo "graceful-restart[$RID]: $*"; }
+# The app pipes stdout only into itself, so a kill-without-relaunch left no
+# trace on disk. Same text both ways: main.swift matches phases on its wording.
+GR_LOG="$WS/logs/graceful-restart.log"
+mkdir -p "$WS/logs" 2>/dev/null || true
+log() {
+  local line="graceful-restart[$RID]: $*"
+  echo "$line"
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> "$GR_LOG" 2>/dev/null || true
+}
+
+# Defined BEFORE the EXIT/INT/TERM traps below are armed: bash resolves a
+# function at call time, so cleanup_lock must never name one that is not yet there.
+PREP_TASK="$WS/tasks/task-restart-prep-$RID.txt"
+# The task has done its job once a decision is made; never leave it for the next boot's orphan-check.
+retire_prep_task() {
+  # The core answers the drain task in results/; no bridge collects a task the
+  # orchestrator wrote, so the orchestrator is its consumer: log it, archive it.
+  local res="$WS/results/task-restart-prep-$RID.txt"
+  if [ -f "$res" ]; then
+    log "drain result: $(head -c 300 "$res" | tr '\n' ' ')"
+    mkdir -p "$WS/results/archive"
+    mv "$res" "$WS/results/archive/" 2>/dev/null || log "drain result NOT archived (mv failed): $res"
+  fi
+  [ -f "$PREP_TASK" ] || return 0
+  mkdir -p "$WS/tasks/archive"
+  mv "$PREP_TASK" "$WS/tasks/archive/" 2>/dev/null || true
+}
 
 # ---- Phase 0: serialize -------------------------------------------------
 
@@ -71,6 +107,7 @@ printf '%s' "$RID" > "$LOCKDIR/rid"
 # Release only OUR lock. Guarded by the rid so a reaper's lock is never removed.
 RESTART_DECIDED=0
 cleanup_lock() {
+  retire_prep_task
   # Production ends in `exec` so this never runs and retention is structural.
   # A dry-run DOES reach here; retaining would self-block the next real run.
   if [ "$RESTART_DECIDED" = 1 ] && \
@@ -110,21 +147,59 @@ alive_age() {
 # Busy = core-status.json claims "running" AND its self-reported ts is fresh.
 busy() {
   [ -f "$STATUS" ] || return 1
-  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$STATUS" 2>/dev/null || return 1
+  # Every writer is a `>` truncate-then-write, so a read can land on an EMPTY
+  # file. Empty is unknown, not idle — re-read instead of authorising the kill.
+  local raw="" i=0
+  while :; do
+    raw="$(cat "$STATUS" 2>/dev/null || true)"
+    [ -n "$raw" ] && break
+    i=$((i + 1))
+    [ "$i" -ge "$STATUS_REREADS" ] && return 1
+    sleep 0.05
+  done
+  printf '%s' "$raw" | grep -q '"status"[[:space:]]*:[[:space:]]*"running"' || return 1
   local ts
-  ts="$(grep -o '"ts"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$STATUS" 2>/dev/null | grep -o '[0-9][0-9]*$' || true)"
+  ts="$(printf '%s' "$raw" | grep -o '"ts"[[:space:]]*:[[:space:]]*[0-9][0-9]*' \
+        | grep -o '[0-9][0-9]*$' || true)"
   [ -n "$ts" ] || return 1
   [ "$(( $(date +%s) - ts ))" -le "$STATUS_TTL_S" ]
 }
 
+# Phase 1a: hand the core a drain task. A busy core reads it at its next tool
+# boundary; only a wedged or dead core never does, and .alive covers that case.
+write_prep_task() {
+  if [ "$DRY_RUN" = 1 ]; then
+    log "DRY-RUN — would write the drain task $PREP_TASK (not written: it would drain a live core)"
+    return 0
+  fi
+  mkdir -p "$WS/tasks"
+  # Dot-prefixed staging name: the watcher globs task-*.txt, so it never sees a partial file.
+  local tmp="$WS/tasks/.task-restart-prep-$RID.tmp"
+  {
+    printf 'id: task-restart-prep-%s\n' "$RID"
+    printf 'timestamp: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'source: restart\ninteraction_type: message\nchannel_id: local-restart\n'
+    printf 'user_id: restart-orchestrator\naccess_tier: owner\npriority: urgent\n'
+    printf 'task: RESTART_PREP: %s — a graceful restart is waiting on this core. Finish the step in hand, start no new work, then run `bash scripts/core-status.sh idle`: that opens the kill window (the orchestrator syncs the workspace and relaunches you). Write results/task-restart-prep-%s.txt with one line naming what was in flight, or "nothing". Do NOT run --restart yourself.\n' "$RID" "$RID"
+  } > "$tmp"
+  mv "$tmp" "$PREP_TASK"
+  log "drain task written: tasks/$(basename "$PREP_TASK") — waiting for the core to go idle"
+}
 do_restart() {
   local reason="$1"
   if [ "$DRY_RUN" = 1 ]; then
-    log "DRY-RUN — would exec 'start-cli.sh --restart' now ($reason). Skipping the actual kill."
-    return 0
+    # Echo the REAL argv: without it the passthrough is unobservable in dry-run.
+    log "DRY-RUN — would exec 'start-cli.sh --restart${RESTART_ARGS_STR}' now ($reason). Skipping the actual kill."
+    # Exit rather than return: both call sites follow with `exit 0`, which is
+    # indistinguishable from a real restart to anyone reading the status.
+    exit 5
   fi
-  log "restarting core ($reason)…"
-  exec bash "$REPO/src/agent/start-cli.sh" --restart
+  retire_prep_task
+  log "restarting core ($reason)… — start-cli.sh's own trace continues in logs/restart-attempts.log"
+  # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
+  # GR_START_CLI is a test seam: dry-run never reaches this line.
+  export GR_RID="$RID"   # lets the launcher release THIS run's lock if it aborts
+  exec bash "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" --restart ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
 }
 
 # ---- Phase 1: quiet gate -------------------------------------------------
@@ -133,6 +208,7 @@ if [ "$(alive_age)" -gt "$STALE_S" ]; then
   DEAD=1
   log "core is DEAD (.alive stale/absent > ${STALE_S}s) — no wait; prep runs best-effort"
 else
+  write_prep_task
   log "quiet gate: waiting for a safe kill window (busy = core-status running + fresh ts)…"
   i=0
   while busy; do
@@ -162,7 +238,7 @@ if ! own_lock; then
 fi
 
 # ---- Phase 2: prep, direct invocation ------------------------------------
-log "running prep (direct invocation — no task-queue handoff)…"
+log "running prep (sync + record, orchestrator-side; the drain task above was the core-side half)…"
 prep_rc=0
 bash "$REPO/src/agent/restart-prep.sh" "$RID" || prep_rc=$?
 

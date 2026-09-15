@@ -28,14 +28,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Isolate the channel config BEFORE the bridge import: _ag2space_access_path()
-# resolves under $CLAUDE_CONFIG_DIR (falling back to the real ~/.claude), and
-# _write_task() reads the tierMap from it at write time — without this, the
-# suite depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on
-# #2432 round 2, P1-2: a controlled tierMap mapping the fixture sender to
-# "team" made the owner-activity assertion fail on an operator box).
+# Isolate the channel config BEFORE the bridge import: _write_task() reads the
+# tierMap from _ag2space_access_path() at write time — without this, the suite
+# depends on the operator's REAL AG2 Space tier map (qingyun-wu CR on #2432
+# round 2, P1-2: a controlled tierMap mapping the fixture sender to "team"
+# made the owner-activity assertion fail on an operator box).
 _CFG_ROOT = Path(tempfile.mkdtemp(prefix="rgb-telem-cfg-"))
+# AG2_DEVICE_ENV outranks CLAUDE_CONFIG_DIR in _ag2space_access_path, so setting
+# only the latter still resolves to the operator's install on a configured host.
 os.environ["CLAUDE_CONFIG_DIR"] = str(_CFG_ROOT)
+os.environ["AG2_DEVICE_ENV"] = ""
 _ACCESS = _CFG_ROOT / "channels" / "ag2space" / "access.json"
 _ACCESS.parent.mkdir(parents=True, exist_ok=True)
 _ACCESS.write_text('{"allowFrom": [], "tierMap": {}}')
@@ -118,9 +120,9 @@ class _FakeTelemetry:
 # 1. newly queued task → one event tagged with the task's source
 _fresh_dirs()
 with _FakeTelemetry() as t:
-    tid = rgb._write_task({"id": "task-telem1", "task": "hello", "source": "ag2space",
-                           "user_id": "@rui:ag2.space", "access_tier": "owner",
-                           "channel_id": "!room:ag2.space"})
+    tid, _ = rgb._write_task({"id": "task-telem1", "task": "hello", "source": "ag2space",
+                              "user_id": "@rui:ag2.space", "access_tier": "owner",
+                              "channel_id": "!room:ag2.space"})
 check("write returns the task id", tid == "task-telem1")
 check("one task_processed event", t.calls == ["ag2space"], repr(t.calls))
 
@@ -156,8 +158,8 @@ check("archived redelivery writes no task file",
 _fresh_dirs()
 _prev = sys.modules.pop("telemetry", None)
 try:
-    tid = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space",
-                           "access_tier": "owner"})
+    tid, _ = rgb._write_task({"id": "task-telem5", "task": "standalone", "source": "ag2space",
+                              "access_tier": "owner"})
 finally:
     if _prev is not None:
         sys.modules["telemetry"] = _prev
@@ -167,8 +169,8 @@ check("missing telemetry module → task still queued",
 # 6. telemetry raising mid-call → write still succeeds (fire-and-forget)
 _fresh_dirs()
 with _FakeTelemetry(raise_on_call=True) as t:
-    tid = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space",
-                           "access_tier": "owner"})
+    tid, _ = rgb._write_task({"id": "task-telem6", "task": "boom", "source": "ag2space",
+                              "access_tier": "owner"})
 check("raising telemetry never breaks the write",
       tid == "task-telem6" and (rgb.TASKS_DIR / "task-telem6.txt").exists())
 check("raising telemetry was attempted", t.calls == ["ag2space"], repr(t.calls))

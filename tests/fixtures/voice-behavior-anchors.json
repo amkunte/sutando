@@ -504,7 +504,8 @@
    "description": "Start streaming live vision frames to you (Gemini) so you can see what the user is doing in real time. Use for: \"watch my screen\", \"look at what I'm doing\", \"follow along\", \"see me as I talk\". Frames flow at ~1 fps until stop_vision is called or the session ends. Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). Prefer send_vision_frame for one-off \"look at this\" questions. Instant.",
    "execution": "inline",
    "params": {
-    "fps": "Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.",
+    "display": "Which display to watch, as its index from the needs_display_choice list. Only for source=screen, and only needed on a multi-display Mac. Held for the rest of the session once set.",
+    "fps": "Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.",
     "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
    }
   },
@@ -513,7 +514,8 @@
    "description": "Start streaming live vision frames to you (Gemini) so you can see what the user is doing in real time. Use for: \"watch my screen\", \"look at what I'm doing\", \"follow along\", \"see me as I talk\". Frames flow at ~1 fps until stop_vision is called or the session ends. Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). Prefer send_vision_frame for one-off \"look at this\" questions. Instant.",
    "execution": "inline",
    "params": {
-    "fps": "Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.",
+    "display": "Which display to watch, as its index from the needs_display_choice list. Only for source=screen, and only needed on a multi-display Mac. Held for the rest of the session once set.",
+    "fps": "Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.",
     "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
    }
   },
@@ -563,18 +565,18 @@
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); \"latest-search\" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
-    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
    }
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); \"latest-search\" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
-    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web."
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
    }
   },
   {

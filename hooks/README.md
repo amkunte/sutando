@@ -16,13 +16,24 @@ the part an instruction alone can't guarantee, since a raw curl bypasses an inst
 
 ### Deploy (per node)
 
+`~/.claude` is NOT always the config dir. Claude Code honours `$CLAUDE_CONFIG_DIR`, and the
+Sutando core sets it (e.g. to `<workspace>/.claude-sutando`). Registering into
+`~/.claude/settings.json` on such a node edits a file the core never reads — the JSON is valid,
+the hook is present, and the guard is still not armed. Resolve the dir first:
+
 ```bash
-cp hooks/context-source-guard.py ~/.claude/hooks/
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/context-source-guard.py "$CFG/hooks/"
 # register under BOTH the Bash and Read PreToolUse matchers:
-python3 - <<'PY'
-import json, os
-sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
-cmd = "python3 ~/.claude/hooks/context-source-guard.py"
+CFG="$CFG" python3 - <<'PY'
+import json, os, shlex
+cfg = os.environ["CFG"]
+sp = os.path.join(cfg, "settings.json")
+s = json.load(open(sp)) if os.path.isfile(sp) else {}
+# Quote: the stored command is re-parsed as a shell word list, and this
+# recipe's target dirs routinely contain a space (e.g. Application Support).
+cmd = f"python3 {shlex.quote(os.path.join(cfg, 'hooks', 'context-source-guard.py'))}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
 for m in ("Bash", "Read"):
     blk = next((b for b in pre if b.get("matcher") == m), None)
@@ -31,6 +42,31 @@ for m in ("Bash", "Read"):
 json.dump(s, open(sp, "w"), indent=2)
 PY
 ```
+
+Verify. Registration is the only thing that proves the guard is armed — the file being
+present in `hooks/` does not. And registration alone does not prove it *runs*: the
+command is stored as a string and re-parsed by a shell, so an unquoted path splits on
+the space in `Application Support` and the hook dies before reading its input. Execute
+what is registered, don't just look for it:
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" python3 - <<'PY'
+import json, os, subprocess
+h = json.load(open(os.path.join(os.environ["CFG"], "settings.json"))).get("hooks", {})
+cmds = [k["command"] for m in h.get("PreToolUse", []) for k in m.get("hooks", [])
+        if "context-source-guard" in k.get("command", "")]
+print("registered:", len(cmds))
+for c in cmds:
+    # The guard fail-opens on a Read event, so 0 is the expected exit. A split
+    # path exits 2 — which is PreToolUse's BLOCK code, so the broken recipe
+    # denies every Bash and Read call rather than merely failing to guard.
+    r = subprocess.run(c, shell=True, input='{"tool_name":"Read","tool_input":{}}',
+                       text=True, capture_output=True)
+    print(f"exit {r.returncode}  {'OK' if r.returncode == 0 else 'BROKEN: ' + r.stderr.strip()[:90]}")
+PY
+```
+
+Both matchers must appear (`Bash` and `Read`), and every line must read `exit 0`.
 
 `settings.json` registration is read at **session start**; once registered, the script
 file itself is executed fresh on every tool call, so updating `context-source-guard.py`
@@ -119,7 +155,19 @@ denied); non-Gmail tools are a no-op, so it is safe under a broad matcher.
 Escape hatch: `SUTANDO_ALLOW_GMAIL_CONNECTOR_WRITES=1` lifts the guard (for
 if/when the connector's scopes are fixed upstream). Fail-OPEN on hook errors.
 
-### Deploy (per node)
+### Registration
+
+**Auto-registered** for every core session: `start-cli.sh` passes this hook to
+`src/agent/claude/cli/build-core-settings.mjs`, which registers it under
+`PreToolUse` with matcher `mcp__.*[Gg][Mm][Aa][Ii][Ll].*` in the `--settings`
+JSON. Nothing to install per node.
+
+The registration rides `--settings` rather than a written `settings.json`, so it
+survives an app update that replaces the engine tree (the failure mode issue
+#3221 describes for the `install-claude-hooks.sh` set).
+
+To register it in a non-core session (e.g. an interactive Claude Code), add the
+same `PreToolUse` entry to `~/.claude/settings.json` by hand:
 
 ```bash
 cp hooks/gmail-write-guard.py ~/.claude/hooks/
@@ -136,6 +184,76 @@ PY
 ```
 
 Test: `python3 tests/gmail-write-guard.test.py`.
+
+## `review-authority-guard.py`
+
+Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /
+`--request-changes` (and `--comment` under `hold`), or `gh api .../pulls/N/reviews`
+carrying `APPROVE` / `REQUEST_CHANGES` — while the owner's standing answer on
+review authority is unresolved. An APPROVE moves a merge gate, and merges are
+the owner's; verifying a change carefully is not authorization to vote on it.
+The mode lives in `<workspace>/state/authority.json`:
+An owner who ruled *verbally* has no file yet, so that ruling reads as `hold` until someone writes it — register the file on the node whose owner already answered.
+
+```json
+{"github_formal_review": "hold" | "findings-only" | "allow"}
+```
+
+A missing file means `findings-only`: the votes stay denied until the owner
+rules, while a COMMENTED review — which moves no gate and is the durable place
+a finding lives — stays possible. A file that is present but unreadable, or
+carries an unknown mode, means `hold` (a ruling was written and cannot be read,
+so the restrictive reading applies). Never gated: review dismissals (a
+reduction of standing), `gh pr comment`, `--comment` under `findings-only`, and
+every non-review command. Compound commands are split per segment so an earlier
+benign `gh` cannot shadow a later review; `bash -c "..."` / `sh -c` / `eval`
+wrappers are re-classified on their quoted command.
+
+Escape hatch: `SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1`. Fail-OPEN on hook errors.
+
+### Registration
+
+Not auto-registered. Deploy per node into `$CLAUDE_CONFIG_DIR` and add a
+`PreToolUse` entry with matcher `Bash`, the same way as the manual block under
+`gmail-write-guard.py` above (command: `python3 <deployed path>/review-authority-guard.py`).
+In-repo the hook resolves the workspace through `workspace_default.resolve_workspace`;
+a deployed copy searches upward for `state/authority.json`. Set
+`SUTANDO_HOOK_WORKSPACE=<workspace>` to pin it.
+
+Test: `python3 tests/review-authority-guard.test.py`.
+
+## `release-target-guard.py`
+
+DENIES `gh release create|edit` whose `--target` is an abbreviated commit SHA
+(7-39 hex characters). GitHub answers `Release.target_commitish is invalid` and
+creates nothing, so the release reads as cut at the moment it did not happen.
+A full 40-character SHA and a branch/tag name both pass.
+
+It exists because the rule is easy to know and useless to know: the value is not
+chosen, it is pasted from whatever printed last, and every tool prints the
+abbreviated form. Measured twice in fourteen hours on one host, with the
+correction written into the build log between the two occurrences.
+
+### Deploy (per node)
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/release-target-guard.py "$CFG/hooks/"
+```
+
+Register it under the `Bash` PreToolUse matcher exactly as the guards above do
+(same `shlex.quote` recipe — these paths routinely contain a space).
+
+Escape hatch: `SUTANDO_SKIP_RELEASE_TARGET_GUARD=1`. Fail-open on any internal
+error, like every guard here.
+
+Scope: it sees only literal text. `--target "$(git rev-parse --short HEAD)"`
+is allowed, because the value is unknowable before execution — and that is a
+very plausible way to produce this bug. The guard bounds pasted values, not
+computed ones.
+
+Tests: `python3 tests/release-target-guard.test.py`
 
 ## `result-file-marker-guard.py`
 
@@ -228,3 +346,23 @@ printf '{"tool_name":"Write","tool_input":{"file_path":"%s/results/task-probe.tx
 ```
 
 Tests: `python3 tests/result-file-marker-guard.test.py`
+
+## `comment-signature-guard.py`
+
+Denies a `gh pr comment` / `gh issue comment` / `gh pr create` / `gh issue create`
+whose body carries no agent MXID. Attribution under a shared GitHub login rests on
+the body signature — the login cannot tell two agents apart and the commit email is
+many-to-one — and nothing enforced it.
+
+The check matches the **MXID**, never the surrounding prose: measured across three
+PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the newer
+`— name (@<mxid>)`, so a wording-keyed check sees 2 of 41.
+
+- `SUTANDO_AGENT_MXID` — the identity to require. **No default.** Unset means the
+  guard does not enforce and says so once on stderr, so a node cannot silently
+  inherit another agent's identity and deny every comment it writes.
+- `SUTANDO_ALLOW_UNSIGNED_COMMENT=1` — one-shot override.
+
+**Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
+the same login and is outside the subcommand set, as is a body read from stdin
+(`-F -`). Both are deliberate — the guard reads a body it can see.

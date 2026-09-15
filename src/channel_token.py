@@ -24,20 +24,23 @@ bridge needs to agree on:
      token was gone with no copy anywhere — and `vault set`, the obvious
      recovery, could not help because nothing read it.
 
-**The bridges do NOT adopt a precedence from this module — they append one tier.**
-Each bridge keeps its own env/`.env` order and calls `token_from_vault()` only
-after its existing resolution has come up empty. That distinction is deliberate:
+**Adoption is per-channel, decided by whether this module's order IS that
+channel's native order.** The DISCORD consumers (`discord-bridge.py`,
+`discord-read.py`, `read_discord_channel.py`, `dm-result.py`) resolve through
+`resolve_channel_token()` directly: their native precedence was already
+env -> `.env` -> vault, so adopting the shared resolver changes nothing but
+who owns the quoting/emptiness rules (five private parsers had already
+drifted on both). TELEGRAM does not adopt it and must not:
 `telegram-bridge.py:91` documents that its config file must WIN over a stale
 shell env (#416 — `setdefault` once let a prior session's token silently
-override a freshly-rotated one), which is the opposite of the order
-`resolve_channel_token()` uses. Declaring one policy while the bridges follow
-another would make this docstring a lie about the code beside it.
-(Caught by @Sutando-Pro reviewing the claim.)
+override a freshly-rotated one), the opposite of this module's order — it
+keeps its own order and appends `token_from_vault()` as the last tier only.
+Declaring one policy while a bridge follows another would make this docstring
+a lie about the code beside it. (Original distinction caught by @Sutando-Pro.)
 
-`resolve_channel_token()` therefore serves the GATE, not the bridges, and the
-gate asks a question precedence cannot affect: *does a usable token exist at
-all?* If more than one layer holds a value, existence is true regardless of
-which one is preferred.
+`resolve_channel_token()` also serves the GATE, which asks a question
+precedence cannot affect: *does a usable token exist at all?* If more than
+one layer holds a value, existence is true regardless of which is preferred.
 
 The value is never printed, logged, or returned in an error message.
 """
@@ -50,13 +53,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
+# AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
+RELAY_TOKEN_VARS: tuple[str, ...] = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
 
 def _clean(value: object) -> str:
     """Strip whitespace and one layer of matching quotes; '' if not usable.
 
     `.env` conventions allow `VAR="abc"`, and the literal quotes reaching an API
     URL is a real bug this repo has already hit (telegram 404s on
-    `.../bot"abc"/getUpdates`).
+    `.../bot"abc"/getUpdates`). Exactly ONE layer: a token may legitimately
+    contain quote characters, so peeling further would corrupt it.
     """
     if not isinstance(value, str):
         return ""
@@ -64,6 +72,35 @@ def _clean(value: object) -> str:
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
         v = v[1:-1].strip()
     return v
+
+
+def clean_relay_token(value: object) -> str:
+    """`_clean` plus repair for a re-rendered `<url>|<secret>` relay token.
+
+    A writer that quoted an already-quoted value leaves stacked layers and
+    shell escapes, and the polluted secret 401s on every relay. Safe to peel
+    here and nowhere else: this shape is url|hex, so a quote or backslash at
+    either edge is never content (unlike a bot token — see
+    tests/discord-token-delegation.test.py's one-layer contract).
+
+    The gate is `|`-SHAPED, not provenance-based: any future value containing a
+    pipe inherits this peel, so check that before adding one to RELAY_TOKEN_VARS.
+    """
+    v = _clean(value)
+    if "|" not in v:
+        return v
+    while True:
+        prev = v
+        v = v.strip().strip("\\'\"").strip()
+        if v == prev:
+            return v
+
+
+def _clean_for(var: str, value: object) -> str:
+    """Apply the contract that `var` requires: relay vars peel, everything else
+    keeps the one-matching-layer rule. Keyed here so the three readers below
+    cannot disagree and a new one inherits it without remembering."""
+    return clean_relay_token(value) if var in RELAY_TOKEN_VARS else _clean(value)
 
 
 def token_from_env_file(var: str, env_file: Path) -> str:
@@ -78,7 +115,7 @@ def token_from_env_file(var: str, env_file: Path) -> str:
             continue
         key, _, value = line.partition("=")
         if key.strip() == var:
-            return _clean(value)
+            return _clean_for(var, value)
     return ""
 
 
@@ -96,7 +133,7 @@ def token_from_vault(var: str, vault_get=None) -> str:
         except Exception:
             return ""
     try:
-        return _clean(vault_get(var))
+        return _clean_for(var, vault_get(var))
     except Exception:
         return ""
 
@@ -110,7 +147,7 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
     conventional sources have nothing usable.
     """
     environ = os.environ if environ is None else environ
-    found = _clean(environ.get(var, ""))
+    found = _clean_for(var, environ.get(var, ""))
     if found:
         return found
     if env_file is not None:

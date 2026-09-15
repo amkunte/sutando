@@ -15,6 +15,7 @@
  * Presets (named after the only knob that matters — Web grounding):
  *   - 'search'    → 2.5-flash-native-audio + googleSearch:true  (Web grounding ON)
  *   - 'no-search' → 3.1-flash-live-preview + googleSearch:false (newer model, no Web)
+ *   - 'latest-search' → 3.1-flash-live-preview + googleSearch:true (needs a paid-tier VOICE key)
  *
  * The tool returns BEFORE the restart fires (small setTimeout) so Gemini
  * can speak the ack before the transport closes. The guarded takeover kills
@@ -22,7 +23,7 @@
  */
 
 import { z } from 'zod';
-import { writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -61,12 +62,46 @@ export function fireGuardedRestart(spawnImpl: typeof spawn = spawn): void {
 // owner_mode / channels are merged in from VOICE_CONFIG_DEFAULTS at write time.
 type VoiceConfigPreset = Pick<VoiceConfig, 'model' | 'googleSearch'>;
 
-const PRESETS: Record<'search' | 'no-search', VoiceConfigPreset> = {
+export const PRESETS: Record<'search' | 'no-search' | 'latest-search', VoiceConfigPreset> = {
 	search: { model: 'gemini-2.5-flash-native-audio-preview-12-2025', googleSearch: true },
 	'no-search': { model: 'gemini-3.1-flash-live-preview', googleSearch: false },
+	// 3.1 + search: a free-tier VOICE key closes with 1011; a paid-tier key holds.
+	'latest-search': { model: 'gemini-3.1-flash-live-preview', googleSearch: true },
 };
 
 const ts = () => new Date().toISOString().slice(11, 23);
+
+/** Read the live config as raw JSON. An absent, unreadable, or corrupt file
+ *  is not a reason to refuse a switch — the caller falls back to defaults. */
+export function readConfigRaw(path: string): unknown {
+	try {
+		return existsSync(path) ? JSON.parse(readFileSync(path, 'utf-8')) : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * What the switch writes: defaults fill gaps, **the user's own file is
+ * preserved**, and only the preset's keys are overlaid.
+ *
+ * The previous form was `{...VOICE_CONFIG_DEFAULTS, ...preset}` — it never
+ * read the file, so every switch REPLACED it. That silently deleted session
+ * tuning (`compressionConfig`, `mediaResolution`), their explicit
+ * `null`/`false` off-switches, and any future key, with a restart right
+ * behind it so the loss left no trace. Preserving raw is also what makes a
+ * fleet-wide defaults revert reach devices whose user has used the switch.
+ */
+export function nextSwitchConfig(
+	existingRaw: unknown,
+	preset: Pick<VoiceConfig, 'model' | 'googleSearch'>,
+): VoiceConfig {
+	const existing =
+		existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)
+			? (existingRaw as Partial<VoiceConfig>)
+			: {};
+	return { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset };
+}
 
 export const switchVoiceConfigTool: ToolDefinition = {
 	name: 'switch_voice_config',
@@ -76,20 +111,21 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		'"switch to no-search mode", "use 2.5", "use 3.1", "turn search on", "turn search off". ' +
 		'Presets: ' +
 		'"search" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); ' +
-		'"no-search" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding). ' +
+		'"no-search" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); ' +
+		'"latest-search" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). ' +
 		'Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. ' +
 		'HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch ' +
 		'requests — NEVER because the conversation merely mentions search/searching, and never on filler ' +
 		'or garbled speech; when unsure, fire nothing.',
 	parameters: z.object({
-		preset: z.enum(['search', 'no-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web.'),
+		preset: z.enum(['search', 'no-search', 'latest-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web. "latest-search" = 3.1+Web grounding.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { preset } = args as { preset: 'search' | 'no-search' };
+		const { preset } = args as { preset: 'search' | 'no-search' | 'latest-search' };
 		const cfg = PRESETS[preset];
 		if (!cfg) {
-			return { error: `Unknown preset "${preset}". Use "search" or "no-search".` };
+			return { error: `Unknown preset "${preset}". Use "search", "no-search" or "latest-search".` };
 		}
 
 		// The voice-agent config is per-user data — it lives in the workspace
@@ -102,8 +138,7 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		const tmpPath = `${configPath}.tmp-${process.pid}`;
 		try {
 			mkdirSync(join(resolveWorkspace(), 'config'), { recursive: true });
-			// Merge with defaults so the on-disk file is complete + auditable.
-			const next: VoiceConfig = { ...VOICE_CONFIG_DEFAULTS, ...cfg };
+			const next = nextSwitchConfig(readConfigRaw(configPath), cfg);
 			writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
 			renameSync(tmpPath, configPath);
 			console.log(`${ts()} [SwitchVoiceConfig] wrote ${configPath} → preset=${preset} (model=${cfg.model}, search=${cfg.googleSearch})`);
@@ -122,7 +157,9 @@ export const switchVoiceConfigTool: ToolDefinition = {
 
 		const summary = preset === 'search'
 			? 'Switching to search mode: Gemini 2.5 with Web grounding. Restarting now…'
-			: 'Switching to no-search mode: Gemini 3.1, no Web grounding. Restarting now…';
+			: preset === 'latest-search'
+				? 'Switching to latest-search mode: Gemini 3.1 with Web grounding. Restarting now…'
+				: 'Switching to no-search mode: Gemini 3.1, no Web grounding. Restarting now…';
 		return {
 			ok: true,
 			preset,

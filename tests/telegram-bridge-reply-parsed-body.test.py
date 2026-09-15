@@ -43,16 +43,15 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
         """
         start = SRC.find("for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):")
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
-        # Delimit on the loop's actual terminator rather than a fixed char
-        # count. The old fixed 4500-char window silently stopped covering the
-        # "whole loop body" it claims to cover once this fork's delivery
-        # contract (#8/#22: attempt counter, archival gated on a confirmed
-        # send, give-up branch) made the body ~7.1k chars — the confirmation
-        # print sits ~5.3k in, so the assertions below were reading a truncated
-        # block and reporting a defect that was not there. A char budget that
-        # must be re-tuned every time the loop grows is not an invariant.
-        end = SRC.find("\n        time.sleep(1)", start)
-        self.assertGreater(end, start, "end of the pending_replies loop not found")
+        # End on the loop's own dedent, not a character count. A fixed window is
+        # a latent break: any insertion pushes the last assertion off its edge.
+        head = SRC.rfind("\n", 0, start) + 1
+        indent = len(SRC[head:start])
+        end = len(SRC)
+        for m in re.finditer(r"^[ \t]*(?=\S)", SRC[start:], re.M):
+            if m.start() and len(m.group()) <= indent:
+                end = start + m.start()
+                break
         return SRC[start:end]
 
     def test_send_reply_uses_parsed_body_not_reply_text(self):

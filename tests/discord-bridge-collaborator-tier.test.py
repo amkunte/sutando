@@ -189,8 +189,8 @@ def behavioral(bridge) -> list:
         fails.append("select_rulebook_key(team, is_collaborator=True) must be 'team-collaborator'")
     if srk("team", False) != "team":
         fails.append("select_rulebook_key(team, False) must stay 'team'")
-    if srk("other", False) != "other":
-        fails.append("select_rulebook_key(other, False) must stay 'other'")
+    if srk("guest", False) != "guest":
+        fails.append("select_rulebook_key(guest, False) must stay 'guest'")
     if srk("owner", False) != "owner":
         fails.append("select_rulebook_key(owner, False) must stay 'owner'")
 
@@ -211,13 +211,13 @@ def structural() -> list:
         fails.append("is_collaborator should default to False (fail-closed)")
 
     # Tier resolution calls the helper with the serving channel id.
-    if not re.search(r"is_collaborator\s*=\s*resolve_is_collaborator\(\s*data\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
-        fails.append("tier resolution must call resolve_is_collaborator(data, sender_id, message.channel.id)")
+    if not re.search(r"is_collaborator\s*=\s*resolve_team_collaborator\(\s*_acc\s*,\s*access_tier\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
+        fails.append("tier resolution must call resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id) — the hoisted, tier-gated wiring")
 
     # Codex-preamble + silent-escalate branches exclude collaborators.
-    if not re.search(r'if\s+access_tier\s+in\s+\("team",\s*"other"\)\s+and\s+not\s+is_collaborator\s*:', src):
+    if not re.search(r'if\s+access_tier\s+in\s+\("team",\s*"guest"\)\s+and\s+not\s+is_collaborator\s*:', src):
         fails.append("codex-preamble branch must exclude collaborators (`and not is_collaborator`)")
-    if not re.search(r'elif\s+access_tier\s+in\s+\("team",\s*"other"\)\s+and\s+not\s+is_collaborator\s*:', src):
+    if not re.search(r'elif\s+access_tier\s+in\s+\("team",\s*"guest"\)\s+and\s+not\s+is_collaborator\s*:', src):
         fails.append("silent-escalate branch must exclude collaborators (`and not is_collaborator`)")
 
     # Task-file assembly: rulebook via helper, collaborator marker, wire tier unchanged.
@@ -231,17 +231,30 @@ def structural() -> list:
         fails.append("access_tier line must still serialize {access_tier} verbatim (collaborators stay team)")
 
     # The team-collaborator rulebook exists and reasserts the owner-only boundary.
-    rb = re.search(r'"team-collaborator"\s*:\s*\(([\s\S]*?)\)\s*,\s*\n\s*"team"\s*:', src)
-    if not rb:
-        fails.append("tier_instructions must define a 'team-collaborator' key before the 'team' key")
-    else:
-        body = rb.group(1)
+    # RENDER the rulebook instead of regexing the source for a literal: the text
+    # moved to src/team_guardrail.py, and a source-shape assertion cannot see it.
+    if not re.search(r'"team-collaborator"\s*:\s*engage_rulebook\(', src):
+        fails.append("tier_instructions must map 'team-collaborator' to engage_rulebook(...)")
+    sys.path.insert(0, str(BRIDGE.parent))
+    try:
+        from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE
+        body = engage_rulebook("channel", DISCORD_PROVENANCE, "results/task-{id}.txt")
+    except Exception as exc:
+        fails.append(f"team-collaborator rulebook is not renderable: {exc}")
+        body = ""
+    if body:
         if "SUTANDO SYSTEM INSTRUCTIONS" not in body:
             fails.append("team-collaborator rulebook must carry the in-band SYSTEM INSTRUCTIONS fence")
         if "OWNER" not in body or "authority boundary" not in body:
             fails.append("team-collaborator rulebook must reassert the owner-only authority boundary")
         if not re.search(r"commit|push|merge|irreversible|system-mutating", body):
             fails.append("team-collaborator rulebook must enumerate the owner-only (no-mutation) constraint")
+        # The subagent is offered as a processing SHAPE, never as a wider grant:
+        # isolating the context must not read as relaxing the boundary above it.
+        if "SUBAGENT" not in body:
+            fails.append("team-collaborator rulebook must offer the subagent processing option")
+        elif not re.search(r"not widen", body):
+            fails.append("subagent option must state it does not widen collaborator authority")
 
     return fails
 

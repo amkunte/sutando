@@ -23,12 +23,18 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP — jq not installed"; exit 0; }
 
 # --- build a fake clone whose path contains spaces ---------------------------
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks test.XXXXXX")"
+# The installer creates the archive hook's destination under $HOME, so every
+# invocation below must run against a throwaway home, not the developer's.
+export HOME="$ROOT/home"; mkdir -p "$HOME"
 REPO="$ROOT/repo with spaces"
 mkdir -p "$REPO/src" "$REPO/.claude"
 cp "$INSTALLER" "$REPO/src/install-claude-hooks.sh"
 # Stub the hook targets so an executed command can prove WHICH file it reached.
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n'      > "$REPO/src/session-handoff.sh"
 printf '#!/bin/bash\necho "PENDING-RAN"\n'      > "$REPO/src/check-pending-tasks.sh"
+# The archiver is exercised for real below, so copy it and its resolver rather
+# than stubbing: a stub would assert the hook string, not that it archives.
+cp "$HERE/../src/archive-transcript.sh" "$HERE/../src/hook_transcript_path.sh" "$REPO/src/"
 chmod +x "$REPO/src/"*.sh
 SETTINGS="$REPO/.claude/settings.json"
 
@@ -79,6 +85,21 @@ RUN_OUT3="$(TRANSCRIPT_PATH=/dev/null bash -c "$PC_CMD" 2>&1)"
 ok "PreCompact handoff stored command executes the intended script" \
    "$([ "$RUN_OUT3" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 
+# The archive hook is a bare `cp`, so it cannot create its own destination. The
+# assertion that matters is not "the directory exists" but "the stored command
+# executed by a shell actually archives a file" — the same standard as above.
+ok "installer created the archive hook's destination directory" \
+   "$([ -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+
+AR_CMD="$(cmds PreCompact | grep sutando-conversations || true)"
+printf 'transcript\n' > "$ROOT/transcript.jsonl"
+# Drive it the way Claude Code does — transcript_path on stdin JSON, no env var.
+# Feeding $TRANSCRIPT_PATH instead passed only while the legacy `cp` co-existed.
+printf '{"transcript_path": "%s"}' "$ROOT/transcript.jsonl" \
+  | bash -c "$AR_CMD" >/dev/null 2>&1
+ok "PreCompact archive stored command actually writes a transcript" \
+   "$([ "$(ls "$HOME/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
+
 # --- 2. legacy Desktop repo hooks are migrated away -------------------------
 ok "legacy Desktop session-handoff hook removed (PreCompact)" \
    "$(cmds PreCompact | grep -q 'Desktop/sutando/src/session-handoff.sh' && echo 1 || echo 0)"
@@ -88,8 +109,10 @@ ok "legacy Desktop check-pending-tasks hook removed (Stop)" \
    "$(cmds Stop | grep -q 'Desktop/sutando/src/check-pending-tasks.sh' && echo 1 || echo 0)"
 
 # --- 3. things that must SURVIVE the sweep ----------------------------------
-ok "transcript-archive hook preserved (different marker)" \
-   "$(cmds PreCompact | grep -q 'sutando-conversations/' && echo 0 || echo 1)"
+# The fixture seeds the legacy bare-`cp` archiver, which this PR migrates rather
+# than sweeps — so name the surviving form, or the grep passes on either one.
+ok "an archive hook on PreCompact, in the archive-transcript.sh form" \
+   "$(cmds PreCompact | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
 ok "operator-added unrelated hook preserved" \
    "$(cmds Stop | grep -q 'operator-added-keepme' && echo 0 || echo 1)"
 
@@ -313,11 +336,148 @@ print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', []) for h 
 ")"
 ok "operator's custom transcript-archive command survives re-run" \
    "$(echo "$CCMDS" | grep -q 'CUSTOM_TRANSCRIPT_PATH' && echo 0 || echo 1)"
+# Match OUR script, not just the destination: the operator's custom command above
+# also names sutando-conversations, so a destination-only grep passes vacuously.
 ok "our archive hook is still installed alongside it" \
-   "$(echo "$CCMDS" | grep -q '"\$TRANSCRIPT_PATH".*sutando-conversations' && echo 0 || echo 1)"
+   "$(echo "$CCMDS" | grep -q 'archive-transcript\.sh.*sutando-conversations' && echo 0 || echo 1)"
 ok "and the repo-path hook is still installed on the same event" \
    "$(echo "$CCMDS" | grep -q 'session-handoff' && echo 0 || echo 1)"
 rm -rf "$CROOT"
+
+# --- 11. the LEGACY archive command is migrated, but never under the omit flag -
+# This PR changed the archiver from a bare `cp` to archive-transcript.sh. Phase 0
+# cannot migrate the old form (no repo path, see 10) and phase 1 matches the exact
+# command, so a host that had opted in would keep BOTH — the stale one failing on
+# every compaction. Under the omit flag the same migration would turn an inert
+# opt-in into live ~/Desktop egress, which an unattended re-run must not decide.
+LEG_CMD='cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'
+seed_legacy_repo() {  # $1 = destination repo dir
+  mkdir -p "$1/src" "$1/.claude"
+  cp "$INSTALLER" "$1/src/install-claude-hooks.sh"
+  printf '#!/bin/bash\n:\n' > "$1/src/session-handoff.sh"
+  printf '#!/bin/bash\n:\n' > "$1/src/check-pending-tasks.sh"
+  printf '#!/bin/bash\n:\n' > "$1/src/archive-transcript.sh"
+  chmod +x "$1/src/"*.sh
+  LEG_SETTINGS="$1/.claude/settings.json" LEG_CMD="$LEG_CMD" python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command",
+    "command": os.environ["LEG_CMD"]}]}]}},
+    open(os.environ["LEG_SETTINGS"], "w"), indent=2)
+PY
+}
+archive_cmds() {  # $1 = settings path -> one command per line, archiver-targeting only
+  LEG_SETTINGS="$1" python3 -c "
+import json, os
+d = json.load(open(os.environ['LEG_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', [])
+                   for h in g['hooks'] if 'sutando-conversations' in h['command']))
+"
+}
+
+LROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy.XXXXXX")"
+seed_legacy_repo "$LROOT/repo with spaces"
+bash "$LROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+LCMDS="$(archive_cmds "$LROOT/repo with spaces/.claude/settings.json")"
+ok "legacy bare-cp archiver is removed on upgrade" \
+   "$(echo "$LCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 1 || echo 0)"
+ok "and replaced by the archive-transcript.sh form" \
+   "$(echo "$LCMDS" | grep -q 'archive-transcript\.sh' && echo 0 || echo 1)"
+ok "leaving exactly one archiver hook, not two" \
+   "$([ "$(echo "$LCMDS" | grep -c 'sutando-conversations')" = 1 ] && echo 0 || echo 1)"
+rm -rf "$LROOT"
+
+OROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy omit.XXXXXX")"
+seed_legacy_repo "$OROOT/repo with spaces"
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$OROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+OCMDS="$(archive_cmds "$OROOT/repo with spaces/.claude/settings.json")"
+ok "under the omit flag the opt-in survives untouched" \
+   "$(echo "$OCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 0 || echo 1)"
+ok "and no archiver is installed in its place" \
+   "$(echo "$OCMDS" | grep -q 'archive-transcript\.sh' && echo 1 || echo 0)"
+rm -rf "$OROOT"
+
+# ---- upgrade path: a pre-existing runner-first skill hook must be MIGRATED ----
+# The outage case: a re-run must replace the old `python3 <path>` entry, not add beside it.
+UROOT="$(mktemp -d)"; UREPO="$UROOT/repo"
+mkdir -p "$UREPO/.claude" "$UREPO/src" "$UREPO/skills/demo/hooks"
+cp "$HERE/../src/install-claude-hooks.sh" "$UREPO/src/"
+cp "$HERE/../src/skill_hooks.py" "$UREPO/src/"
+printf '#!/bin/bash\n:\n' > "$UREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$UREPO/src/check-pending-tasks.sh"
+chmod +x "$UREPO/src/"*.sh
+printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"}]}\n' \
+    > "$UREPO/skills/demo/manifest.json"
+printf 'import sys; sys.exit(2)\n' > "$UREPO/skills/demo/hooks/g.py"
+# Resolve the fixture path: skill_hooks writes RESOLVED paths, and macOS mktemp's
+# /var/... alias would seed a string no installer ever wrote (false migration failure).
+GPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$UREPO/skills/demo/hooks/g.py")"
+export U_SETTINGS="$UREPO/.claude/settings.json"
+# Seed EXACTLY what a previous installer wrote, plus an operator variant that
+# invokes the same script — the negative control the sweep must not eat.
+U_OLD="python3 $GPATH" python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    {"type": "command", "command": os.environ["U_OLD"]},
+    {"type": "command", "command": "bash -x " + os.environ["U_OLD"].split(" ", 1)[1]},
+]}]}}, open(os.environ["U_SETTINGS"], "w"), indent=2)
+PY
+bash "$UREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+UCMDS="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['U_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreToolUse', []) for h in g['hooks']))
+")"
+ok "old runner-first skill hook is REMOVED on re-run (not left beside the new one)" \
+   "$(echo "$UCMDS" | grep -qx "python3 $GPATH" && echo 1 || echo 0)"
+ok "guarded skill hook is registered exactly once" \
+   "$([ "$(echo "$UCMDS" | grep -c '^\[ -f .*g\.py ')" = 1 ] && echo 0 || echo 1)"
+ok "operator's own variant on the same script survives (negative control)" \
+   "$(echo "$UCMDS" | grep -q 'bash -x ' && echo 0 || echo 1)"
+# The point of the whole change: with the script gone, nothing blocks.
+rm -f "$GPATH"
+UGUARD="$(echo "$UCMDS" | grep '^\[ -f .*g\.py ' | head -1)"
+bash -c "$UGUARD" >/dev/null 2>&1
+ok "with the script deleted the guarded hook exits 0 (tool not blocked)" "$?"
+rm -rf "$UROOT"
+
+# ---- same upgrade, on a repo path containing `exec ` and `|` ----
+# `${CMD#*exec }` splits inside such a path; the `|` exercises the NUL field framing.
+EROOT="$(mktemp -d)"; EREPO="$EROOT/exec repo|x/repo"
+mkdir -p "$EREPO/.claude" "$EREPO/src" "$EREPO/skills/demo/hooks"
+cp "$HERE/../src/install-claude-hooks.sh" "$EREPO/src/"
+cp "$HERE/../src/skill_hooks.py" "$EREPO/src/"
+printf '#!/bin/bash\n:\n' > "$EREPO/src/session-handoff.sh"
+printf '#!/bin/bash\n:\n' > "$EREPO/src/check-pending-tasks.sh"
+chmod +x "$EREPO/src/"*.sh
+printf '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/g.py"}]}\n' \
+    > "$EREPO/skills/demo/manifest.json"
+printf 'import sys; sys.exit(2)\n' > "$EREPO/skills/demo/hooks/g.py"
+EPATH="$(python3 -c "import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())" "$EREPO/skills/demo/hooks/g.py")"
+export E_SETTINGS="$EREPO/.claude/settings.json"
+# shq quotes the path, so the seeded legacy entry must be quoted the same way an
+# installer would have written it — otherwise the fixture is not what it claims.
+E_OLD="python3 $(python3 -c "import shlex,sys;print(shlex.quote(sys.argv[1]))" "$EPATH")"
+export E_OLD
+python3 - <<'PY'
+import json, os
+json.dump({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [
+    {"type": "command", "command": os.environ["E_OLD"]},
+]}]}}, open(os.environ["E_SETTINGS"], "w"), indent=2)
+PY
+bash "$EREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ECMDS="$(python3 -c "
+import json, os
+d = json.load(open(os.environ['E_SETTINGS']))
+print(chr(10).join(h['command'] for g in d['hooks'].get('PreToolUse', []) for h in g['hooks']))
+")"
+ok "path containing 'exec ': legacy entry is REMOVED, not left blocking" \
+   "$(echo "$ECMDS" | grep -qxF "$E_OLD" && echo 1 || echo 0)"
+# No trailing space in the pattern: this path needs quoting, so shq emits `g.py'`
+# where an ordinary path emits a bare `g.py `.
+ok "path containing 'exec ': guarded hook registered exactly once" \
+   "$([ "$(echo "$ECMDS" | grep -c "^\[ -f .*g\.py")" = 1 ] && echo 0 || echo 1)"
+rm -rf "$EROOT"
 
 rm -rf "$ROOT"
 echo "---"
