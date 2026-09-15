@@ -48,6 +48,8 @@ function kartsAirDataPath(): string {
 	const home = join(process.env.HOME || REPO_ROOT, '.claude/skills/karts-air/state/karts-air-data.json');
 	const repo = join(REPO_ROOT, 'skills/karts-air/state/karts-air-data.json');
 	return existsSync(home) ? home : repo;
+}
+
 // ─── Browser voice-transport delivery ──────────────────────────────────────
 //
 // The page loads src/web-voice-transport.ts — the canonical transport — as a
@@ -4968,6 +4970,8 @@ function markStateItemDelivered(dataPath: string, listKey: 'orders' | 'parcels',
 	if (!String(item.notes || '').includes('marked delivered manually')) item.notes = (item.notes ? item.notes + ' · ' : '') + 'marked delivered manually';
 	writeFileSync(dataPath, JSON.stringify(data, null, 2) + '\n');
 	return { status: 200, body: { ok: true }, label: String(item.merchant || item.item || id).slice(0, 40) };
+}
+
 function isLoopbackAddress(address: string | undefined): boolean {
 	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
