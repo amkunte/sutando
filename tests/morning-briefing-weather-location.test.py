@@ -25,6 +25,25 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "morning-briefing.py"
 
+_CFG_PATCHER = None
+
+
+def setUpModule():
+    """These tests mock os.environ, but config_get reads the config stanza
+    first — an install that configures weather would shadow every mock."""
+    global _CFG_PATCHER
+    sys.path.insert(0, str(REPO / "src"))
+    import sutando_config
+    _CFG_PATCHER = patch.object(sutando_config, "load_config", return_value={})
+    _CFG_PATCHER.start()
+
+
+def tearDownModule():
+    if _CFG_PATCHER is not None:
+        _CFG_PATCHER.stop()
+
+
+
 PAYLOAD = {
     "current": {"temperature_2m": 59.4, "weather_code": 3},
     "daily": {

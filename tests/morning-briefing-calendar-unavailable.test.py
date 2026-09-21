@@ -18,11 +18,31 @@ All subprocess calls are mocked — no real osascript runs here.
 import importlib.util
 import subprocess
 import unittest
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "morning-briefing.py"
+
+_CFG_PATCHER = None
+
+
+def setUpModule():
+    """These tests mock os.environ, but config_get reads the config stanza
+    first — an install that configures weather would shadow every mock."""
+    global _CFG_PATCHER
+    sys.path.insert(0, str(REPO / "src"))
+    import sutando_config
+    _CFG_PATCHER = patch.object(sutando_config, "load_config", return_value={})
+    _CFG_PATCHER.start()
+
+
+def tearDownModule():
+    if _CFG_PATCHER is not None:
+        _CFG_PATCHER.stop()
+
+
 
 CAL_600_ERR = (
     "execution error: Calendar got an error: "
