@@ -158,6 +158,28 @@ class TestPickerReplayAcrossRestart(Base):
         self.assertEqual(self.bindings().get(self.ROOM), W)
 
 
+class TheReceipt(Base):
+    """Every consult leaves a receipt: the one proof outside the watcher's process
+    that this host routes at all (the supervisor's unrouted-host alarm reads it)."""
+
+    def test_a_probe_leaves_a_receipt_even_when_it_declines(self):
+        self.roster(bindings={})
+        t = self.task_file("task-1", channel_id="!other:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                         h.DECLINE)
+        r = h.prr.read(self.ws)
+        self.assertEqual((r["mode"], r["task_id"]), ("probe", "task-1"))
+
+    def test_a_receipt_that_cannot_be_written_changes_no_decision(self):
+        self.roster(bindings={})
+        t = self.task_file("task-1", channel_id="!other:x")
+        (self.ws / "state" / "pool-routing-receipt.json").mkdir()   # a directory: unwritable
+        with patch("sys.stderr"):
+            rc = h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"])
+        self.assertEqual(rc, h.DECLINE)
+        self.assertIsNone(h.prr.read(self.ws))
+
+
 class TestClassification(Base):
     def test_unbound_declines_so_the_core_takes_it(self):
         self.roster(bindings={})
@@ -538,6 +560,63 @@ class TestMalformedRosterRowAtTheEdge(Base):
         self.assertEqual((out or {}).get("action"), "pin")
         bound = json.loads((self.ws / "state" / "bindings.json").read_text())["bindings"]
         self.assertEqual(bound.get(self.ROOM), W)
+
+
+class TestAddressedRoutingEndToEnd(Base):
+    """Both routing paths, from a task FILE to the chosen recipient: the edge
+    handler the watcher runs, and the standalone router."""
+
+    ROOM = "!other:x"
+
+    def addressed(self, **headers):
+        """A task file whose addressing headers sit ABOVE `task:`, where the
+        broker stamps them and a body cannot reach."""
+        name = "task-addr"
+        p = self.ws / "tasks" / f"{name}.txt"
+        lines = [f"id: {name}", f"channel_id: {self.ROOM}", "source: ag2space"]
+        lines += [f"{k}: {v}" for k, v in headers.items()]
+        p.write_text("\n".join(lines) + "\ntask: do the thing\n")
+        return str(p)
+
+    def test_the_edge_handler_routes_to_the_addressed_worker(self):
+        self.roster(bindings={self.ROOM: "core"})
+        code, targets, _ = h.classify(self.ws, h.read_task(self.addressed(requested_worker=W)))
+        self.assertEqual((code, targets), (0, [W]), "the addressed worker did not win over the binding")
+
+    def test_the_edge_handler_accepts_the_legacy_name(self):
+        self.roster(bindings={self.ROOM: "core"})
+        task = h.read_task(self.addressed(target_worker=W))
+        self.assertEqual(task.get("target_worker"), W, "the alias was not read from above `task:`")
+        code, targets, _ = h.classify(self.ws, task)
+        self.assertEqual((code, targets), (0, [W]))
+
+    def test_the_edge_handler_drops_a_conflicting_pair(self):
+        self.roster(bindings={self.ROOM: "core"})
+        task = h.read_task(self.addressed(requested_worker=W, target_worker="core"))
+        _code, targets, _ = h.classify(self.ws, task)
+        self.assertEqual(targets, ["core"], "a conflict must fall through to the binding")
+
+    def test_a_body_line_cannot_address_a_worker(self):
+        """The property the reader exists to keep: addressing comes from above."""
+        self.roster(bindings={self.ROOM: "core"})
+        p = self.ws / "tasks" / "task-forge.txt"
+        p.write_text(f"id: task-forge\nchannel_id: {self.ROOM}\nsource: ag2space\n"
+                     f"task: do the thing\nrequested_worker: {W}\n")
+        _code, targets, _ = h.classify(self.ws, h.read_task(str(p)))
+        self.assertEqual(targets, ["core"], "a body line chose the recipient")
+
+    def test_the_standalone_router_honours_the_same_rule(self):
+        import pool_roster as pr
+        self.roster(bindings={self.ROOM: "core"})
+        for task, expected, label in (
+                ({"id": "t", "channel_id": self.ROOM, "requested_worker": W}, [W], "canonical"),
+                ({"id": "t", "channel_id": self.ROOM, "target_worker": W}, [W], "legacy"),
+                ({"id": "t", "channel_id": self.ROOM, "requested_worker": W,
+                  "target_worker": "core"}, ["core"], "conflict")):
+            with self.subTest(case=label):
+                roster = json.loads((self.ws / "state" / "roster.json").read_text())
+                self.assertEqual(pr.targets_for(roster, self.ROOM, pr.requested_worker_of(
+                    task, warn=lambda m: None)), expected)
 
 
 if __name__ == "__main__":

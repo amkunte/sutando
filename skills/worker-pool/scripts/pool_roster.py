@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import task_event_handler_config_path  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 CORE = "core"
@@ -42,6 +43,16 @@ STATES = ("live", "recovering", "abandoned", "retired")
 
 class RosterError(Exception):
     """A declaration the roster cannot represent, refused at compile time."""
+
+
+class PublishError(OSError):
+    """The roster was written but its advertisement was not: the router will
+    follow the new roster, the picker will not until a publish succeeds."""
+
+    def __init__(self, roster: dict, cause: OSError):
+        super().__init__(getattr(cause, "errno", None),
+                         f"roster v{roster.get('version')} written, advertisement not: {cause}")
+        self.roster = roster
 
 
 def _root(workspace) -> Path:
@@ -131,6 +142,32 @@ def resolve_label(roster: dict, name: str) -> str:
         return name
     hits = [wid for wid, row in workers.items() if (row or {}).get("label") == name]
     return hits[0] if len(hits) == 1 else name
+
+
+LEGACY_WORKER_FIELD = "target_worker"
+
+
+def requested_worker_of(task: dict, warn=None) -> "str | None":
+    """The route the sender asked for, from the canonical field.
+
+    `target_worker` is accepted for one migration window and reported, so a
+    producer that has not moved keeps working and is visible while it does.
+    Two fields that DISAGREE name two recipients: neither is chosen, because
+    picking one silently routes the owner's message somewhere they can no
+    longer see. The task falls through to its binding instead.
+    """
+    say = warn if warn is not None else (lambda m: print(m, file=sys.stderr))
+    canonical = (task.get("requested_worker") or "").strip() or None
+    legacy = (task.get(LEGACY_WORKER_FIELD) or "").strip() or None
+    if canonical and legacy and canonical != legacy:
+        say(f"pool_roster: SECURITY: requested_worker={canonical!r} disagrees with "
+            f"{LEGACY_WORKER_FIELD}={legacy!r}; ignoring both and using the binding")
+        return None
+    if legacy and not canonical:
+        say(f"pool_roster: DEPRECATED: {LEGACY_WORKER_FIELD} is the old name for "
+            f"requested_worker; the producer of this task should be updated")
+        return legacy
+    return canonical
 
 
 def targets_for(roster: dict, source: str, requested_worker=None) -> list:
@@ -228,7 +265,52 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None) -> dic
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
     _write_atomic(roster_path(workspace), roster)
+    _publish(workspace, roster)
     return roster
+
+
+def _publish(workspace, roster: dict) -> None:
+    """The advertisement is derived from the roster, so it is published where the
+    roster is written: a direct `bind_room` is then harmless by construction."""
+    import pool_advertise as pa  # sibling; it imports this module, so bound late
+    try:
+        pa.write_advertisement(workspace)
+    except OSError as e:
+        raise PublishError(roster, e) from e
+
+
+class HandlerPublishError(RosterError):
+    """The handler could not be published, so no pool may be registered.
+
+    core's watcher reads a missing/unusable config as the ordinary no-pool
+    case, so a pool that exists without one is indistinguishable from no pool
+    at all -- and worker-bound tasks would fall through to the unrestricted
+    core.
+    """
+
+
+def publish_task_event_handler(workspace):
+    """Declare this skill's router as core's task-event handler.
+
+    Written to <workspace>/state/task-event-handler.json, which core's
+    watcher also fswatches -- so a worker registration takes effect on the
+    watcher's very next event, no restart. An install that never registers a
+    worker never writes this, and the watcher behaves exactly as it did
+    before this skill existed. `_write_atomic`'s tmp name is PID-suffixed, so
+    two concurrent registrations (the caller already serializes via `_locked`,
+    but this function is also exercised directly, unlocked, elsewhere) never
+    collide on the same tmp path the way a shared name would.
+    """
+    handler = Path(__file__).resolve().parent / "pool_route_handler.py"
+    cfg = task_event_handler_config_path(Path(workspace) / "state")
+    try:
+        _write_atomic(cfg, {"handler": str(handler)})
+    except OSError as e:
+        raise HandlerPublishError(
+            f"cannot publish the task-event handler at {cfg}: {e}") from e
+    return cfg
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
@@ -239,6 +321,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
     drops one of them from the result.
     """
     with _locked(workspace):
+        # Before any durable write: a registration that survived a failed publish
+        # would leave a real pool the launcher cannot distinguish from no pool.
+        publish_task_event_handler(workspace)
         workers = dict((_load_existing_roster_strict(workspace) or {}).get("workers") or {})
         workers[worker_id] = {"state": "live", "label": label or worker_id}
         if runtime:
@@ -254,10 +339,11 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
 
 def bind_room(workspace, room: str, target: str) -> dict:
     """Bind one room to one worker, named by id or by a unique label — the one
-    production writer for a pin. Same locked read-merge-write as
-    `register_worker`; an unknown or ambiguous name is refused BEFORE the
-    declaration is saved, so bindings.json never names a target the roster
-    would reject on its next compile."""
+    production writer for a pin, and it publishes: the compile it ends in writes
+    the advertisement too. Same locked read-merge-write as `register_worker`; an
+    unknown or ambiguous name is refused BEFORE the declaration is saved, so
+    bindings.json never names a target the roster would reject on its next
+    compile."""
     with _locked(workspace):
         raw = _load_existing_roster_strict(workspace)
         if raw is None:

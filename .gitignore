@@ -72,6 +72,7 @@ tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.test.ps1
 !tests/*.test.mjs
 tests/__pycache__/
 !tests/*.txt
@@ -157,6 +158,8 @@ skills/tv-price-watcher/
 # Playwright MCP cache (created by mcp__playwright tools)
 .playwright-mcp/
 
+# IDE / editor workspace state — per-user, never shared.
+.vscode/
 # coverage-gate artifacts (scripts/coverage-gate.sh)
 .coverage
 .coverage.*
