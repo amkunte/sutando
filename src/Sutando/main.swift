@@ -797,17 +797,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Run an executable, capture stdout as String. Returns nil on failure
     /// or non-zero exit. Used by refreshContextualChips for `gh` / `gws` /
     /// other CLI shell-outs that are mechanical and need no LLM judgment.
+    /// Parent env with the tool PATH prepended. An app launched via `open` gets a
+    /// minimal PATH, so any child that shells out loses brew-installed deps.
+    static func envWithToolPath() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let toolDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        env["PATH"] = toolDirs.joined(separator: ":") + ":" + (env["PATH"] ?? "")
+        return env
+    }
+
     func runShell(_ path: String, _ args: [String]) -> String? {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
-        // Inherit parent env; also force PATH to include homebrew so child
-        // tools that themselves shell-out (e.g. `gh` invoking `git`) find
-        // their own deps. Apps launched via `open` get a minimal PATH
-        // that excludes /opt/homebrew/bin → gh can't find git → exits non-zero.
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
-        proc.environment = env
+        proc.environment = AppDelegate.envWithToolPath()
         let outPipe = Pipe()
         let errPipe = Pipe()
         proc.standardOutput = outPipe
@@ -1956,6 +1959,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             proc.standardOutput = fh
             proc.standardError = fh
             proc.currentDirectoryURL = URL(fileURLWithPath: self.workspace)
+            proc.environment = AppDelegate.envWithToolPath()
 
             do {
                 try proc.run()
