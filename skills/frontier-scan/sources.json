@@ -36,6 +36,24 @@
       "kind": "github",
       "repo": "openclaw/openclaw",
       "why_track": "Owner-flagged agentic runtime (calendar-versioned). Ships features that map straight onto Sutando: durable task orchestration (TaskFlow), richer Telegram delivery, Skill Workshop, auto fast-mode. Repo confirmed 2026-06-24."
+    },
+    {
+      "name": "Hermes (Nous Research) — agent releases",
+      "kind": "web",
+      "search": "Nous Research Hermes AI agent release 2026",
+      "why_track": "Owner-flagged competitor. The Hermes-Function-Calling repo above publishes no releases or tags, so GitHub polling sees nothing — this web lane is what actually covers Hermes agent launches."
+    },
+    {
+      "name": "Grok Bots (xAI)",
+      "kind": "web",
+      "search": "xAI Grok bots agents release announcement 2026",
+      "why_track": "Owner-flagged competitor. Grok's agent/bot surface ships through X and xAI announcements, not a public agent repo."
+    },
+    {
+      "name": "xAI SDK (Grok)",
+      "kind": "github",
+      "repo": "xai-org/xai-sdk-python",
+      "why_track": "The one xAI repo with real releases (5 as of 2026-09-21) — deterministic signal for Grok agent/tool-calling capability, complementing the web lane above."
     }
   ]
 }
