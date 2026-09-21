@@ -11,7 +11,7 @@ Fix: prefer a Google-calendar cache the core agent writes at
 `state/calendar-today.json` (the agent can reach the Station connector; this
 standalone script cannot). And when MORNING_BRIEFING_CALENDAR_SOURCE=google is
 set, the cache is the ONLY trusted source — a missing/stale cache returns None
-(→ "couldn't read your calendar"), never a misleading empty local read.
+(→ "couldn't read your macOS Calendar"), never a misleading empty local read.
 
 No real osascript / network runs here.
 """
@@ -180,7 +180,7 @@ class TestGoogleSourceGate(unittest.TestCase):
             weather=None, events=None, reminders=[], discord_msgs=[],
             pending_qs=[], health_issues=[],
         )
-        self.assertIn("couldn't read your calendar", text)
+        self.assertIn("couldn't read your macOS Calendar", text)
         self.assertNotIn("clear", text)
 
 

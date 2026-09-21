@@ -251,7 +251,7 @@ class TestSpokenSentence(unittest.TestCase):
         self.assertIn("clear today", self._say([]))
 
     def test_unreadable_calendar_still_reported(self):
-        self.assertIn("couldn't read your calendar", self._say(None))
+        self.assertIn("couldn't read your macOS Calendar", self._say(None))
 
 
 class TestAllDayDateOnlyStarts(unittest.TestCase):

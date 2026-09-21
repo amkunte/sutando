@@ -171,7 +171,7 @@ allgone = _mod.synthesize(None, None, None, [], [], None)
 ok("all-unavailable briefing makes no all-clear claim", CLEAN not in allgone,
    f"got {allgone!r}")
 ok("all-unavailable briefing still reports the calendar honestly",
-   "couldn't read your calendar" in allgone, f"got {allgone!r}")
+   "couldn't read your macOS Calendar" in allgone, f"got {allgone!r}")
 
 
 # --- a CRASHED health check is not a clean system (review round 2) ---------
