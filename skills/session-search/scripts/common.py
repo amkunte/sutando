@@ -15,6 +15,22 @@ from pathlib import Path
 
 # ---- paths ---------------------------------------------------------------
 
+def _claude_home_path(*subpath: str) -> Path:
+    """Delegate to the repo's single claude-home resolver rather than copying
+    its $CLAUDE_CONFIG_DIR / $CLAUDE_HOME / ~/.claude order (duplicated policy
+    drifts). Falls back to the stock home only if the helper is unreachable."""
+    import sys
+    repo = Path(__file__).resolve().parents[3]
+    src = str(repo / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from util_paths import claude_home_path  # noqa: E402
+    except Exception:
+        return Path.home().joinpath(".claude", *subpath)
+    return claude_home_path(*subpath)
+
+
 def resolve_workspace() -> Path:
     """Canonical workspace via the M0 helper `scripts/sutando-config.sh workspace`
     (config.local.json → config.json → <repo>/workspace). `$SUTANDO_WORKSPACE`
@@ -55,12 +71,17 @@ def transcript_dir() -> Path:
     """Where this project's Claude Code .jsonl transcripts live.
 
     Override with SESSION_SEARCH_TRANSCRIPT_DIR. Default: the
-    ~/.claude/projects/<mangled-repo-path> dir; if that exact dir is absent,
-    fall back to the projects subdir whose name contains the repo basename."""
+    <claude-home>/projects/<mangled-repo-path> dir; if that exact dir is absent,
+    fall back to the projects subdir whose name contains the repo basename.
+
+    The claude-home root comes from `claude_home_path()` (src/util_paths.py),
+    NOT a hardcoded ~/.claude: on a migrated install $CLAUDE_CONFIG_DIR points
+    at the workspace's .claude-sutando/, and hardcoding the stock home made this
+    index read a tree the running agent no longer writes."""
     env = os.environ.get("SESSION_SEARCH_TRANSCRIPT_DIR")
     if env:
         return Path(os.path.expanduser(env))
-    projects = Path.home() / ".claude" / "projects"
+    projects = _claude_home_path("projects")
     exact = projects / _mangle(str(repo_dir()))
     if exact.is_dir():
         return exact
