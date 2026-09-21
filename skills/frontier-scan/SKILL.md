@@ -36,7 +36,7 @@ The predecessor was a session-only `CronCreate` job never committed to `crons.js
 so it silently died in the Maverick→Goose migration and nobody noticed for ~2 weeks.
 This version is durable on three legs:
 - **`crons.json` entry** (`frontier-scan`, weekly) → re-registered by `/schedule-crons` on every restart.
-- **`scan-catchup.py` backstop** → if the cron ever lapses, the proactive loop re-fires it off `state/seen.json`'s `last_scan` (7-day cadence). Trigger is on-disk state, not a live cron, so it cannot silently stop.
+- **`scan-catchup.py` backstop** → if the cron ever lapses, the launchd `catchup-backstops` cron (`crons.json`, every 15 min) re-fires it off `state/seen.json`'s `last_scan` (7-day cadence). Trigger is on-disk state, not a live cron, so it cannot silently stop. It ran from the proactive loop until that caller was dropped in a SKILL.md rewrite, which is how a 35-day lapse went unseen — launchd owns it now precisely because it outlives any session.
 - **`last_scan` advances every run** → the backstop can always tell whether the scan is alive.
 
 ## Cadence

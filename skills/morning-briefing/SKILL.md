@@ -94,7 +94,7 @@ Deliver via:
   This posts straight to the channel via the bot token — deterministic, NOT subject to proactive-DM routing. If `channels.dailybriefings` is missing, fall back to the proactive path below.
 - Keep a record at `notes/briefings/briefing-{date}.md` (a NON-polled path). **Do NOT write `results/briefing-{date}.txt` or any `results/proactive-*` copy** — those prefixes are polled by the Telegram/Discord bridges and would double-deliver the brief to the owner's DM. The #dailybriefings channel post is the sole delivery.
 
-**After delivering, mark today done** — touch the delivery sentinel so the proactive-loop's scheduled-catchup (`src/scheduled-catchup.py`) knows the briefing went out and does NOT re-run it:
+**After delivering, mark today done** — touch the delivery sentinel so scheduled-catchup (`src/scheduled-catchup.py`, run by the launchd `catchup-backstops` cron every 15 min, not by the proactive loop) knows the briefing went out and does NOT re-run it:
 ```bash
 touch "$(bash scripts/sutando-config.sh workspace)/state/briefing-delivered-$(date +%F).sentinel"
 ```
