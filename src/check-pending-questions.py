@@ -108,6 +108,22 @@ _INLINE_RESOLVED = re.compile(
     re.IGNORECASE,
 )
 
+# The two marker forms this file actually uses, which neither matcher above
+# catches: `_ORG_HEADING` anchors the keyword at the title's first character
+# and `_INLINE_RESOLVED` requires brackets.
+#   `~~Question~~ — RESOLVED 2026-08-13`   marker TRAILS the title
+#   `✅ RESOLVED (2026-07-24) — subject`   decoration PRECEDES the keyword
+# Shape-anchored rather than a bare keyword search: a title only counts as
+# resolved when the marker sits in one of those positions, so "render a [DONE]
+# badge" keeps its bracket mid-sentence and stays a live question. The dash
+# must be preceded by whitespace: an intra-word hyphen is not a separator, or
+# "NOT self-resolved" reads as resolved.
+_DECORATED_RESOLVED = re.compile(
+    r'(?:^|\s)[\u2014\u2013-]\s*(?:\u2705\s*)?(?:RESOLVED|DONE|ANSWERED)\b[^\n]*$'
+    r'|^[~*\s]*(?:\u2705\s*)?(?:RESOLVED|DONE|ANSWERED)\b',
+    re.IGNORECASE,
+)
+
 
 def section_is_waiting(title: str, body: str) -> bool:
     """One rule for "this entry still wants an answer", used on BOTH regions.
@@ -163,12 +179,12 @@ def get_waiting_questions():
         # A `---` horizontal rule terminates the section: trailing footer /
         # scaffolding prose lives below the rule, not in any question's body.
         body = re.split(r'^---\s*$', body, maxsplit=1, flags=re.MULTILINE)[0]
-        # This file uses a TRAILING marker (`## Foo — RESOLVED 2026-08-13`), which
-        # _INLINE_RESOLVED does not match (it wants a BRACKETED leading marker).
-        # Dropping this filter took the live count 6 -> 10 by un-hiding resolved
-        # entries. Applied here, not in section_is_waiting, so the archive region
-        # zero_reason() checks keeps its existing rule.
-        if re.search(r'\b(resolved|done|answered)\b', title, re.IGNORECASE):
+        # Shape-anchored resolution markers, replacing a bare
+        # \b(resolved|done|answered)\b search that also hid live questions whose
+        # titles merely contained the word. Kept at the call site, not in
+        # section_is_waiting, so the archive region zero_reason() reads is
+        # unchanged.
+        if _DECORATED_RESOLVED.search(title):
             continue
         # A section with a TITLE but no body IS a pending question — the title
         # carries the ask. Only an explicit "(none)" placeholder is skipped.

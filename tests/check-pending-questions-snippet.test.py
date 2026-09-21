@@ -73,15 +73,26 @@ ok("strikethrough skipped → first real line is snippet",
    len(qs) == 1 and "Actual action" in qs[0].get("snippet", ""),
    f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
 
-# 2a. Pin the filter the old fixture was tripping over by accident, so the
-# behaviour is asserted on purpose rather than discovered by a confusing failure.
+# 2a. `[done-ish]` NAMES AN OPEN UNCERTAINTY and must stay a live question.
+# This previously asserted 0, pinning a bare \b(done)\b search that also hid
+# real questions whose titles merely contained the word. _INLINE_RESOLVED's
+# closed-bracket grammar already documents rejecting `[done-ish]`; the title
+# filter now agrees with it instead of contradicting it.
 qs = questions_for(
     "## [done-ish] something\n"
     "Actual action: run foo to fix.\n"
 )
-ok("a title matching resolved/done/answered is filtered out",
-   len(qs) == 0,
-   f"expected 0 sections, got {len(qs)}")
+ok("a bracketed open-uncertainty title stays a live question",
+   len(qs) == 1,
+   f"expected 1 section, got {len(qs)}")
+
+# 2a-bis. The marker forms this file really uses ARE still filtered, so 2a
+# relaxes the false positive without switching the filter off.
+for _marker in ("## ~~something~~ — RESOLVED 2026-08-13\n",
+                "## RESOLVED (superseded) — something\n"):
+    ok(f"a real resolution marker is still filtered ({_marker[3:28].strip()}...)",
+       len(questions_for(_marker + "Actual action: run foo.\n")) == 0,
+       "expected 0 sections")
 
 # 2b. Regression for reviewer finding (liususan091219, 2026-07-12): a section
 # whose **Status:** line comes before the narrative text must not DM the
