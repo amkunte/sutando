@@ -73,15 +73,26 @@ ok("strikethrough skipped → first real line is snippet",
    len(qs) == 1 and "Actual action" in qs[0].get("snippet", ""),
    f"got snippet: {qs[0].get('snippet') if qs else 'N/A'}")
 
-# 2a. Pin the filter the old fixture was tripping over by accident, so the
-# behaviour is asserted on purpose rather than discovered by a confusing failure.
+# 2a. `[done-ish]` NAMES AN OPEN UNCERTAINTY and must stay a live question.
+# This previously asserted 0, pinning a bare \b(done)\b search that also hid
+# real questions whose titles merely contained the word. _INLINE_RESOLVED's
+# closed-bracket grammar already documents rejecting `[done-ish]`; the title
+# filter now agrees with it instead of contradicting it.
 qs = questions_for(
     "## [done-ish] something\n"
     "Actual action: run foo to fix.\n"
 )
-ok("a title matching resolved/done/answered is filtered out",
-   len(qs) == 0,
-   f"expected 0 sections, got {len(qs)}")
+ok("a bracketed open-uncertainty title stays a live question",
+   len(qs) == 1,
+   f"expected 1 section, got {len(qs)}")
+
+# 2a-bis. The marker forms this file really uses ARE still filtered, so 2a
+# relaxes the false positive without switching the filter off.
+for _marker in ("## ~~something~~ — RESOLVED 2026-08-13\n",
+                "## RESOLVED (superseded) — something\n"):
+    ok(f"a real resolution marker is still filtered ({_marker[3:28].strip()}...)",
+       len(questions_for(_marker + "Actual action: run foo.\n")) == 0,
+       "expected 0 sections")
 
 # 2b. Regression for reviewer finding (liususan091219, 2026-07-12): a section
 # whose **Status:** line comes before the narrative text must not DM the
@@ -106,9 +117,16 @@ ok("empty body → snippet is empty string",
 
 # 4. Bullet-format entries have no snippet (one-liners, body = "")
 qs = questions_for("  - **[bullet item, 2026-06-30]** action text here\n")
-ok("bullet entry → no snippet key or empty",
-   len(qs) == 1 and not qs[0].get("snippet"),
+# #1861 asserted bullets carry no snippet because at the time they were
+# one-liners whose label WAS the content. The format outgrew that premise.
+ok("bullet entry → snippet is the ask after the label",
+   len(qs) == 1 and qs[0].get("snippet") == "action text here",
    f"got {qs[0] if qs else 'N/A'}")
+
+qs_bare = questions_for("  - **[bare label, 2026-06-30]**\n")
+ok("label-only bullet → still no snippet",
+   len(qs_bare) == 1 and not qs_bare[0].get("snippet"),
+   f"got {qs_bare[0] if qs_bare else 'N/A'}")
 
 # 5. notify_discord_dm renders arrow-snippet under title when present
 qs_with_snippet = [{"title": "pending question", "snippet": "Run bash --init to fix."}]

@@ -23,7 +23,7 @@ If prefs exist, do a light refresh: fold in any new lodging/dining signal since 
 
 Gmail queries (paginate; add ` in:anywhere`; also sweep travel labels per rule 1):
 ```
-from:(noreply@united.com OR delta.com OR aa.com OR alaskaair.com OR southwest.com OR jetblue.com OR ana.co.jp OR qatarairways.com OR emirates.com OR airindia.com OR aircanada.ca OR amadeus.com OR amexgbt.com OR mytrips.amexgbt.com) subject:(confirmation OR itinerary OR "e-ticket" OR "your trip" OR booking OR ticket OR boarding) in:anywhere newer_than:1y
+from:(united.com OR delta.com OR aa.com OR alaskaair.com OR southwest.com OR jetblue.com OR ana.co.jp OR qatarairways.com OR emirates.com OR airindia.com OR aircanada.ca OR amadeus.com OR amexgbt.com OR mytrips.amexgbt.com) subject:(confirmation OR itinerary OR "e-ticket" OR "your trip" OR booking OR ticket OR boarding) in:anywhere newer_than:1y
 from:(marriott.com OR hilton.com OR hyatt.com OR ihg.com OR booking.com OR hotels.com OR airbnb.com OR fourseasons.com OR tajhotels.com OR oberoihotels.com OR xanterra.com) subject:(confirmation OR reservation OR "your stay" OR receipt) in:anywhere newer_than:1y
 from:(hertz.com OR avis.com OR enterprise.com OR turo.com OR amtrak.com OR trainline.com) subject:(confirmation OR reservation OR itinerary) in:anywhere newer_than:1y
 label:"2026_Travel" OR label:"Travel_Imp"   (+ any travel/trip/vacay label from list_labels)

@@ -2,19 +2,45 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
-**Calendar** — read Google Calendar events via `gws calendar`:
+**Calendar** — the owner's calendar (Google Calendar, Outlook, …) comes from the Superpower Station
+connector tools, first:
+- `mcp__sutando-station__composio_find` `{"apps": ["google calendar"], "query": "list today's events"}`
+  → whether the app is connected, plus the matching actions with their input schemas;
+- `mcp__sutando-station__composio_exec` `{"toolkit": "googlecalendar", "action": "<from find>", "arguments": {…}}`.
+
+Not connected → follow the `connect-apps` skill: one Connect card (a message in the owner's DM; in a
+room with other people a private card under their message that only they see), the task closes, and
+the answer follows by itself after sign-in. Never paste a sign-in link, never restart the engine.
+Fallbacks, only when the Station tools aren't available: `gws calendar` if it is installed, then
+macOS Calendar (`skills/macos-tools`). An empty macOS Calendar is not an answer for an owner who uses
+Google Calendar — say you couldn't read their calendar instead.
 ```bash
-gws calendar +agenda --today            # today's events (table format by default)
+gws calendar +agenda --today            # fallback: today's events (table format by default)
 gws calendar +agenda --week              # this week
 gws calendar +agenda --days 7 --format json   # next 7 days, JSON for parsing
 ```
 
-**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`):
+**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`). Every capture route requires the startup token in `X-Sutando-Capture-Token` — without it the server answers `403 {"status":"error","error":"forbidden"}`:
 ```bash
-curl -s http://localhost:7845/capture | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
+TOKEN="$(cat ~/.config/sutando/screen-capture-token)"
+curl -s -H "X-Sutando-Capture-Token: $TOKEN" http://localhost:7845/capture \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
 # Multi-display: add ?all=true to capture every display, or ?display=N for a specific one.
+# /capture-video takes the same header — it is the other capture route, gated identically.
 ```
 Then use the Read tool on the returned path to view the screenshot. Use this for any screen-related question: "what am I looking at", "help me with this", "what's on my screen", etc.
+
+A `forbidden` response means the header was missing or stale, **not** that capture is unavailable — re-read the token file rather than restarting the server.
+
+`/capture` returns the display's native resolution — on a Retina screen that is
+megabyte-class per frame. Frames entering a live voice session (the Watch/vision
+stream, pull or push) are bounded first: anything over 200 KB is resampled to a
+1280 px long edge and re-encoded as JPEG q60, measured at ~2.5 MB → ~236 KB on a
+3024×1964 display. Frames share one websocket with realtime audio, so an
+unbounded frame delays speech, not just vision. Reading a captured file from disk
+is unaffected — the bound applies only on the way into a session.
+
+**Windows platform tools** — `open_file` uses Windows ShellExecute with a literal target; characters such as `&`, `%`, and apostrophes are not interpreted as commands. Missing handlers return an error. Clipboard reads and writes preserve Unicode and multiline text through UTF-8. `pwsh -File src/notify.ps1 "message"` delegates Discord delivery to the shared owner-resolution and send policy, honoring the configured Claude home. Voice frames use Windows image resizing before the same frame-size limit is applied.
 
 **Notes** — the user's second brain. Save and retrieve notes:
 - Save: write to `notes/{slug}.md` with a descriptive filename
@@ -31,13 +57,18 @@ tags: [ideas, projects, voice]
 Content here...
 ```
 
-**Email (Gmail)** — use the `gws-gmail` skill (OAuth, no app password needed):
+**Email (Gmail, Outlook)** — the Station connector first: `composio_find` `{"apps": ["gmail"], "query": "<what
+you need>"}`, then `composio_exec` with the action it returns (search, read, draft, send). Not connected →
+the `connect-apps` skill, as for Calendar. Fallback only when the Station tools aren't available: the
+`gws-gmail` skill (OAuth, no app password needed):
 ```bash
 gws gmail +send --to "to@x.com" --subject "subj" --body "body"
 gws gmail +triage                               # unread inbox summary
 gws gmail +read <messageId>                     # read a message
 gws gmail users messages list --params 'q=keyword'  # search
 ```
+
+**Signatures are never auto-inserted — append one yourself.** Gmail attaches the configured signature in its *composer*, so anything that writes a message some other way (the Gmail API, an IMAP `APPEND`-created draft) produces mail with no signature, and no Gmail setting changes that. When drafting or sending on the owner's behalf, append their signature to the body yourself — plain text plus an HTML alternative, so links render in both parts.
 
 **Finding a specific email** — when the obvious query fails, invoke `/email-find <description>`. Broad-before-narrow playbook (full-inbox scan → partner-domain fanout → thread re-walk) that refuses to give up after one or two failed queries. See `skills/email-find/SKILL.md` for the workflow and rules around subject-mismatch + `get_thread` truncation. Per-user partner-domain mappings live in your own memory (the skill describes the file format).
 
@@ -47,6 +78,49 @@ python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob"  
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
 
+**Google Contacts — writable in practice, but NOT via a contract Google supports.** The entry above
+is macOS Contacts and is lookup-only. It is not the only contacts path: on 2026-09-04 an agent that
+had been told no write path existed created a contact on a live Google account using **only the Gmail
+app password already held for IMAP/SMTP** — `PROPFIND` returned 207, `PUT` of a vCard returned 201,
+and a `GET` read it back (#3903).
+
+**Read that as an observation, not as Google's credential contract.** Google's own CardDAV
+documentation specifies OAuth 2.0 with a registered application, tells clients to begin at
+`https://www.googleapis.com/.well-known/carddav` rather than hardcoding a discovered URI, and
+documents `POST` of a vCard as the insert operation (`PUT` being the update path). The app-password
+Basic-auth flow below matches none of that. It is legacy behaviour that happened to work once, on one
+account, and Google can withdraw it without notice.
+
+So: **probe before you rely on it, and never present it to the owner as a supported integration.**
+
+```bash
+# 1. DISCOVER — do not hardcode the principal URL; Google says it can change.
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PROPFIND \
+     https://www.googleapis.com/.well-known/carddav -H 'Depth: 0'
+# 2. PROBE the collection you discovered. 207 = this legacy path is still open for this account;
+#    401/403 = it is not — stop, and say so, rather than assuming the 2026-09-04 result still holds.
+BASE="<collection URL from step 1>"     # observed then: .../carddav/v1/principals/$USER_EMAIL/lists/default/
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PROPFIND "$BASE" -H 'Depth: 1'
+# 3. CREATE. Google documents POST for insert; PUT with `If-None-Match: *` is what was observed to
+#    work, and is create-only, so a retry cannot silently overwrite an existing card.
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PUT "$BASE<uid>.vcf" \
+     -H 'Content-Type: text/vcard; charset=utf-8' -H 'If-None-Match: *' \
+     --data-binary @contact.vcf
+curl -su "$USER_EMAIL:$APP_PASSWORD" "$BASE<uid>.vcf"                      # read it back
+```
+
+Get the app password from the vault (`secret-vault.py get <KEY>`); never inline it. If the probe in
+step 2 fails, the supported route is OAuth 2.0 against the People API or CardDAV with a registered
+client — build that rather than retrying Basic auth with the owner's secret.
+
+**⚠ The general rule this entry exists to teach: a credential's reach is not the name of the tool you
+got it for.** A Google app password is accepted by IMAP and SMTP, and — as above — was accepted by
+CardDAV. Before telling the owner "I have no way to do X", spend one probe on what your *held
+credentials* actually reach, rather than answering from what this catalog happens to list. Answering
+from the catalog is how a capability that already existed gets reported as missing. The probe is also
+what keeps the answer honest in the other direction: it distinguishes "this works" from "this worked
+once for someone else."
+
 **iMessage** — send and read iMessages:
 ```bash
 imsg send --to "+14155551234" --text "Hello!"    # send message
@@ -55,7 +129,7 @@ imsg messages --chat "+14155551234" --limit 10    # read messages
 ```
 Always confirm message content with user before sending.
 
-**WhatsApp** — send messages via WhatsApp (requires `wacli auth` first; full reference in `skills/whatsapp/SKILL.md`):
+**WhatsApp** — send messages via WhatsApp (unpaired? use the guided connect flow — `skills/whatsapp/scripts/guided_connect.py`, pairing from chat, no terminal; full reference in `skills/whatsapp/SKILL.md`):
 ```bash
 wacli send text --to "+14155551234" --message "Hello!"
 wacli chats list --limit 20
@@ -70,10 +144,14 @@ python3 skills/x-twitter/x-post.py post "With video" --media /path/to.mp4  # wit
 python3 skills/x-twitter/x-post.py search "query"                          # search recent
 python3 skills/x-twitter/x-post.py read 123456789                          # read tweet
 python3 skills/x-twitter/x-post.py mentions                                # recent @mentions
-python3 skills/x-twitter/x-post.py timeline                                # your tweets
+python3 skills/x-twitter/x-post.py timeline                                # YOUR tweets (OAuth1)
+python3 skills/x-twitter/x-post.py user-timeline <handle>                  # ANOTHER account (bearer)
 python3 skills/x-twitter/x-post.py engagement 123456789                    # likes/rt/views
 ```
-Requires X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET in .env.
+`post`/`mentions`/`timeline` need X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET.
+`search`/`read`/`user-timeline` run on X_BEARER_TOKEN alone. `timeline` resolves `users/me` and is
+OAuth1-only; `user-timeline` reads the same endpoint by handle over bearer, so it works where
+`timeline` cannot. Its `--limit` is 5..100 (`search`'s is 10..100 — different endpoints).
 Always confirm post content with user before publishing.
 
 **Reminders** — read/write macOS Reminders (to-do list):
@@ -117,8 +195,17 @@ node src/browser.mjs "https://example.com"                    # get page text
 node src/browser.mjs "https://example.com" screenshot         # full-page screenshot → path
 node src/browser.mjs "https://example.com" "fill:#email:me@x.com" "click:#submit"  # fill + click
 node src/browser.mjs "https://example.com" --headed           # watch automation live
+node src/browser.mjs "https://example.com" screenshot --timeout=60000  # override the 45s command limit
 ```
 Actions: `text`, `screenshot`, `pdf`, `html`, `click:<selector>`, `fill:<selector>:<value>`, `select:<selector>:<value>`, `wait:<ms>`.
+Non-interactive commands are bounded to 45 seconds by default; `--timeout` may
+raise that command-level limit to at most 300,000 ms. Navigation uses the
+remaining command budget, and declared `wait:` actions must fit the budget or
+the command fails before launching with guidance to pass a larger `--timeout`.
+Up to five seconds of the limit is reserved for cleanup. Normal completion,
+errors, timeouts, `SIGINT`, and `SIGTERM` all close the page, context, and browser
+before the command exits. A second signal during cleanup restores Node's normal
+immediate termination behavior instead of being swallowed.
 
 **File search (Spotlight)** — find any file on the Mac:
 ```bash
@@ -143,15 +230,148 @@ npx tsx -e "import 'dotenv/config'; import { summonTool } from './skills/zoom/to
 - Look up contacts and calendar for numbers/PINs before calling
 - The voice agent delegates "call X" and "join my meeting" requests to core via `work`
 
+**Claude Code history import** — `/import-claude-context` (`skills/import-claude-context/`): index, extract and haiku-summarise the owner's stock `~/.claude/projects` transcripts into core memory (`claude_import.md` + a budget-guarded `MEMORY.md` row), `notes/claude-import/` and People payloads. Everything is staged first (`finalize.py --stage`, the default) and shown to the owner as a digest in their DM; it lands only when they reply "bring it in" (`--commit`), "bring in <slug>" for one project, or is dropped with "forget <slug>" (`--discard`). Sessions the summariser flags as personal are held back — the digest shows only their date and a generic reason, and "include <date>" / "hold <date>" / "forget <date>" are the owner's call; people the store already has get an appended section and merged identifiers, never a replaced dossier or a duplicate. Read-only on `~/.claude`, conversation text only (no tool I/O), secrets redacted before disk; the owner's transcripts are processed by Anthropic's Claude API (the haiku subagents), the provider the Sutando already runs on, which does not train on them. Nothing is uploaded to AG2 Space except the people the owner approves in the digest, which are saved to their People store, and nothing else leaves the machine without `--cloud`. Only after the onboarding Import button or an explicit "import my Claude history"; `--counts-only`/`--dry-run` for counts, `--new` to pick up new sessions, `--forget <slug>` (a known slug or a unique part of one — never a path) to undo one project: its note, roll-up, summaries, approved snapshot and its citations in the approved People export. The memory file and `overview.md` are rebuilt from per-project approved snapshots (`data/claude-import/approved/<slug>.json`), so committing one project never lands another's unreviewed roll-up — the digest names it "changed since approval — bring in <slug> to refresh".
+
 **Local skills** — check `$CLAUDE_CONFIG_DIR/skills/` for user-installed skills (video processing, etc.). Always prefer a local skill over raw commands when one exists for the task.
+
+**Trusted capability catalog** — discover, inspect, install, and update skills
+from the allowlisted repositories declared in
+`skills/trusted-capabilities/manifest.json`:
+```bash
+C=skills/trusted-capabilities/scripts/catalog.py
+python3 "$C" sources
+python3 "$C" search browser
+python3 "$C" inspect anthropic-skills skills/skill-creator
+python3 "$C" install anthropic-skills skills/skill-creator        # dry run
+# Review the dry-run output, then copy its exact commit into the write:
+python3 "$C" install anthropic-skills skills/skill-creator --commit <40-char-sha> --yes
+python3 "$C" update skill-creator                                 # dry run
+python3 "$C" update skill-creator --commit <40-char-sha> --yes
+```
+Skill installs are pinned to an upstream commit and record provenance for later
+updates. Tool repositories can be searched and inspected but are
+install-disabled because their setup and permissions are source-specific.
+
+**Marketplace (Superpower Station)** — install skills, activate cloud tools, and
+keep them current for the signed-in owner, without the Marketplace UI:
+```bash
+M=skills/marketplace/scripts/marketplace.py
+python3 "$M" find "lead enrichment"
+python3 "$M" status                                   # missing / outdated skills
+python3 "$M" install intent-leads campaign-runner     # plan; exit 3 = spends credits
+python3 "$M" install intent-leads campaign-runner --yes
+python3 "$M" update --yes                             # never charges
+```
+Skills are usable immediately, and so is a newly activated cloud tool: reach it through
+`station_find` / `station_call` (state the price first when it is `confirm_before_call`). A restart
+is needed only when `install` prints `RESTART REQUIRED` (the running engine started without the
+Station); the owner does it from Agent settings → Runtime → Restart engine.
+
+**Connected apps (Station connectors)** — Gmail, Google Calendar, Google Meet, Google Drive, Slack,
+Linear, Notion, GitHub and many more, through `composio_find` / `composio_exec` (normally loaded;
+ToolSearch is the fallback when the tool is not in your list). Connecting one is the `connect-apps`
+skill's job: one `card` call arms the wait and, in the owner's DM, prints the one `room.message.send`
+payload to post (a Connect card with your intro above it); in a shared room `--private` writes the
+owner-only card and nothing is posted. Its helper:
+```bash
+C=skills/connect-apps/scripts/connectors.py
+python3 "$C" find "google calendar"     # exact catalog app, connected or not (30s read cache)
+python3 "$C" status googlecalendar      # connected? plus pending waits (30s read cache)
+python3 "$C" card googlecalendar --room '<room>' --reply-to '<source_message_id>' --task '<task id>' \
+  --owner-from-task [--private] [--switch] --request-file - <<'SUTANDO_REQUEST'
+<the owner request, verbatim>
+SUTANDO_REQUEST
+python3 "$C" rearm                      # restart waiters of pending waits (startup + proactive loop)
+```
+The skill's precheck hook adds a `connect-apps precheck:` line on your first touch of a task naming an
+app: which apps it needs, which are connected (from the cache), and the room kind from the task's
+`channel_kind:` header. The owner sees, switches and disconnects connected apps in AG2 Space →
+Settings → Integrations; `card --switch` (or `await --switch`) arms a wait that resumes only once the
+app is signed in with a new account.
+
+**Generate an image** — `skills/image-generation`: a picture, logo, hero image, mockup or edited
+photo from a prompt, over the Gemini REST API with the standard library (no pip; any Gemini key the
+credential resolver finds, the managed key included):
+```bash
+python3 skills/image-generation/scripts/generate.py --prompt "A flat-design mascot, teal and cream"
+python3 skills/image-generation/scripts/generate.py --input photo.jpg --prompt "Replace the background"
+```
+stdout is one JSON line: `{"ok": true, "path": "<workspace>/results/media/generated-<ts>.png", "model"}`
+or `{"ok": false, "error": no_key|refused|no_image|api_error, "message", "remedy"}` (exit 0 / 1 / 2).
+Deliver with `[file: <path>]` on its own line in the reply; on a failure say the skill's verbatim
+message for that error (`skills/image-generation/SKILL.md`) and stop. `--video` (Veo) needs the
+`google-genai` SDK and reports `sdk_missing` without it.
+
+**Activate a cloud tool** — the `marketplace` skill (below) is the activation: `install <slug> --yes`
+after the plan; a newly activated tool is usable at once through `station_find` / `station_call`.
+Never send the owner to a dashboard or a Station page for it, and never ask for a restart unless the
+script printed `RESTART REQUIRED`.
 
 **App launcher** — open any macOS app:
 ```bash
-open -a "Safari"                    # open by name
+# Windows: use the registered display name; success requires verified foreground focus.
+pwsh -NoProfile -File scripts/open-app.ps1 "Paint"
+pwsh -NoProfile -File scripts/open-app.ps1 "Microsoft Store"
+
+# macOS
+open -a "Safari"
 open -a "Slack"
 open "https://github.com"           # open URL in default browser
 ```
+Voice and phone can use `switch_app` on macOS and Windows. The Windows CLI and
+inline tool share `src/windows-app-launcher.ps1`; bundled services ship the same
+backend beside their JavaScript artifacts.
+
+Windows matches registered app IDs or exact executable paths, never window-title
+substrings. It reuses an existing window (restoring it if minimized) or launches
+once, then verifies the intended app actually owns the foreground. An already
+foreground app is left alone; otherwise the first matching window is selected,
+not a particular document or profile. Shortcuts whose identity cannot be resolved
+fail rather than guessing from their display name.
+
+An interactive desktop is required. Windows may refuse foreground activation,
+especially when the agent runs in the background; the tool reports that refusal
+and asks the user to select the app from the taskbar. Merely launching a process
+or making a window visible is not success.
 
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 
-Launches automatically via `startup.sh`. Check `tasks/` for dropped context.
+The menu-bar app is optional and is not built or launched by the headless core's `startup.sh`; compile and launch the app separately, including `bash skills/context-drop/build.sh` when enabling context-drop. Check `tasks/` for dropped context.
+
+## Switch model (no CLI needed)
+
+Triggers: `/model <x>` typed in chat (a room message, not only the tray), "switch to opus", "use
+sonnet", "change the model", and the question "which model are you on" / "what model is this".
+
+```bash
+bash scripts/switch-model.sh claude-opus-5          # alias (opus/sonnet/haiku/fable/default) or a claude-* id, optional [1m]
+bash scripts/switch-model.sh fable --dry-run        # prints what it would do, changes nothing
+bash scripts/switch-model.sh opus --confirm         # a warm core asks to confirm; this answers it (owner instruction)
+```
+
+**Report the script's `switched:` line verbatim** (`switched: model=<x> (was <y>); accepted by the
+CLI…`); a non-zero exit is reported with its meaning from the list below, never as a switch. The
+current model is `model` in `<workspace>/state/model-switch.json` (`previous`, `ts` beside it);
+no file means no switch was recorded from here, so say the model is the runtime's default rather
+than guessing. The desktop's `core-model` local card (`agent-settings:core-runtime#model`) is the
+place to point an owner who wants to switch by hand.
+
+Types `/model <name>` into the live `sutando-core` pane through the shared sender, waits for the CLI
+to accept it, and only then records `<workspace>/state/model-switch.json` (with the previous model).
+A warm core asks to confirm first; `--confirm` (on an owner instruction) answers it, otherwise the
+dialog is cancelled. Refuses when the input box carries text or on a Codex runtime. It never writes
+`settings.json`: Claude Code's `/model` persists the choice itself. Exit 2 = name refused; 3 = no live
+pane; 4 = Codex runtime; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance seen.
+The capability lives in `skills/model-switch/`.
+
+## Check quota
+
+Triggers: "how much quota do I have", "am I near the limit", "when does it reset", and any paused
+or refused core turn. Read `<workspace>/state/quota-state.json` (written by the credential proxy,
+`skills/quota-tracker`): `utilization_5h` and `utilization_7d` (0..1 of each window used),
+`resets_at_5h` / `resets_at_7d` (ISO times), `last_checked` (ISO). A `last_checked` older than
+6 hours, or no file, means the quota is **unknown**: say so, do not quote stale numbers.
+`python3 skills/quota-tracker/scripts/read-quota.py` prints the same with remaining percentages and
+`--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
+core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
+model (above) is the way to keep going before then.

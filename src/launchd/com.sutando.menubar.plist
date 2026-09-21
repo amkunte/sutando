@@ -81,5 +81,15 @@
 
     <key>ProcessType</key>
     <string>Interactive</string>
+
+    <!-- REQUIRED for the status item to appear. Without this key launchd may
+         run the agent in a session with no window-server connection: the
+         process starts, logs nothing, `launchctl print` reports it running,
+         and NSStatusItem silently never draws. Measured 2026-09-21 on this
+         host — identical binary showed no menu-bar icon under launchd and
+         appeared immediately when launched via `open`. Aqua pins the job to
+         the GUI login session. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
 </dict>
 </plist>

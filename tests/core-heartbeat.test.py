@@ -6,20 +6,77 @@ Exit: 0 on pass, 1 on fail.
 """
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+_REAL_RUN = subprocess.run
 
 
 def _short_host() -> str:
     return socket.gethostname().split(".")[0]
+
+
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(str(path))) if path else None
+
+
+# A stand-in tmux must prove it talked to THIS server: echo the socket and session it was asked about.
+_ARGV_PARSE = ('#!/bin/sh\nsock=""; sess=""; prev=""\nfor a in "$@"; do\n  case "$prev" in -S) sock="$a";; -t) sess="${a#=}";; esac\n'
+               '  prev="$a"\ndone\n')
+
+
+EXPORTED_CLIENT = 'case "$*" in\n  *-V*) echo \'tmux 3.5a\';;\n  *has-session*) [ "$sess" = real ] && exit 0 || { echo "no such session: $sess" >&2; exit 1; };;\n  *list-sessions*) case "$*" in *socket_path*) echo "$sock";; *) echo real;; esac;;\n  *list-panes*) [ "$sess" = real ] && echo 4242 || exit 1;;\n  *display-message*) [ "$sess" = real ] && echo "3.5a|$sock|" || { echo "no such session" >&2; exit 1; };;\n  *) exit 1;;\nesac\n'
+
+
+def _git_bash() -> str:
+    git = shutil.which("git")
+    if git:
+        candidate = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("bash") or "bash"
+
+
+def _write_executable(path: Path, body: str) -> Path:
+    if os.name != "nt":
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+    script = Path(str(path) + ".sh")
+    script.write_text(body)
+    wrapper = Path(str(path) + ".cmd")
+    wrapper.write_text(f'@echo off\n"{_git_bash()}" "{script}" %*\n')
+    return wrapper
+
+
+def _portable_run(command, *args, **kwargs):
+    if (os.name == "nt" and isinstance(command, (list, tuple)) and command
+            and str(command[0]).lower().endswith((".cmd", ".bat"))):
+        quoted = " ".join(f'"{str(part).replace(chr(34), chr(34) * 2)}"' for part in command)
+        return _REAL_RUN(quoted, *args, shell=True, **kwargs)
+    return _REAL_RUN(command, *args, **kwargs)
+
+
+def _wait_file(path, deadline_s=5.0):
+    end = time.monotonic() + deadline_s
+    while time.monotonic() < end:
+        try:
+            txt = path.read_text()
+            if txt.strip():
+                return txt
+        except FileNotFoundError:
+            pass
+        time.sleep(0.02)
+    return None
 
 
 class TestHeartbeatWrite(unittest.TestCase):
@@ -37,6 +94,10 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="core-heartbeat-"))
         os.environ["SUTANDO_WORKSPACE"] = str(self.tmp)
         os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
+        self._run_patch = None
+        if os.name == "nt":
+            self._run_patch = patch.object(subprocess, "run", side_effect=_portable_run)
+            self._run_patch.start()
         # Force re-import so module picks up the new env.
         sys.modules.pop("core_heartbeat", None)
 
@@ -52,6 +113,8 @@ class TestHeartbeatWrite(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
         sys.modules.pop("core_heartbeat", None)
+        if self._run_patch:
+            self._run_patch.stop()
 
     def test_write_beat_creates_per_host_file(self):
         import core_heartbeat
@@ -59,17 +122,60 @@ class TestHeartbeatWrite(unittest.TestCase):
         alive_path = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
         self.assertTrue(alive_path.is_file(), f"expected {alive_path} to exist")
 
+    def test_a_failing_lineage_write_does_not_take_the_beat_down(self):
+        """Liveness must survive a lineage failure: .alive is what peers poll."""
+        import core_heartbeat
+        with patch.object(core_heartbeat.core_lineage, "record_run",
+                          side_effect=RuntimeError("lineage exploded")):
+            core_heartbeat.write_beat()          # must not raise
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        self.assertTrue(alive.is_file(), "the beat did not land despite the guard")
+
+    def test_handle_signal_writes_tombstone_before_unlink(self):
+        import core_heartbeat
+        core_heartbeat.write_beat()
+        alive = core_heartbeat._alive_path()
+        self.assertTrue(alive.is_file())
+        core_heartbeat._handle_signal(15, None)
+        stopped = alive.with_suffix(".stopped")
+        self.assertTrue(stopped.is_file(), "graceful stop must leave a .stopped tombstone (#2160)")
+        self.assertFalse(alive.exists(), "graceful stop must still unlink .alive")
+        float(stopped.read_text())  # payload is a timestamp
+
     def test_write_beat_payload_schema(self):
         import core_heartbeat
-        core_heartbeat.write_beat(status="custom-status")
+        # Pin the core-pid resolver. Before schema 3 this test asserted
+        # `pid == os.getpid()` and passed only because CI runners have no tmux
+        # server on the socket — on a machine that DID, it would have failed.
+        # Pinning makes the contract, not the environment, decide.
+        _orig = core_heartbeat.core_pid
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: 4242
+        try:
+            core_heartbeat.write_beat(status="custom-status")
+        finally:
+            core_heartbeat.core_pid = _orig
         data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
         # Required fields
         self.assertEqual(data["host"], _short_host())
-        self.assertEqual(data["pid"], os.getpid())
+        # schema 3: `pid` is the CORE's (what the docstring always claimed);
+        # the writer's own pid moved to `heartbeat_pid`. Before this, a dead
+        # core read as healthy because the writer outlives core restarts.
+        self.assertEqual(data["pid"], 4242)
+        self.assertEqual(data["heartbeat_pid"], os.getpid())
+        self.assertNotEqual(data["pid"], data["heartbeat_pid"])
         self.assertEqual(data["status"], "custom-status")
-        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["schema_version"], 4)
+        # schema 4: a client VERIFIED to speak to this server (not its creator) and the
+        # server's own version, so a reader starts from a compatible binary.
+        self.assertEqual(data["backend"], "tmux")
+        for k in ("tmux_binary", "tmux_version", "tmux_server_version", "tmux_verified", "tmux_candidates"):
+            self.assertIn(k, data)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
+        # session: what tmux says this core is IN, not what the env claims.
+        self.assertEqual(data["session"], core_heartbeat._observed_session(
+            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")))
+
         # socket: the runtime-authored tmux socket the core runs on. Consumed by
         # `sutando-config.sh runtime` so the AgentRuntime descriptor reports the
         # real socket (incl. custom sockets) independent of a caller's env.
@@ -81,6 +187,80 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIsInstance(data["last_beat_at"], float)
         # last_beat_at advances after a sleep; just sanity-check it's recent.
         self.assertLess(abs(time.time() - data["last_beat_at"]), 5)
+
+    def test_observed_session_prefers_tmux_over_a_lying_env(self):
+        """The Claude launcher hardcodes SESSION and never forwards
+        SUTANDO_TMUX_SESSION, so an exported value can name a session that does
+        not exist. Recording it would send the owner to a dead target."""
+        import core_heartbeat
+        import subprocess as _sp
+        _orig = core_heartbeat._tmux
+        core_heartbeat._tmux = lambda sock, *a: _sp.CompletedProcess(
+            a, 0, stdout="sutando-core\n", stderr="")
+        os.environ["TMUX"] = "/tmp/sutando-tmux.sock,1,0"
+        os.environ["SUTANDO_TMUX_SESSION"] = "custom-core-does-not-exist"
+        try:
+            self.assertEqual(core_heartbeat.core_session(),
+                             "custom-core-does-not-exist")   # the env still lies
+            self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
+                             "sutando-core")                 # tmux wins
+        finally:
+            core_heartbeat._tmux = _orig
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+            os.environ.pop("TMUX", None)
+
+    def test_observed_session_never_uses_bare_display_message_outside_tmux(self):
+        """Outside tmux a bare display-message resolves an arbitrary session on a
+        shared socket. Scoped calls are fine; that one specific call is not."""
+        import core_heartbeat
+        import subprocess as _sp
+        _orig, _origpid = core_heartbeat._tmux, core_heartbeat.core_pid
+
+        def _guard(sock, *a):
+            if a and a[0] == "display-message":
+                raise AssertionError("bare display-message outside tmux")
+            return _sp.CompletedProcess(["tmux"], 1, "", "")
+
+        core_heartbeat._tmux = _guard
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: None
+        os.environ.pop("TMUX", None)
+        os.environ["SUTANDO_TMUX_SESSION"] = "from-contract"
+        try:
+            self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
+                             "from-contract")
+        finally:
+            core_heartbeat._tmux, core_heartbeat.core_pid = _orig, _origpid
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+
+    def test_write_beat_records_the_live_session_not_a_lying_env(self):
+        """With $TMUX unset and SUTANDO_TMUX_SESSION naming a session that does not
+        exist, the beat records the live session on the socket, not the env's claim."""
+        import core_heartbeat
+        import json as _json
+        import subprocess as _sp
+        _orig, _origpid = core_heartbeat._tmux, core_heartbeat.core_pid
+        LIE, REAL = "custom-core-does-not-exist", "sutando-core"
+
+        def _fake_tmux(sock, *a):
+            if a and a[0] == "list-sessions":
+                return _sp.CompletedProcess(["tmux"], 0, f"{REAL}\n", "")
+            return _sp.CompletedProcess(["tmux"], 1, "", "")
+
+        core_heartbeat._tmux = _fake_tmux
+        core_heartbeat.core_pid = (lambda socket_path=None, session=None:
+                                  4321 if session == REAL else None)
+        os.environ.pop("TMUX", None)
+        os.environ["SUTANDO_TMUX_SESSION"] = LIE
+        try:
+            core_heartbeat.write_beat()
+            rec = _json.loads((self.tmp / "state" / "cores" /
+                               f"{_short_host()}.alive").read_text())
+            self.assertNotEqual(rec["session"], LIE,
+                                "recorded the unverified env value")
+            self.assertEqual(rec["session"], REAL)
+        finally:
+            core_heartbeat._tmux, core_heartbeat.core_pid = _orig, _origpid
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
 
     def test_locality_kind_from_env(self):
         """Track 10: `kind` self-reports from $SUTANDO_CORE_LOCALITY — `cloud`
@@ -111,6 +291,292 @@ class TestHeartbeatWrite(unittest.TestCase):
                 os.environ["SUTANDO_CORE_LOCALITY"] = saved
             else:
                 os.environ.pop("SUTANDO_CORE_LOCALITY", None)
+
+    def _fake_tmux(self, name, speaks, version="3.6b"):
+        # display-message succeeds only when `speaks`; -V always answers.
+        f = self.tmp / name
+        refuse = "echo 'protocol version mismatch (client 8, server 9)' >&2; exit 1"
+        # Real tmux renders #{session_name} EMPTY under -t (TustinOC, 3.5a and 3.7c): the fake does the same.
+        body = (_ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux %s';;\n  *list-sessions*) %s;;\n  *has-session*) %s;;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n") % (
+            version, ('echo "$sock"' if speaks else refuse), ('exit 0' if speaks else refuse), (('echo "%s|$sock|"' % version) if speaks else refuse))
+        return str(_write_executable(f, body))
+
+    def test_tmux_backend_records_a_client_verified_against_the_socket(self):
+        import core_heartbeat
+        path_tmux = self._fake_tmux("tmux", speaks=True, version="3.6b")
+        exported = self._fake_tmux("exported-tmux", speaks=False, version="3.5a")
+        # The mixed case: the app exported one binary, the launcher ran the PATH one.
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported, "PATH": str(self.tmp)}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="sutando-core")
+        self.assertEqual((_path_key(b["tmux_binary"]), b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
+                         (_path_key(path_tmux), "3.6b", "3.6b", True))
+        self.assertEqual([_path_key(p) for p in b["tmux_candidates"]],
+                         [_path_key(path_tmux), _path_key(exported)])
+        # the other way round: only the exported binary speaks → it is the record
+        path_tmux2 = self._fake_tmux("tmux", speaks=False, version="3.6b")
+        exported2 = self._fake_tmux("exported-tmux", speaks=True, version="3.5a")
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": exported2, "PATH": str(self.tmp)}):
+            b2 = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="sutando-core")
+        self.assertEqual((_path_key(b2["tmux_binary"]), b2["tmux_version"], b2["tmux_server_version"]),
+                         (_path_key(exported2), "3.5a", "3.5a"))
+        # nothing speaks → nulls and verified False, never a guess
+        self._fake_tmux("tmux", speaks=False); self._fake_tmux("exported-tmux", speaks=False)
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "exported-tmux"), "PATH": str(self.tmp)}):
+            b3 = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="sutando-core")
+        self.assertEqual((b3["tmux_binary"], b3["tmux_version"], b3["tmux_server_version"], b3["tmux_verified"]), (None, None, None, False))
+
+    def test_tmux_backend_verifies_the_observed_session_not_the_env_claim(self):
+        # The verifier must use the OBSERVED session write_beat records, not the env's claim:
+        # a lying SUTANDO_TMUX_SESSION left the payload unverified with a compatible client present.
+        import core_heartbeat
+        f = _write_executable(
+            self.tmp / "tmux",
+            _ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *has-session*'-t =real'*) exit 0;;\n  *display-message*'-t =real'*) echo \"3.6b|$sock|\";;\n  *) echo 'no such session' >&2; exit 1;;\nesac\n",
+        )
+        _obs, _pid = core_heartbeat._observed_session, core_heartbeat.core_pid
+        core_heartbeat._observed_session = lambda sock: "real"
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: 4242
+        try:
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "lie", "SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
+                core_heartbeat.write_beat()
+        finally:
+            core_heartbeat._observed_session, core_heartbeat.core_pid = _obs, _pid
+        data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
+        self.assertEqual((data["session"], data["tmux_verified"], _path_key(data["tmux_binary"]), data["tmux_server_version"]),
+                         ("real", True, _path_key(f), "3.6b"))
+
+    def test_tmux_backend_is_reverified_every_beat_so_a_replaced_server_is_seen(self):
+        # A memoized failure would make a cold-boot miss permanent and a memoized success would
+        # survive a server replacement; nothing is cached — every call asks the live server.
+        import core_heartbeat
+        ver = self.tmp / "server-version"
+        # PATH is pinned to the temp dir below, so the stand-in must use absolute tool paths.
+        f = _write_executable(
+            self.tmp / "tmux",
+            _ARGV_PARSE + "case \"$*\" in\n  *-V*) echo \"tmux $(/bin/cat '%s' 2>/dev/null || echo none)\";;\n"
+            "  *has-session*) [ -s '%s' ] && exit 0 || { echo 'no server running' >&2; exit 1; };;\n"
+            "  *display-message*) [ -s '%s' ] && echo \"$(/bin/cat '%s')|$sock|\" || { echo 'no server running' >&2; exit 1; };;\n"
+            "  *) exit 1;;\nesac\n" % (ver, ver, ver, ver),
+        )
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp)}):
+            first = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")        # cold boot: no server yet
+            self.assertFalse(first["tmux_verified"])
+            ver.write_text("3.5a")
+            second = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")       # server up → heals, no refresh needed
+            self.assertEqual((second["tmux_verified"], second["tmux_server_version"]), (True, "3.5a"))
+            ver.write_text("3.6b")                                                # server replaced between beats
+            third = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
+            self.assertEqual(third["tmux_server_version"], "3.6b")
+
+    def test_tmux_backend_tolerates_a_missing_or_vanishing_binary(self):
+        # A candidate that cannot be executed is skipped (not raised); a binary that speaks
+        # and then disappears before -V still yields the verified client with version None.
+        import core_heartbeat
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "absent"), "PATH": str(self.tmp / "empty")}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
+        self.assertEqual((b["tmux_verified"], b["tmux_candidates"]), (False, [str(self.tmp / "absent")]))
+        # speaks (socket + session), then is gone before -V is asked
+        f = _write_executable(
+            self.tmp / "tmux",
+            _ARGV_PARSE + "case \"$*\" in\n  *-V*) /bin/rm -f \"$0\"; exit 1;;\n  *has-session*) exit 0;;\n  *display-message*) echo \"3.6b|$sock|\";;\n  *) exit 1;;\nesac\n",
+        )
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
+            b2 = core_heartbeat._tmux_backend(sock="/tmp/x", sess="s")
+        self.assertEqual((b2["tmux_verified"], b2["tmux_binary"], b2["tmux_server_version"], b2["tmux_version"]), (True, str(f), "3.6b", None))
+
+    def test_tmux_backend_rejects_a_runnable_wrong_binary_and_malformed_success(self):
+        # Exit 0 with output is not "verified": /bin/echo answers anything. The proof is the server's
+        # own socket path and the session name coming back; a -V that is not tmux records no version.
+        import core_heartbeat
+        wrong = "/bin/echo" if os.name != "nt" else str(_write_executable(
+            self.tmp / "wrong-tmux", "#!/bin/sh\necho \"$*\"\n"
+        ))
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": wrong, "PATH": str(self.tmp / "empty")}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/definitely-no-server.sock", sess="nope")
+        self.assertEqual((b["tmux_binary"], b["tmux_version"], b["tmux_server_version"], b["tmux_verified"]),
+                         (None, None, None, False), b)
+        for name, out, hs in (("bare-version", "echo '3.6b'", "exit 0"), ("other-socket", "echo \"3.6b|/tmp/other.sock|\"", "exit 0"),
+                              ("no-such-session", "echo \"3.6b|$sock|\"", "echo \"can't find session\" >&2; exit 1")):
+            f = _write_executable(
+                self.tmp / name,
+                _ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'tmux 3.6b';;\n  *has-session*) %s;;\n  *display-message*) %s;;\n  *) exit 1;;\nesac\n" % (hs, out),
+            )
+            with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(f), "PATH": str(self.tmp / "empty")}):
+                b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="core")
+            self.assertFalse(b["tmux_verified"], (name, b))
+        g = _write_executable(
+            self.tmp / "odd-version",
+            _ARGV_PARSE + "case \"$*\" in\n  *-V*) echo 'something 9.9';;\n  *has-session*) exit 0;;\n  *display-message*) echo \"3.6b|$sock|\";;\n  *) exit 1;;\nesac\n",
+        )
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(g), "PATH": str(self.tmp / "empty")}):
+            b = core_heartbeat._tmux_backend(sock="/tmp/x.sock", sess="core")
+        self.assertEqual((b["tmux_verified"], b["tmux_server_version"], b["tmux_version"]), (True, "3.6b", None))
+
+    @unittest.skipIf(os.name == "nt", "POSIX pgrep/ps process discovery")
+    def test_unpatched_beat_discovers_the_session_through_the_compatible_client(self):
+        # PATH tmux is protocol-refused, the exported client speaks, the env names a session that does
+        # not exist: the FULL write_beat (no seams patched) must find `real` through the exported client.
+        import core_heartbeat
+        bindir = self.tmp / "bin"; bindir.mkdir()
+        _write_executable(bindir / "tmux", "#!/bin/sh\necho 'protocol version mismatch (client 8, server 9)' >&2; exit 1\n")
+        _write_executable(bindir / "ps", "#!/bin/sh\necho 'claude --name real --resume'\n")
+        _write_executable(bindir / "pgrep", "#!/bin/sh\necho 4242\n")
+        exported = _write_executable(self.tmp / "exported-tmux", _ARGV_PARSE + EXPORTED_CLIENT)
+        with patch.dict(os.environ, {"PATH": str(bindir), "SUTANDO_TMUX_BIN": str(exported),
+                                     "SUTANDO_TMUX_SESSION": "lie", "SUTANDO_TMUX_SOCKET": "/tmp/unpatched.sock"}):
+            core_heartbeat._CLIENT_CACHE.clear()
+            core_heartbeat.write_beat()
+        data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
+        self.assertEqual((data["session"], data["tmux_binary"], data["tmux_verified"], data["tmux_server_version"], data["pid"], data["socket"]),
+                         ("real", str(exported), True, "3.5a", 4242, "/tmp/unpatched.sock"), data)
+
+    def test_write_beat_is_a_noop_once_the_signal_handler_ran(self):
+        # The handler unlinks .alive; a beat already in flight must not republish it.
+        import core_heartbeat
+        core_heartbeat._SIGNALLED = True
+        try:
+            core_heartbeat.write_beat()
+        finally:
+            core_heartbeat._SIGNALLED = False
+        self.assertFalse((self.tmp / "state" / "cores" / f"{_short_host()}.alive").exists())
+
+    def test_restart_paths_hand_the_heartbeat_over(self):
+        # Both launchers stop the running writer before starting one; startup only starts when none runs.
+        restart = (ROOT / "src" / "restart.sh").read_text()
+        codex = (ROOT / "src" / "agent" / "codex" / "cli" / "start-cli.sh").read_text()
+        self.assertIn('core_heartbeat.py" --stop', restart)
+        self.assertIn('core_heartbeat.py" --stop', codex)
+        self.assertNotIn('pkill -f "$REPO/src/core_heartbeat.py"', restart)   # no argv sweep as a fallback
+        self.assertIn('"$PY_BIN" "$REPO/src/core_heartbeat.py" --stop', restart)
+        self.assertNotIn('python3 "$REPO/src/core_heartbeat.py"', codex)  # never a bare python3, start OR stop
+        self.assertIn('resolve_python "$REPO"', codex[:codex.index('core_heartbeat.py" --stop')])
+        doc = (ROOT / "docs" / "claude-md-moved-detail.md").read_text()
+        self.assertIn("has-session -t =<session>", doc)
+        self.assertNotIn("answers with the **server's own socket path and that session name**", doc)
+        self.assertLess(codex.index('core_heartbeat.py" --stop'), codex.index("  ensure_core_heartbeat\n"))
+
+    def test_recording_the_writer_pid_never_creates_the_cores_dir(self):
+        # An EMPTY state/cores reads as "every core offline" to signal_room_tasks.core_is_alive, so a
+        # harness that stubs write_beat() must leave none behind: the record waits for the first beat.
+        import core_heartbeat
+        with tempfile.TemporaryDirectory() as d:
+            cores = Path(d) / "state" / "cores"
+            with patch.object(core_heartbeat, "CORES_DIR", cores), \
+                 patch.object(core_heartbeat, "_alive_path", lambda: cores / "host.alive"), \
+                 patch.object(core_heartbeat, "_PID_RECORDED", False):
+                core_heartbeat._record_writer_pid()
+                self.assertFalse(cores.exists(), "no beat yet: nothing may be created")
+                cores.mkdir(parents=True)
+                core_heartbeat._record_writer_pid()
+                self.assertTrue((cores / "host.heartbeat.pid").exists())
+                self.assertTrue(core_heartbeat._PID_RECORDED)
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal handoff")
+    def test_stop_other_writers_in_process_ends_a_stand_in_and_reports_it(self):
+        # Coverage runs in-process: the handoff itself, not only its CLI wrapper, must be exercised here.
+        import core_heartbeat
+        script = str(Path(core_heartbeat.__file__).resolve())
+        # Selection is from the RECORD, identity from argv: a recorded pid that is not a writer is left alone.
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", script, "not-a-writer"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        quiet = {**os.environ, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}   # no core → publishes nothing
+        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)
+        old = subprocess.Popen([sys.executable, script, "--interval", "60"], env=quiet, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.assertIsNotNone(_wait_file(core_heartbeat._pidfile()), "the writer did not record its pid")
+            core_heartbeat._pidfile().write_text(f"{bystander.pid} {script}\n")          # a record naming a non-writer
+            self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=2.0), 0)
+            self.assertIsNone(bystander.poll())
+            core_heartbeat._pidfile().write_text(f"{old.pid} {script}\n")                # the real writer's record
+            self.assertTrue(core_heartbeat._pid_running(old.pid))
+            self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=5.0), 1)
+            self.assertIsNotNone(old.wait(timeout=5))
+            self.assertIsNone(bystander.poll())
+            self.assertFalse(core_heartbeat._is_writer_argv(f"python3 -c import time; time.sleep(60) {script} not-a-writer", script))
+            self.assertTrue(core_heartbeat._is_writer_argv(f"/opt/py/bin/python3.12 {script} --interval 60", script))
+            self.assertTrue(core_heartbeat._is_writer_argv(
+                f"/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python {script} --interval 60", script))
+            self.assertFalse(core_heartbeat._is_writer_argv(f"bash {script}", script))
+            self.assertFalse(core_heartbeat._is_writer_argv(f"python3 {script}x", script))
+        finally:
+            for pr in (old, bystander):
+                if pr.poll() is None:
+                    pr.kill(); pr.wait()
+        self.assertFalse(core_heartbeat._pid_running(old.pid))   # reaped: lookup fails or state is Z
+        self.assertTrue(core_heartbeat._pid_running(os.getpid()))
+        with patch("core_heartbeat.os.kill", side_effect=PermissionError):
+            self.assertTrue(core_heartbeat._pid_running(1))       # not ours to signal, but running
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
+            self.assertTrue(core_heartbeat._pid_running(os.getpid()))   # unknown state reads as running
+        # main(--stop) with nothing to stop still answers, and never raises
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = core_heartbeat.main(["--stop"])
+        self.assertEqual(rc, 0)
+        self.assertIn("core_heartbeat: stopped", buf.getvalue())
+        core_heartbeat._pidfile().write_text(f"{os.getpid()} {script}\n")   # a record naming THIS process is skipped
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
+            self.assertEqual(core_heartbeat.stop_other_writers(), 0)
+        core_heartbeat._pidfile().write_text(f"424242 {script}\n")
+        with patch("core_heartbeat.subprocess.run", side_effect=OSError("no ps")):
+            self.assertEqual(core_heartbeat.stop_other_writers(), 0)              # cannot verify → left alone
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal handoff")
+    def test_handoff_edge_paths_are_covered_in_process(self):
+        # Records: an absent pidfile and a .alive naming a heartbeat_pid; argv with no script at all;
+        # a pid that vanishes between ps and SIGTERM; a pid that ignores SIGTERM and takes the SIGKILL path.
+        import core_heartbeat
+        script = str(Path(core_heartbeat.__file__).resolve())
+        cores = self.tmp / "state" / "cores"; cores.mkdir(parents=True, exist_ok=True)
+        core_heartbeat._pidfile().unlink(missing_ok=True)
+        (cores / f"{_short_host()}.alive").write_text(json.dumps({"heartbeat_pid": 777001}))
+        self.assertEqual(core_heartbeat._recorded_writer_pids(), [777001])
+        (cores / f"{_short_host()}.alive").write_text("not json")
+        self.assertEqual(core_heartbeat._recorded_writer_pids(), [])
+        self.assertFalse(core_heartbeat._is_writer_argv("bash -c sleep 60", script))
+        quiet = {**os.environ, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")}
+        old = subprocess.Popen([sys.executable, script, "--interval", "60"], env=quiet, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.assertIsNotNone(_wait_file(core_heartbeat._pidfile()))
+            # vanished between ps and SIGTERM: counted as handled, nothing raised
+            with patch("core_heartbeat.os.kill", side_effect=ProcessLookupError), patch("core_heartbeat._pid_running", return_value=False):
+                self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=0.5), 1)
+            self.assertIsNone(old.poll())      # the patch swallowed the signal; the writer is still there
+            # ignores SIGTERM (simulated by _pid_running staying True): the SIGKILL path runs and ends it
+            with patch("core_heartbeat._pid_running", return_value=True):
+                self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=0.3), 1)
+            self.assertIsNotNone(old.wait(timeout=5))
+            # SIGKILL on a pid that is already gone is not an error
+            core_heartbeat._pidfile().write_text(f"{old.pid} {script}\n")
+            with patch("core_heartbeat.subprocess.run", return_value=subprocess.CompletedProcess([], 0, f"python3 {script} --interval 60", "")), \
+                 patch("core_heartbeat._pid_running", return_value=True), \
+                 patch("core_heartbeat.os.kill", side_effect=[None, ProcessLookupError]):
+                self.assertEqual(core_heartbeat.stop_other_writers(timeout_s=0.2), 1)
+        finally:
+            if old.poll() is None:
+                old.kill(); old.wait()
+
+    def test_client_and_socket_helpers_fail_closed_on_errors(self):
+        import core_heartbeat
+        # a candidate that cannot be executed is skipped, not raised
+        with patch.dict(os.environ, {"SUTANDO_TMUX_BIN": str(self.tmp / "absent-tmux"), "PATH": str(self.tmp / "empty")}):
+            core_heartbeat._CLIENT_CACHE.clear()
+            self.assertIsNone(core_heartbeat._client_for("/tmp/nope.sock"))
+        # a non-path reported socket is not the socket
+        self.assertFalse(core_heartbeat._same_socket(123, "/tmp/x.sock"))  # type: ignore[arg-type]
+        self.assertFalse(core_heartbeat._same_socket("", "/tmp/x.sock"))
+        self.assertTrue(core_heartbeat._same_socket("/tmp/x.sock", "/tmp/x.sock"))
+        # a signalled exit unlinks .alive once more after the loop
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        alive.parent.mkdir(parents=True, exist_ok=True); alive.write_text("{}")
+        core_heartbeat._SIGNALLED = True; core_heartbeat._SHUTDOWN_REQUESTED = True
+        try:
+            self.assertEqual(core_heartbeat.run_forever(interval=0.01), 0)
+        finally:
+            core_heartbeat._SIGNALLED = False; core_heartbeat._SHUTDOWN_REQUESTED = False
+        self.assertFalse(alive.exists())
 
     def test_write_beat_is_atomic_via_tmp(self):
         """The .alive write goes through .alive.tmp then renames into place —
@@ -182,14 +648,64 @@ class TestHeartbeatCli(unittest.TestCase):
         data = json.loads(alive.read_text())
         self.assertEqual(data["status"], "smoke")
 
+    @unittest.skipIf(os.name == "nt", "POSIX signal handoff")
+    def test_stop_hands_over_from_an_old_writer_to_a_schema_4_singleton(self):
+        # An old writer (argv names this checkout's script) is still running; --stop must end it and
+        # wait, then a fresh --once beat carries schema 4. No pkill pattern kills another checkout's.
+        script = ROOT / "src" / "core_heartbeat.py"
+        # A REAL old writer that records its pid, plus a bystander whose argv merely mentions the script
+        # path — the shape a pgrep sweep would have killed.
+        (self.tmp / "state" / "cores").mkdir(parents=True, exist_ok=True)
+        old = subprocess.Popen([sys.executable, str(script), "--interval", "60"],
+                               env={**self.env, "SUTANDO_TMUX_SOCKET": str(self.tmp / "no-server.sock")},
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(script.resolve()), "not-a-writer"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            pidfile = self.tmp / "state" / "cores" / f"{_short_host()}.heartbeat.pid"
+            self.assertIsNotNone(_wait_file(pidfile), "the writer did not record its pid")
+            r = subprocess.run([sys.executable, str(script), "--stop"], env=self.env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("stopped 1 writer(s)", r.stdout)
+            self.assertIsNotNone(old.wait(timeout=5), "the old writer must be gone before --stop returns")
+            time.sleep(0.2)
+            self.assertIsNone(bystander.poll(), "a process that only mentions the path must not be touched")
+        finally:
+            for pr in (old, bystander):
+                if pr.poll() is None:
+                    pr.kill(); pr.wait()
+        r2 = subprocess.run([sys.executable, str(script), "--once"], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        data = json.loads((self.tmp / "state" / "cores" / f"{_short_host()}.alive").read_text())
+        self.assertEqual(data["schema_version"], 4)
+
+    @unittest.skipIf(os.name == "nt", "POSIX SIGTERM cleanup")
     def test_sigterm_cleans_up_alive_file(self):
         """Graceful shutdown removes the .alive file so peers see the core
         leave immediately rather than wait for mtime staleness."""
         import signal as _signal
         script = ROOT / "src" / "core_heartbeat.py"
+        # A beat is only published AFTER a core has been observed (4fda4a4b:
+        # before first sighting the loop publishes nothing and unlinks any stale
+        # record, so a cold boot that never gets a core cannot advertise itself
+        # healthy). This test is about SIGTERM cleanup, and it needs a file to
+        # clean up — so give the child a toolchain that reports a real core
+        # instead of asserting the pre-4fda4a4b fail-open behaviour.
+        _bin = self.tmp / "fakebin"
+        _bin.mkdir(parents=True, exist_ok=True)
+        for _name, _body in (
+            ("tmux",  "#!/bin/sh\nexit 0\n"),
+            ("pgrep", "#!/bin/sh\necho 4242\n"),
+            ("ps",    "#!/bin/sh\necho 'claude --name sutando-core --resume'\n"),
+        ):
+            _f = _bin / _name
+            _f.write_text(_body)
+            _f.chmod(0o755)
+        _env = dict(self.env)
+        _env["PATH"] = f"{_bin}:{_env.get('PATH', '')}"
         proc = subprocess.Popen(
             [sys.executable, str(script), "--interval", "0.5"],
-            env=self.env,
+            env=_env,
         )
         # Wait for first beat to land.
         alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
@@ -197,7 +713,8 @@ class TestHeartbeatCli(unittest.TestCase):
             if alive.exists():
                 break
             time.sleep(0.1)
-        self.assertTrue(alive.exists(), "first beat should have landed within 4s")
+        self.assertTrue(alive.exists(),
+                        "first beat should have landed within 4s once a core is observed")
         # Signal graceful shutdown.
         proc.send_signal(_signal.SIGTERM)
         proc.wait(timeout=5)

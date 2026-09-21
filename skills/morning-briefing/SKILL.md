@@ -14,7 +14,28 @@ ARGUMENTS: $ARGUMENTS
 
 ## What to gather
 
-**Step 0 — Base data (canonical, always run first):**
+**Step 0 — Calendar cache. CONDITIONAL: Google-calendar hosts only.**
+
+`src/morning-briefing.py` cannot reach the owner's Google Workspace calendar; it reads a cache the
+*agent* writes. Omitting this is silent: the briefing reports "couldn't read your calendar", or
+falls back to a local macOS Calendar read that stalls and can miss the work account entirely. Pull
+today's local-day events from the Google connector, then:
+
+```bash
+echo '[{"raw":"9:00-9:30am 1:1 w/ Sam","calendar":"work"}]' | python3 src/write_calendar_cache.py
+python3 src/write_calendar_cache.py --empty   # ONLY for a genuinely empty day
+```
+
+**Hosts with no Google connector skip STEP 0 ONLY** — the reader falls back to local macOS
+Calendar. Step 1 below still runs on every host. See "Calendar source (Google Workspace) —
+activation" for the full contract.
+
+**A missing connector is one line of text, never a card.** If `composio_find` reports the owner's
+calendar or mail app `connected: false`, say so in the briefing ("Google Calendar isn't connected;
+connect it in AG2 Space") and move on. The briefing is not an owner request: never post a connect
+card or start a `connect-apps` wait from it.
+
+**Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**
 
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
@@ -35,17 +56,15 @@ python3 src/morning-briefing.py
 
 4. **System status** — Run `python3 src/health-check.py`. Report any issues.
 
-5. **Daily insight** — Run `python3 src/daily-insight.py --stdout-only`. If it produces an insight, include it at the end of the briefing as "💡 Insight: ..."
+5. **Friction check** — Run `python3 src/friction-detector.py --stdout-only`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
 
-6. **Friction check** — Run `python3 src/friction-detector.py --stdout-only`. If friction items found, include as "⚠️ Friction: [count] items need attention" with the top 3.
+6. **SutandoWIRE** — Run `python3 src/wire_briefing.py`. If it prints a line (it only does so when a NEW WIRE episode has appeared since the last briefing), include that line verbatim — it's already a fully-formed `📺 New SutandoWIRE: <title> — <url>`. Silent output = no new episode; skip the line. The script is a clean no-op without `YOUTUBE_API_KEY` (env or vault) and tracks last-seen in `state/wire-briefing.json`, so each episode is announced exactly once across both briefing paths.
 
-7. **SutandoWIRE** — Run `python3 src/wire_briefing.py`. If it prints a line (it only does so when a NEW WIRE episode has appeared since the last briefing), include that line verbatim — it's already a fully-formed `📺 New SutandoWIRE: <title> — <url>`. Silent output = no new episode; skip the line. The script is a clean no-op without `YOUTUBE_API_KEY` (env or vault) and tracks last-seen in `state/wire-briefing.json`, so each episode is announced exactly once across both briefing paths.
-
-> **Why `--stdout-only`:** these scripts default to writing `results/insight-*.txt` / `results/friction-*.txt`, which the Telegram/Discord bridge polls and delivers as SEPARATE DMs — fragmenting the briefing into 3 messages. `--stdout-only` prints the content (for you to fold inline here) without writing a deliverable file, so the owner gets ONE consolidated briefing. Do NOT remove the flag.
+> **Why `--stdout-only`:** friction-detector defaults to writing `results/friction-*.txt`, which the Telegram/Discord bridge polls and delivers as a SEPARATE DM — fragmenting the briefing. `--stdout-only` prints the content (for you to fold inline here) without writing a deliverable file, so the owner gets ONE consolidated briefing. Do NOT remove the flag.
 
 ## How to deliver
 
-Run `python3 src/morning-briefing.py` first — it is the single source of truth for the base data (weather, calendar, reminders, overnight Discord, pending questions, health). Fold the augmentation from steps 1–8 into ONE message.
+Run `python3 src/morning-briefing.py` first — it is the single source of truth for the base data (weather, calendar, reminders, overnight Discord, pending questions, health). Fold the augmentation from steps 1–6 into ONE message.
 
 > **Delivery on this host differs from upstream's default.** Upstream's version of
 > this section tells you to append a follow-up `results/proactive-<ts>.txt`. Do NOT
@@ -63,7 +82,6 @@ Good morning. Here's your briefing:
 💬 Discord: [summary of overnight activity]
 📋 Tasks: [pending items]
 🖥️ System: [health status]
-💡 Insight: [behavioral pattern from daily-insight.py, if available]
 ```
 
 Deliver via:
@@ -83,16 +101,32 @@ touch "$(bash scripts/sutando-config.sh workspace)/state/briefing-delivered-$(da
 
 **Never touch that sentinel without an actual post** — a pre-touched sentinel silently suppresses the briefing for the whole day (observed 2026-06-17→19). It is proof-of-delivery, not a scheduling hint.
 
+## Calendar source (Google Workspace) — activation
+
+`src/morning-briefing.py` is a standalone script and **cannot reach the owner's Google Workspace calendar** — the Station/Composio connector is agent-only. So the briefing reads a cache that the *agent* produces:
+
+- **Producer:** `src/write_calendar_cache.py` writes `state/calendar-today.json` — `{"date": "YYYY-MM-DD", "events": [{"raw": "...", "calendar": "..."}]}`, atomically (tmp + `os.replace`). `date` is today in local time so a stale cache is ignored, and `events: []` means a *verified-empty* day (never rendered as "clear" from a missing cache). Feed it the events you pulled from the connector:
+  ```bash
+  echo '[{"raw":"9:00-9:30am 1:1 w/ Sam","calendar":"work"}]' | python3 src/write_calendar_cache.py
+  python3 src/write_calendar_cache.py --empty   # verified no events today
+  ```
+- **Reader:** `get_calendar_events()` prefers the cache. Set `MORNING_BRIEFING_CALENDAR_SOURCE=google` to make the cache the *only trusted source* — if it's missing/stale the briefing reports "couldn't read your calendar" rather than falling back to a local macOS Calendar that may not include the work account (the 2026-07-21 "falsely clear" bug, #2256).
+- **Without a Google connector:** skip the producer step and the env var; the reader falls back to local macOS Calendar via AppleScript.
+
+Nothing writes the cache automatically, so **a briefing that only runs the reader reports unread on a Google-source host.** The producer is therefore step 0 of this skill's own flow (above), which covers both `/morning-briefing` and a cron declared as `"prompt_skill": "morning-briefing"` — the natural config. The expanded cron prompt under "Scheduling" below remains valid but is no longer the only place the producer appears.
+
+Observed on Chis-Mac-mini: `state/calendar-today.json` was last written **2026-07-30 07:28** and the host's cron was `{"name": "morning-briefing", "prompt_skill": "morning-briefing"}`, so nothing invoked the producer. Three consecutive briefings reported no calendar, and the local fallback added a ~23s AppleScript stall before returning nothing.
+
 ## Scheduling
 
-The canonical daily schedule calls the script directly (same code path):
+The canonical daily schedule produces the Google-calendar cache first, then runs the briefing against it (see the activation section above):
 
 ```json
 {
   "name": "morning-briefing",
   "cron": "57 6 * * *",
-  "prompt": "Run python3 src/morning-briefing.py to deliver the daily morning briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Speak the result if voice is connected, send as Discord DM otherwise."
+  "prompt": "Morning briefing. FIRST produce the calendar cache from the owner's REAL Google calendar (the standalone script can't reach the connector): pull today's events via the Google-calendar connector (e.g. sutando-station composio_exec GOOGLECALENDAR_EVENTS_LIST, calendarId=primary, today's local-day window), then pipe them as a JSON array of {raw,calendar} to `python3 src/write_calendar_cache.py` (or `--empty` if genuinely no events). THEN run `MORNING_BRIEFING_CALENDAR_SOURCE=google python3 src/morning-briefing.py` to deliver the briefing. Speak the result if voice is connected, send as Discord DM otherwise."
 }
 ```
 
-Calling `/morning-briefing` manually runs the same script plus the MCP email/calendar and insight augmentation in steps 1–7.
+Calling `/morning-briefing` manually runs the same script plus the MCP email/calendar augmentation in steps 1–6.

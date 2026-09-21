@@ -30,8 +30,22 @@ def _field_pos(src: str, pattern: str) -> int:
     return src.find(pattern)
 
 
+def _strip_comments(src: str) -> str:
+    """Drop whole-line `#` comments before position matching.
+
+    Upstream prose legitimately mentions the field names this test locates
+    (e.g. "Must stay above `task:`"), and a bare find() hits the comment
+    before the real f-string field — reporting a field-order defect that is
+    not there. Only emitted fields should count.
+    """
+    return "\n".join(
+        l for l in src.split("\n") if not l.lstrip().startswith("#")
+    )
+
+
 def _assert_task_last(src: str, before_patterns: list, writer_id: str):
     """Assert task: template appears after all before_patterns in src."""
+    src = _strip_comments(src)
     task_pos = _field_pos(src, "task:")
     assert task_pos > 0, f"{writer_id}: could not locate 'task:' in writer"
     for pat in before_patterns:
@@ -55,9 +69,14 @@ def test_telegram_bridge_task_field_last():
     src = _src("src/telegram-bridge.py")
     # Locate the task writer block specifically — find the write_text call
     # and the slice around it so we compare relative positions within that block.
-    block_start = src.find("task_file.write_text(")
-    assert block_start > 0, "telegram-bridge: could not find write_text call"
-    block = src[block_start: block_start + 600]
+    # Anchor on the CONTENT assignment, not write_text: the body is built into
+    # _task_content (and HMAC-stamped) before it is written, so a window after
+    # write_text() no longer contains the fields. Same shape as the other writers.
+    block_start = src.find("_task_content = (")
+    if block_start < 0:
+        block_start = src.find("task_file.write_text(")
+    assert block_start > 0, "telegram-bridge: could not find the task-content writer"
+    block = src[block_start: block_start + 1200]
     _assert_task_last(block, ["source: telegram", "priority:"], "telegram-bridge")
 
 
@@ -73,7 +92,15 @@ def test_discord_bridge_task_field_last():
     # try (so a build failure is logged rather than raised). Anchor on the
     # builder; fall back to the legacy inline form so this guard still works
     # against a pre-refactor writer.
+    # Slice the builder's actual `return (` block rather than a character window:
+    # upstream grew the leading comments past the old 1800-char budget, pushing
+    # priority:/task: outside it. A budget that must be re-tuned whenever a
+    # comment grows is not an invariant.
     block_start = src.find("def _build_task_content")
+    if block_start >= 0:
+        _ret = src.find("return (", block_start)
+        if _ret > 0:
+            block_start = _ret
     if block_start < 0:
         block_start = src.find("task_file.write_text(")
     assert block_start > 0, "discord-bridge: could not find task-content builder"

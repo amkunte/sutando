@@ -90,9 +90,8 @@ SCANS = [
 
 GRACE = 1.5  # flag only after 1.5x cadence elapsed (absorbs one missed tick)
 
-# Roaming node: only speak when the owner node looks DOWN, not merely late.
-# Deliberately much wider than GRACE -- GRACE absorbs one missed tick, this has
-# to absorb the owner node being legitimately off for a while.
+# Roaming node: speak only when the owner node looks DOWN, not merely late.
+# Much wider than GRACE, which absorbs only one missed tick.
 ROAMING_STALE_MULT = 4
 
 
@@ -182,10 +181,8 @@ def _report_owner_node_stall(now: datetime) -> None:
         if data.get("suspended"):
             continue
         if not s.get("roaming_observable", True):
-            # This scan's state never reaches a roaming node, so the file being
-            # aged here is this node's OWN copy and will never refresh. Ageing it
-            # produces an alert that cannot clear no matter what the owner node
-            # does -- which trains the reader to ignore the whole SCANSTALE class.
+            # The file aged here is this node's OWN copy and never refreshes, so
+            # ageing it yields an alert that cannot clear whatever the owner does.
             continue
         last = _parse(data.get("last_scan"))
         if last is None:

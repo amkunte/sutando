@@ -119,7 +119,7 @@ else
 
   # Run codex /goal exec (codex sandbox can fetch URLs + write files; needs network access)
   # Per `feedback_codex_nested_quotes_hang_stdin.md`: pass via "$(cat /tmp/file)" not raw -- arg
-  codex exec --sandbox workspace-write -o "$OUT_DIR/artifacts/codex-output.txt" -- "$(cat "$PROMPT_FILE")"
+  codex exec --sandbox workspace-write --skip-git-repo-check -o "$OUT_DIR/artifacts/codex-output.txt" -- "$(cat "$PROMPT_FILE")"
   echo "[Phase 1] codex done; output at $OUT_DIR/artifacts/codex-output.txt"
 fi
 

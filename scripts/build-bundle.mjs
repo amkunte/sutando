@@ -20,7 +20,12 @@
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { statSync } from 'node:fs';
+import { copyFileSync, statSync } from 'node:fs';
+import {
+  BROWSER_TRANSPORT_ARTIFACT,
+  BROWSER_TRANSPORT_ENTRY,
+  browserTransportOptions,
+} from './browser-transport-build.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -74,6 +79,30 @@ for (const entry of ENTRYPOINTS) {
     console.error(`  ✗ ${entry} — ${err.message}`);
     failed = true;
   }
+}
+
+// The browser voice transport is a SEPARATE build: platform:browser + IIFE, not
+// node/ESM. The packaged web-client serves this file to the page; without it the
+// voice UI has no transport at all (there is no inline copy to fall back to), so
+// a failure here fails the whole bundle rather than warning.
+{
+  const outfile = join(repo, 'dist', BROWSER_TRANSPORT_ARTIFACT);
+  try {
+    await build(browserTransportOptions({ outfile }));
+    console.log(
+      `  ✓ ${BROWSER_TRANSPORT_ENTRY.padEnd(52)} → dist/${BROWSER_TRANSPORT_ARTIFACT}  ${human(statSync(outfile).size)}  [browser/iife]`,
+    );
+  } catch (err) {
+    console.error(`  ✗ ${BROWSER_TRANSPORT_ENTRY} (browser) — ${err.message}`);
+    failed = true;
+  }
+}
+
+try {
+  copyFileSync(join(repo, 'src', 'windows-app-launcher.ps1'), join(repo, 'dist', 'windows-app-launcher.ps1'));
+} catch (err) {
+  console.error(`  ✗ Windows app launcher asset — ${err.message}`);
+  failed = true;
 }
 
 if (failed) {

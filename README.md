@@ -77,39 +77,13 @@ We're looking for contributors to help test and harden these capabilities. If yo
 
 ## How it works
 
-```
-    You ──voice (browser)──► Voice agent ─────────┐
-     │                       (Gemini Live,        │
-     │                        WS on :9900)        ├──► inline tools (instant,
-     │                                            │    in-process: describe_screen,
-     ├──phone (Twilio)─────► Conversation server ─┤    get_current_time, hang_up,
-     │                       (Gemini Live,        │    dtmf, ...)
-     │                        WS on :3100)        │
-     │                                            └──┐
-     │                                               │   file bridge       .──────▶────────.
-     ├──telegram──────────► Telegram bridge ─────────┼── tasks/ ─────────► |               |
-     │                                               │                    |   Core        |
-     │                                               │                    |   agent ↻     |
-     └──discord───────────► Discord bridge ──────────┘                    |               |
-                                                                           `──────◀────────'
-                                                                                  │
-                                                                                  ▼
-                                                                          uses anything:
-                                                                          email, calendar,
-                                                                          browser, files,
-                                                                          phone, reminders...
-                                    ◄── results/ ◄────────────────────────────────┘
-                                (spoken via voice/phone,
-                                 text via Telegram/Discord)
+See [Sutando architecture boundaries](docs/architecture-boundaries.md) for the
+normative definitions of core, adapters, apps, skills, tooling, and workspace
+state.
 
-    ↻ = a cron job fires the `/proactive-loop` skill every 5 minutes
-        (`*/5 * * * *` in `skills/schedule-crons/crons.json`). The skill
-        runs as a 10-minute pass that keeps a persistent watcher on
-        `tasks/` via Claude Code's `Monitor` tool — pending tasks are
-        processed the moment they arrive, not just on the cron tick.
-        Each pass also runs health checks and picks the next build-log
-        item autonomously.
-```
+![Sutando architecture: voice and phone realtime agents use inline tools for instant actions; Telegram and Discord bridges queue larger work to tasks/, the scheduled proactive loop watches tasks/, and the core agent executes work with available tools before returning results to each channel.](docs/assets/sutando-architecture.png)
+
+The core agent's loop is a cron job that fires `/proactive-loop` every 15 minutes (`*/15 * * * *` in the per-host `crons.json`). On Claude, Sutando backs that off to every 30 minutes when 7-day quota utilization reaches 80%, restoring the configured cadence once an authoritative routed reading drops below it; missing, stale, rejected, or unrouted telemetry holds the slower cadence and reports why. Each pass keeps a persistent watcher on `tasks/` via Claude Code's `Monitor` tool, so tasks are processed on arrival rather than on the tick, and also runs health checks and picks the next build-log item.
 
 Four processes work together:
 - **Voice agent** (Gemini Live, WebSocket on :9900) — listens and talks in real time for browser voice.
@@ -123,14 +97,31 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ## Quick start
 
-**Prerequisites:**
-- macOS 15+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) (sign in to the CLI you select)
-- Node.js 22+ (`brew install node`)
-- fswatch (`brew install fswatch`)
-- [Gemini API key](https://ai.google.dev) for voice (optional for text/core-only use)
-- *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls; you can run the browser + Telegram + Discord paths without them.
-- *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
+**Prerequisites** — `bash src/startup.sh` checks that these are **installed** and refuses to boot otherwise:
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) or [Codex CLI](https://developers.openai.com/codex/cli/) — whichever you select
+- Node.js (`brew install node`)
+- Python 3 (`brew install python3`)
+- fswatch (`brew install fswatch`) — auto-installs via Homebrew on first start
+
+**Also required** — sign in to the selected agent CLI. Startup checks the
+configured Claude or Codex home before launching background services and fails
+with the matching login remedy. `SUTANDO_SKIP_AUTH_PREFLIGHT=1` bypasses this
+once for recovery; the runtime launcher still checks again before replacing the
+core session.
+
+**Recommended, but not checked at boot** — macOS 15+ and Node.js 22+.
+
+`bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
+
+**Optional** — each unlocks one feature and degrades alone:
+- [Gemini API key](https://ai.google.dev) — voice (text/core paths work without it)
+- `pip3 install discord.py` / `slack_bolt` — Discord / Slack bridges (Telegram needs no package)
+- ffmpeg (`brew install ffmpeg`) — subtitle-burn, video-concat, recording handoff
+- tmux (`brew install tmux`) — Sutando.app watcher auto-restart; the core starts without it
+- git — vault sync, self-upgrade, commit provenance
+- [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — phone calls and SMS
+
+Full list with the line enforcing each, plus what to vendor when embedding Sutando in another application: **[External runtime dependencies](docs/runtime-dependencies.md)**.
 
 ```bash
 # Clone
@@ -141,11 +132,40 @@ cd sutando
 cp .env.example .env
 # Add GEMINI_API_KEY only if you want voice
 
-# Start everything
-bash src/startup.sh
+# Start everything on macOS / Linux — core, app, and dashboard
+./start.sh
+
+# Start everything on Windows
+pwsh -File src/startup.ps1
 ```
 
-This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) plus **Open Core** (selected CLI terminal) and **Open Dashboard** (status page).
+That is the whole first run. `start.sh` is a thin front door: it delegates to `src/startup.sh --with-app` and opens the dashboard once it answers. Extra arguments pass straight through (`./start.sh --runtime codex`). Set `SUTANDO_OPEN_DASHBOARD=0` to skip the browser, or `SUTANDO_DASHBOARD_URL` to point it elsewhere. If the dashboard never comes up the core still starts — the browser open is backgrounded and can never gate it.
+
+`src/startup.sh` remains the supported lower-level entry, and is what you want when there is no desktop to open things on:
+
+```bash
+# Headless core only — no app, no browser
+bash src/startup.sh
+
+# Core plus the macOS menu-bar app, still no browser
+bash src/startup.sh --with-app
+```
+
+Either path starts the core services (voice agent, phone conversation server, web client, dashboard, and API) and the autonomous loop. The browser UI is at http://localhost:8080 and the dashboard at http://localhost:7844; `src/startup.sh` never opens a browser for you.
+
+**The macOS menu-bar app is opt-in and separate.** Plain `bash src/startup.sh` never touches it, so the core stays headless. `--with-app` builds, signs, and **launches** the bundle; a failure there is reported and never stops the core.
+
+**Auto-start at login is a further, explicit opt-in.** Neither `./start.sh` nor `--with-app` installs a launchd job — running the app and having macOS resurrect it forever are different decisions. When you do want it, run the installer from the checkout you actually use: it records that path in the LaunchAgent, so installing from a temporary worktree leaves you with a login job pointing at a directory that will be deleted.
+
+To manage the app on its own — build only, launch once, or supervise — use its installer directly:
+
+```bash
+bash scripts/install-menu-bar-app.sh              # build + sign, print next steps
+bash scripts/install-menu-bar-app.sh --launch     # …and open it now
+bash scripts/install-menu-bar-app.sh --supervise  # …and auto-start it at login
+```
+
+First run needs Accessibility granted in System Settings → Privacy & Security. Run the installer from the checkout you actually use: it records that path in the launchd job, so running it from a temporary worktree pins the app to a directory that will be deleted.
 
 > **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches the selected core CLI with unattended approvals and full local access — permission prompts would otherwise break the voice-in / answer-out flow. In exchange:
 >
@@ -159,6 +179,90 @@ This starts all services (voice agent, phone conversation server, web client, da
 **Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
 **macOS permissions** — on first run, macOS will ask you to grant Screen Recording, Accessibility, and Microphone access. See [Security](#security) for what each permission is used for.
+
+## Windows support
+
+Sutando started life on macOS and most of its app-automation surface — AppleScript-driven Chrome/QuickTime control, Cmd+Ctrl+F fullscreen, the Sutando menu-bar Swift app — has no portable Windows equivalent. The core Sutando loop nevertheless runs on Windows; what's there is the headless agent: voice, screen capture, clipboard, notifications, the task bridge, the dashboard, and the messaging bridges.
+
+**Works on Windows:**
+- Voice agent (Gemini Live WebSocket on :9900) — talk to Sutando in the browser
+- Web client (:8080) and Dashboard (:7844) and Agent API (:7843)
+- Screen capture (:7845) — uses PowerShell `System.Drawing.Bitmap` instead of `screencapture`
+- Task bridge — file-based; uses a PowerShell `FileSystemWatcher` shim in place of `fswatch`
+- Clipboard (Get-Clipboard / Set-Clipboard) and desktop notifications (balloon-tip)
+- Telegram, Discord, Slack bridges (any feature that runs in the core agent)
+- Capture screen + describe screen tools
+
+Dashboard and `/tasks/active` use platform process probes, not a fixed `pgrep` path.
+Unavailable process probes do not abort either response: the dashboard reports unavailable status and `/tasks/active` returns `null` for watcher state. The macOS-only Sutando app reports as not running on Windows.
+Proactive orphan recovery uses the shared, non-signalling process-identity probe:
+only confirmed dead owners release claims; live or uninspectable owners keep them.
+
+`switch_app` and `pwsh -File scripts/open-app.ps1 "Calculator"` identify Windows
+apps by registered app ID or exact executable path and verify foreground focus.
+They reuse existing windows, restore minimized ones, and fail explicitly if no
+interactive desktop exists or Windows refuses focus. Bundled services include
+the same native backend; no window-title guessing or simulated keystrokes are used.
+
+**Returns a `macOSOnly` error on Windows (the voice agent stays up; Gemini tells the user):**
+- `press_key`, `type_text`, `volume`, `brightness`, `fullscreen`, `slide_control`, `toggle_tasks`
+- `scroll`, `switch_tab`, `close_tab`, `open_url`, `click`, `point_at` (browser AppleEvents)
+- `join_gmeet`, `call_contact` (Chrome AppleScript)
+- `screen_record`, `play_video`, `pause_video`, `resume_video`, `replay_video`, `close_video`, `scroll_and_describe` (QuickTime + Chrome)
+- Sutando.app menu-bar shortcuts (Swift/Cocoa), Twilio + ngrok auto-launch from startup
+
+**Windows quickstart:**
+
+```powershell
+# Clone (PowerShell)
+git clone https://github.com/sonichi/sutando.git
+cd sutando
+
+# Configure
+Copy-Item .env.example .env
+# Edit .env in your editor; set GEMINI_API_KEY
+
+# Install dependencies + start everything
+pwsh -File src/startup.ps1
+
+# Stop everything
+pwsh -File src/stop.ps1
+
+# Restart
+pwsh -File src/restart.ps1
+```
+
+The Windows scripts mirror their `.sh` twins:
+- `src/startup.ps1` — launches voice agent + web client + dashboard + agent API + screen capture (+ optional bridges)
+- `src/restart.ps1` — stops everything, then starts (matches `restart.sh`); it runs detached so a restart requested from chat survives stopping its caller, logging to `<workspace>/logs/restart.log`
+- `src/stop.ps1` — stops everything without restarting (matches `stop.sh`; shortcut for `restart.ps1 -StopOnly`)
+- `src/notify.ps1 "msg"` — desktop notification + Discord DM (matches `notify.sh`)
+- `src/watch-tasks-stream.ps1` — task-folder watcher; emits `TASK_FILE: …` per new file
+
+**Prerequisites:**
+- Windows 10/11
+- PowerShell 7+ (`winget install Microsoft.PowerShell` — `pwsh` shim)
+- Node.js 22+ from [nodejs.org](https://nodejs.org)
+- Python 3.11+ from [python.org](https://python.org) (used by the dashboard, agent API, and bridges)
+- Claude Code installed and logged in (`claude` once)
+
+Fresh Windows installs use `npm ci --ignore-scripts` and require the shipped runtime build. Repository paths and workspace names may contain spaces and Unicode.
+
+**Workspace:** identical contract as macOS — defaults to `<repo>/workspace/`; override via `sutando.config.local.json` (see [docs/workspace-config.md](docs/workspace-config.md)).
+
+**What's not ported (and why):**
+- **Sutando.app menu bar** — Swift / AppKit, no Windows equivalent. The global ⌃C / ⌃V / ⌃M shortcuts aren't available; use the web client UI instead.
+- **AppleScript-driven app automation** — Windows has no equivalent of System Events that's portable from the CLI. UIAutomation via PowerShell could replace some of this if there's demand.
+- **Phone-call flow** — `startup.ps1` skips Twilio + ngrok auto-launch. If you want phone calls on Windows, start ngrok manually and set `WEBHOOK_BASE_URL` in `.env`.
+- **macOS permissions block** — Windows has no TCC; screen capture and microphone "just work" once you grant Chrome microphone access.
+
+**Task-loop architecture (Windows-specific).** macOS Claude Code exposes a `Monitor` tool that streams stdout from a long-running command (e.g. `bash src/watch-tasks-stream.sh`) and wakes the agent on every `TASK_FILE:` event. Claude Code 2.1.168 on Windows **does not include the `Monitor` tool** (verified: not in the agent's tool list, and the literal string `"Monitor"` is absent from `claude.exe`). Without Monitor, there's no push-based file-watch primitive available to the agent, so the long-running `sutando-core` TUI would only pick up new tasks on its `*/5` proactive-loop cron tick — fine for autonomous work, far too slow for chat.
+
+The Windows port works around this with `src/task-dispatcher.ps1`, a standalone process auto-launched by `src/startup.ps1`. It uses `FileSystemWatcher` to watch `tasks/`, claims new files via atomic rename, and runs each one through `claude --print` as a one-shot subprocess. Each queued chat task starts as soon as the dispatcher is available; inference and delivery time depend on the model and connection. The long-running core still handles autonomous proactive-loop work + cron jobs; the dispatcher only intercepts user-driven chat tasks.
+
+**Task context and authorization:** owner turns and authenticated Discord collaborator turns resume a session per channel. Collaborators require both a verified task envelope and a current access entry. Other non-owner turns use `codex exec --sandbox read-only`; when Codex is unavailable, they are refused. Owner and collaborator turns in the same channel share conversational context.
+
+The dispatcher holds an exclusive lifetime lock and publishes results atomically. After a crash or forced restart, abandoned claims are archived with an interruption result instead of being retried: actions may already have run. Check their outcome before resubmitting. Restart stops the dispatcher process tree, including its in-flight CLI child.
 
 **Try saying:**
 - "What's on my screen?" — takes a screenshot and describes it
@@ -183,6 +287,7 @@ bash src/verify-setup.sh
 - Screen recording produces 0-second files? `screencapture -v` needs a TTY. Sutando uses `ffmpeg` instead — make sure it's installed: `brew install ffmpeg`
 - Something broke? Run `bash src/restart.sh` — this kills all services and restarts fresh
 - Sutando acting confused, contradicting itself, or giving stale answers after a long session? Restart the selected core CLI session to reset its context.
+- **Still stuck?** [Join the official Discord](https://discord.gg/uZHWXXmrCS) — real humans and community-run agents answer support questions there.
 - Phone call answers with "We are sorry, an error has occurred"? The conversation server (`skills/phone-conversation/scripts/conversation-server.ts`, port 3100) isn't running. Run `bash src/startup.sh` or `bash src/restart.sh` to relaunch all services.
 
 **Shutting down:**
@@ -213,7 +318,7 @@ These unlock more capabilities. Add to `.env` when ready:
 | Telegram | Message Sutando from your phone. **First DM auto-enrolls you as owner** (trust-on-first-use). Subsequent senders need to be added: edit `$CLAUDE_CONFIG_DIR/channels/telegram/access.json` → `allowFrom` list. | [Create bot via @BotFather](https://t.me/BotFather), then `/telegram:configure <token>` |
 | Discord | Message Sutando from Discord (DM + channel @mentions) | [Developer portal](https://discord.com/developers), then `/discord:configure <token>` |
 | Claude for Chrome | Browser automation — navigate, read pages, fill forms, interact with web apps | [Install extension](https://claude.ai/chrome), log in with the same account as Claude Code |
-| Sutando app (menu bar) | Global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Auto-launches via `startup.sh` |
+| Sutando app (menu bar) | Optional global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) | Build and launch separately; core startup stays headless |
 | OS-supervised health checks | Detect stuck loops, dead watchers, and queue pileups even when core is unresponsive — macOS notifies you when Sutando is broken | `bash src/install-health-check-launchd.sh` (idempotent; uninstall with `--uninstall`) |
 | Multi-machine workspace sync | Run the same agent identity across Mac mini + MacBook + Mac Studio etc.; memory + notes + state stay consistent via a private git repo you own | Create a private vault repo, set `vault.remote_url` in `sutando.config.local.json`, run `bash scripts/sync-workspace.sh --init` once + cron it. See [docs/workspace-sync.md](docs/workspace-sync.md). The legacy `sync-memory.sh` flow is deprecated in v0.3.0 and removed in v0.4.0. |
 
@@ -285,7 +390,7 @@ When running, Sutando exposes these local ports:
 
 ## Keyboard shortcuts
 
-The Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It launches automatically via `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published in [`state/hotkeys.json`](state/hotkeys.json) (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
+The optional Sutando menu bar app (`src/Sutando/`) provides global keyboard shortcuts. It is separate from the headless core and is never built or launched by `startup.sh`. **All shortcuts are configurable** — the bindings below are the shipped *defaults*, published at runtime to `<workspace>/state/hotkeys.json` (the source of truth); override any of them per-machine in `~/.config/sutando/hotkeys.json`.
 
 | Action | Default binding |
 |--------|-----------------|
@@ -303,7 +408,7 @@ On first run:
 1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security
 2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for the **Toggle Voice** hotkey — default ⌃V, see [Keyboard shortcuts](#keyboard-shortcuts))
 
-The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd src/Sutando && swiftc -O -o Sutando main.swift -framework Cocoa -framework Carbon -framework ApplicationServices`
+To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sutando main.swift SutandoConfig.swift RestartCoordinator.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation`, then run `./Sutando`. The app and its accessibility helper are not core boot dependencies.
 
 ---
 
@@ -317,7 +422,20 @@ The binary auto-compiles on `startup.sh` if missing. To compile manually: `cd sr
 - Learns from your corrections and adapts over time
 - Notifies you on Discord and voice when it completes autonomous work
 
-It consumes API quota proportional to how much work it finds to do.
+It consumes API quota proportional to how much work it finds to do. The Claude
+core protects weekly headroom by changing the autonomous loop to a 30-minute
+cadence at 80% 7-day utilization and restoring the configured cadence after the
+quota window resets and an authoritative routed reading confirms recovery. Unavailable
+telemetry reports whether it is stale, rejected, or unrouted while retaining the safer
+cadence. Owner tasks still arrive immediately through the streaming
+watcher while the autonomous loop is throttled.
+
+Autonomous self-development is enabled by default. To run Sutando in a stable
+product context without idle-time code evolution, set
+`SUTANDO_SELF_DEVELOPMENT_ENABLED=0` in `.env` and restart the core. Sutando
+continues to process owner requests, monitor health, and deliver tasks; it only
+stops choosing and executing autonomous improvement work. An explicit
+owner-requested code change is still allowed.
 
 ---
 
@@ -340,6 +458,9 @@ It consumes API quota proportional to how much work it finds to do.
 - **Contacts / Calendar / Reminders** → asked on demand by the features that use them (contact lookup before a call, `gws calendar +agenda`, `reminders.py add/list/complete`). You can grant these when first prompted rather than up front.
 
 See **[SECURITY.md](SECURITY.md)** for full details, best practices, and how to test your setup.
+
+For setup guides, operator runbooks, architecture, protocols, and release
+policy, start at the **[documentation hub](docs/README.md)**.
 
 ---
 

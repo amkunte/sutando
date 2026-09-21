@@ -44,6 +44,15 @@ REPO = Path(__file__).resolve().parent.parent
 # TELEGRAM_BOT_TOKEN must be set or the module aborts at import.
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "dummy-token-for-import-test")
 
+# The bridge resolves channel config during exec_module, and channel_access_path()
+# falls back to the real ~/.claude when the canonical path is missing — so without
+# this the import reads the operator's live allowlist. Seeding matters as much as
+# redirecting: an EMPTY temp root still takes that legacy fallback.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-tg-pending-replies-")
+_cfg_telegram = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_cfg_telegram.mkdir(parents=True, exist_ok=True)
+(_cfg_telegram / "access.json").write_text('{"allowFrom": []}')
+
 
 def _load_module():
     spec = importlib.util.spec_from_file_location("tg", REPO / "src" / "telegram-bridge.py")

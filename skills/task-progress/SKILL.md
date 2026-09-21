@@ -1,6 +1,6 @@
 # task-progress
 
-Sends mid-task progress updates to the channel a task came from (Slack, Discord, or Telegram).
+Sends mid-task progress updates to the channel a task came from (Slack, Discord, Telegram, or an AG2 Space room).
 
 ## Critical rule — if you notify, notify BEFORE any work begins
 
@@ -107,14 +107,46 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 | slack     | `channel_id:`       | `--channel-id`  |
 | discord   | `channel_id:`       | `--channel-id`  |
 | telegram  | `chat_id:`          | `--chat-id`     |
+| ag2space  | `channel_id:`       | `--channel-id`  |
 
 Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
 
+### AG2 Space rooms
+
+A task with `source: ag2space` is a message in an AG2 Space room (its `channel_id`, `!room:server`).
+The same script posts the update in that room:
+
+```bash
+python3 skills/task-progress/scripts/notify.py \
+  --source ag2space --channel-id '!room:server' \
+  --message "Got it, 2 in line before this one."
+```
+
+Any `--source` other than slack/discord/telegram is sent through the remote gateway
+(`channels/<source>/.env` under `$CLAUDE_CONFIG_DIR`, `REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`), the
+transport the AG2 Space task bridge itself uses. The room the task came from is the only room this
+posts to; a queue position ("Got it, right after the one I'm on." / "Got it, N in line before this
+one.") is one line, in that task's own conversation.
+
 ## Supported channels
 
-- **Slack** — `chat.postMessage`, token from `$CLAUDE_CONFIG_DIR/channels/slack/.env` (`SLACK_BOT_TOKEN`)
-- **Discord** — REST v10 messages, token from `$CLAUDE_CONFIG_DIR/channels/discord/.env` (`DISCORD_BOT_TOKEN`)
-- **Telegram** — `sendMessage`, token from `$CLAUDE_CONFIG_DIR/channels/telegram/.env` (`TELEGRAM_BOT_TOKEN`)
+- **Slack** — `chat.postMessage`, `SLACK_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/slack/.env` → vault**
+- **Discord** — REST v10 messages, `DISCORD_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/discord/.env` → vault**
+- **Telegram** — `sendMessage`, `TELEGRAM_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/telegram/.env` → vault**
+
+All three share one resolver (`src/channel_token.resolve_channel_token`), the same one the bridges
+use, so a token stored only via `vault set` resolves here too. If `src/` is not importable the
+vault tier is skipped rather than raising — a progress notification never fails a task.
+
+### Discord mentions
+
+Discord mention validation is on by default. Use a resolved user snowflake
+(`<@USER_ID>`), not a GitHub-style `@handle`. Before posting, `notify.py`
+checks each user ID through Discord; after posting, it verifies the response's
+`mentions` array. An unresolved mention exits 1 with an agent-visible error.
+
+For intentional plain-text handles that should not ping anyone, pass
+`--no-validate-mentions`.
 
 ## Fail-open
 

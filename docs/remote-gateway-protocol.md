@@ -13,8 +13,15 @@ channel `.env` supplies a token, and is silent otherwise.
 
 ## Configuration
 
-The bridge reads these from the environment (typically sourced from
-`channels/<provider>/.env`):
+The bridge reads these from the environment. `channels/<provider>/.env` is not
+sourced by every launcher, so the bridge also reads that file directly for the
+keys marked *(.env too)* below — an exported value always wins.
+
+Those file reads happen **at import**, so a `.env` edit needs a bridge restart
+to take effect (unlike `REMOTE_TASK_TOKEN`, which is re-read on rotation). In
+the file as in the environment, **presence decides, not truthiness**: a key
+written with an empty value is an explicit "off" and does not fall through to a
+lower-precedence candidate.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
@@ -22,11 +29,17 @@ The bridge reads these from the environment (typically sourced from
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
-| `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`other` for a shared gateway (see Security). |
+| `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
+| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
+| `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
 > **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.
+
+Older installs using `AG2_REMOTE_URL` / `AG2_REMOTE_TOKEN` remain supported by
+both the bridge launcher and the core-independent health-alert sender during
+the compatibility window.
 
 ## Transport
 
@@ -49,21 +62,50 @@ seconds and return as soon as work is available.
 Return `{"tasks": []}` on long-poll timeout. The client uses an HTTP timeout of
 `wait + 10s`, so the server must respond within `wait` seconds.
 
-A task object **must** carry a unique `"id"`. Any additional string fields
-(`task`, `source`, `channel_id`, `user_id`, `priority`, …) are written verbatim
-into the local task file the core consumes.
+A task object **must** carry a unique `"id"`. Recognized string fields
+(`task`, `source`, `channel_id`, `user_id`, `priority`, …) are newline-confined
+and written into the local task file the core consumes. For AG2 Space, the
+broker also supplies its room-policy `access_tier` attestation.
+
+A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
+`unpin`) plus optional `"picker_args"` — a JSON object, either inline or
+already serialized as a string; the bridge writes it as JSON either way. Both
+are written as trusted pre-body headers, because `worker_picker_commands.py`
+reads them with the parser that stops at `task:`. A command the reader cannot
+honour — an unknown verb, args that are not an object, or arguments that do not
+fit the verb — is refused by name rather than resolved from the sentence, and
+the room always comes from `channel_id`, never from `picker_args`. A broker
+that sends no `picker_command` keeps the prose fallback.
+
+An AG2 Space broker may additionally send `"session_scope": "room"`. The
+bridge writes only that exact value as a trusted pre-body header; missing,
+unknown, or malformed values are omitted, preserving the main-session path for
+older brokers, bridges, and Sutando installations. An optional task handler may
+use the header with `source: ag2space` and `channel_id` to select a durable
+room-specific provider session.
 
 ### `POST /v1/tasks/<id>/ack`
 
 Claim/acknowledge a task so the server stops redelivering it.
 
 ```
-body: { "id": "task-123" }
+body: { "id": "task-123", "durable": true }
 ```
 
 The client acks each task as it is accepted. A server with at-least-once
 delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
+
+`durable: true` is sent only once the task file, its media sidecar and the
+in-flight set are all fsync'd, so the task survives a crash of this host. When a
+fresh queue write, its media sidecar, the in-flight set or the pending-ack
+ledger does not commit, the client withholds the ack entirely rather than
+claiming a task it could still lose. The flag is merely absent — a plain ack the
+server should treat as "stop redelivering" and nothing more — when a redelivered
+task is already queued and its durability could not be repaired. Acks that do
+not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
+retires the retry for good, while a bare no-route 404/405 keeps the
+endpoint-unsupported cooldown.
 
 ### `POST /v1/results`
 
@@ -84,9 +126,59 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
 }
 ```
+
+`team-collaborator` tells the AG2 Space control plane that this gateway
+understands the per-agent Collaborator control layered over Team. Gateways
+without it safely keep Team on their prior restricted path.
+
+### `POST /v1/workers` *(optional)*
+
+The worker pool this gateway fronts, pushed when the local advertisement's
+content changes and re-sent every 600 s so a relay that restarted with an empty
+copy heals without an operator. Sent only when the gateway finds a readable
+advertisement; a gateway with no pool never calls it.
+
+```
+body: {
+  "roster_version": <int>,           // monotonic per publisher
+  "live_cores": ["<worker id>", …],  // ids currently serving
+  "dead_cores": ["<worker id>", …],
+  "bindings": { "<room id>": "<worker id>" },  // rooms the owner pinned
+  "ts": <unix seconds>               // when the publisher compiled it
+}
+success: 2xx, body ignored
+```
+
+### `PUT /v1/agents/<mxid>/profile` *(optional)*
+
+The instance's identity card, pushed on the same change signal and cadence as
+the workers snapshot, from the same single read, so the two can never describe
+different revisions. `<mxid>` is percent-encoded as one path segment.
+
+```
+body: {
+  "display": { "name": "<display name>" },
+  "host":    { "host_id": "<short hostname>", "kind": "local" },
+  "workers": { "<worker id>": { "label": "<name>", "runtime": "<runtime>" } }
+             // label always; runtime when the publisher knows it
+}
+success: 2xx, body ignored
+```
+
+The broker REPLACES the profile document, so the gateway sends this only from
+an advertisement it could read in full.
+
+**Unsupported is not an error.** A relay that does not implement either route
+answers `404`, `405` or `501`; the gateway logs once and stops trying for an
+hour. Any other failure (5xx, timeout, transport) is retried in five minutes.
+Neither call can fail the task loop: both are handed to a background thread
+AFTER the beat's durable retries, so the next `/v1/tasks` poll is issued while
+a slow push is still in flight and an optional push never delays an
+owner-approved publication. A push still running when the next beat arrives is
+left to finish; that beat's push is skipped, not queued.
 
 ## Media markers (optional)
 
@@ -115,6 +207,18 @@ Credential routing is by parsed exact origin, never string matching:
 Authenticated fetches refuse redirects (a 3xx is a failure), so a
 gateway-controlled URL can never bounce a bearer to another host.
 
+Outbound `[file: …]` markers upload through `POST /v1/rooms/<room>/media`. A
+task the server marked with a `signal` object instead uploads against its own
+lease, `POST /v1/tasks/<id>/media` with `{ "ordinal": 0..9, "filename":
+"<name>", "content_b64": "…" }`, where `<id>` is the id the result is delivered
+under and `ordinal` is the marker's position in the body. The client records
+that mode in `state/remote-task-media[.<instance>].json` before the task is
+queued, so it survives a restart. `409` (content conflicts with an upload the
+server already recorded) and `423` (encrypted room) are reported in-band and
+never retried; a network failure or any 5xx defers the whole result, and the
+retry re-offers the same id, ordinal and bytes so the server can resume rather
+than store a second copy.
+
 ## Delivery + idempotency
 
 - Delivery is assumed **at-least-once**. The client persists its in-flight set
@@ -125,16 +229,27 @@ gateway-controlled URL can never bounce a bearer to another host.
 
 ## Security
 
-- Inbound tasks are **not trusted to set their own access tier.** The bridge
-  stamps every task with the local `REMOTE_TASK_TIER` as the last `access_tier:`
-  line, so a task body cannot forge a higher tier. **Default is `owner`** for the
-  personal-agent model (2026-07-08): the gateway authenticates with its owner's
-  own bearer and the broker owner-scopes every pull, so its tasks are the
-  owner's own (e.g. voice delegations); trust derives from the broker's
-  owner-scoping, not from the gateway process or the task's claim. A **shared /
-  multi-user gateway** (one that could pull tasks not scoped to a single owner)
-  MUST set `REMOTE_TASK_TIER=team` (or `other`) explicitly. An invalid value
-  fails **closed** to `team`.
+- Inbound message text is **not trusted to set its own access tier.** Effective
+  access is the lower of the broker-attested room tier and the owner-controlled
+  local cap (`REMOTE_TASK_TIER`, optionally narrowed per sender by
+  `channels/ag2space/access.json` `tierMap`). Missing or invalid broker values
+  fail closed to Guest. Every serialized wire field is newline-confined, and the
+  bridge emits the resolved `access_tier:` independently, so message text cannot
+  forge a higher tier.
+- A broker-attested AG2 Space **Team** tier plus exact boolean
+  `collaborator: true` is the explicit trusted-runtime opt-in. The legacy wire
+  tier remains Guest with `requested_access_tier: team`, so older gateways stay
+  restricted. A capable bridge promotes that signed combination and adds one
+  `collaborator: true` line before the task body. A local owner-to-Team cap does
+  not opt a room in; missing/malformed controls fail closed. This setting is
+  controlled per room and per agent rather than by a host-wide environment flag.
+- Collaborator result secret scanning defaults on. An exact broker boolean
+  `sensitive_data_filter: false` adds one trusted pre-body opt-out stamp; missing,
+  malformed, duplicated, or body-authored values keep scanning enabled. The
+  delivery-control-marker guard remains active even when secret scanning is off.
+- The default local cap remains `owner` for the personal-agent model. A shared /
+  multi-user gateway SHOULD set a lower local cap as defense in depth. Invalid
+  local cap values fail closed to Guest.
 - The token is a per-host credential; keep it in the channel `.env`
   (host-local), not in the synced workspace.
 

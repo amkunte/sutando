@@ -212,7 +212,8 @@ def test_service_registry_full_desktop_set():
                      "discord-bridge", "slack-bridge", "telegram-bridge"):
         assert expected in ids, expected
     for s in reg:
-        assert s["probe"][0] in ("alive_file", "pidfile", "port", "process")
+        assert s["probe"][0] in ("alive_file", "pidfile", "port", "process",
+                                 "gateway", "watcher_sentinels")
     # a full build over the real registry must not raise and covers every kind
     payload = ss.build_payload(reg, 1.0, pid_alive=lambda p: False,
                                connect=lambda p: False, pgrep=lambda pat: [])
@@ -300,6 +301,135 @@ def test_run_forever_single_iteration_then_shutdown():
         m.emit_once = orig
         m._SHUTDOWN_REQUESTED = False
 
+
+def _sidecar(connected, ts_offset=0.0, now=None, last_ok_offset=None):
+    """Write a gateway-status.json sidecar and return its path."""
+    now = time.time() if now is None else now
+    body = {"connected": connected, "ts": now + ts_offset}
+    if last_ok_offset is not None:
+        body["last_ok_ts"] = now + last_ok_offset
+    d = Path(tempfile.mkdtemp())
+    p = d / "gateway-status.json"
+    p.write_text(json.dumps(body))
+    return p
+
+
+def test_gateway_connected_without_last_ok_is_offline():
+    """`connected` with no completed poll is not serving. This is the shape a
+    dead bridge's own final write leaves behind — the dashboard rendered it
+    `running / connected` while nothing was delivered."""
+    now = time.time()
+    p = _sidecar(True, ts_offset=-5, now=now)          # deliberately no last_ok_ts
+    status, detail, since = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: [])
+    assert status == "offline", (status, detail)
+    assert since is None, since
+    assert "no successful poll" in detail, detail
+
+
+def test_gateway_sidecar_connected_is_running():
+    now = time.time()
+    # last_ok_offset is required: without it the fixture is a never-polled lane,
+    # not the "sidecar beats pgrep" case this test pins.
+    p = _sidecar(True, ts_offset=-5, now=now, last_ok_offset=-5)
+    status, detail, _ = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: [])
+    # pgrep says NO process, yet the sidecar says connected → sidecar wins.
+    assert status == "running", (status, detail)
+    assert "connected" in detail
+
+
+def test_gateway_sidecar_disconnected_is_offline_even_with_a_live_process():
+    """The regression this guards: a healthy PROCESS is not a serving connection."""
+    now = time.time()
+    p = _sidecar(False, ts_offset=-5, now=now, last_ok_offset=-3600)
+    status, detail, since = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: ["78594"])
+    assert status == "offline", (status, detail)
+    assert "not serving" in detail
+    assert "3600s" in detail
+    assert since is not None
+
+
+def test_gateway_disconnected_without_last_ok_still_offline():
+    """A bridge that has NEVER connected has no last_ok_ts — still offline, no crash."""
+    now = time.time()
+    p = _sidecar(False, ts_offset=-5, now=now)          # note: no last_ok_ts
+    status, detail, since = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: ["999"])
+    assert status == "offline", (status, detail)
+    assert detail == "not serving"
+    assert since is None
+
+
+def test_gateway_stale_sidecar_falls_back_to_process():
+    now = time.time()
+    p = _sidecar(True, ts_offset=-(ss.GATEWAY_STATUS_TTL_S + 60), now=now)
+    # Sidecar claims connected but is too old to trust → pgrep answers.
+    status, detail, _ = ss.probe_gateway(p, "bridge", now, pgrep=lambda pat: [])
+    assert status == "offline"
+    assert "no process" in detail
+
+
+def test_gateway_missing_sidecar_falls_back_to_process():
+    now = time.time()
+    missing = Path(tempfile.mkdtemp()) / "absent.json"
+    status, detail, _ = ss.probe_gateway(missing, "bridge", now, pgrep=lambda pat: ["4242"])
+    assert status == "running"
+    assert "4242" in detail  # pre-sidecar behaviour preserved
+
+
+def test_gateway_malformed_sidecar_falls_back_to_process():
+    d = Path(tempfile.mkdtemp()); p = d / "gateway-status.json"
+    p.write_text("not json at all")
+    status, detail, _ = ss.probe_gateway(p, "bridge", time.time(), pgrep=lambda pat: ["7"])
+    assert status == "running"
+    assert "7" in detail
+
+
+def test_registry_gateway_uses_the_sidecar_probe():
+    spec = next(s for s in ss.service_registry() if s["id"] == "gateway")
+    assert spec["probe"][0] == "gateway", spec["probe"]
+    assert spec["probe"][1] == ss.GATEWAY_STATUS_PATH
+
+
+
+def test_watcher_row_aggregates_every_instance_sentinel():
+    """Reporting the FIRST sentinel answers about one instance, and is wrong in
+    both directions on a pool: a dead historic pid beside a live worker read
+    `offline`, and a live historic pid beside a dead worker read `running`."""
+    import tempfile
+    two = {"watch-tasks-stream.pid": "100", "watch-tasks-stream-worker-1.pid": "200"}
+
+    def probe(files, alive):
+        td = Path(tempfile.mkdtemp())
+        for n, txt in files.items():
+            (td / n).write_text(txt)
+        return ss.probe_watcher_sentinels(td, lambda pid: pid in alive)[:2]
+
+    assert probe(two, {200})[0] == "degraded"
+    assert probe(two, {100})[0] == "degraded"
+
+    # An unmixed set, and a single-instance host, keep their exact verdicts.
+    assert probe(two, {100, 200})[0] == "running"
+    assert probe(two, set())[0] == "offline"
+    assert probe({"watch-tasks-stream.pid": "100"}, {100})[0] == "running"
+    assert probe({"watch-tasks-stream.pid": "100"}, set())[0] == "offline"
+    assert probe({}, set()) == ("offline", "no pidfile")
+    # `unknown` outranks `offline` when nothing is up: an unreadable sentinel
+    # is a question, and "offline" would answer it.
+    assert probe({"watch-tasks-stream.pid": "xx"}, set())[0] == "unknown"
+    mixed_unreadable = {"watch-tasks-stream.pid": "xx", "watch-tasks-stream-w.pid": "200"}
+    assert probe(mixed_unreadable, set())[0] == "unknown"
+    assert probe(mixed_unreadable, {200})[0] == "degraded"
+
+
+def test_the_degraded_detail_names_which_instance_is_down():
+    """A row saying only "1 of 2 up" sends the reader to guess which."""
+    import tempfile
+    td = Path(tempfile.mkdtemp())
+    (td / "watch-tasks-stream.pid").write_text("100")
+    (td / "watch-tasks-stream-worker-1.pid").write_text("200")
+    status, detail, _ = ss.probe_watcher_sentinels(td, lambda pid: pid == 200)
+    assert status == "degraded"
+    assert "watch-tasks-stream.pid" in detail
+    assert "100" in detail and "200" in detail
 
 if __name__ == "__main__":
     # Minimal assert-runner so the file is self-executing without pytest too.

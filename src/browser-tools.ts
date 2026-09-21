@@ -1,16 +1,25 @@
 /**
  * Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
  * Split from inline-tools.ts for readability.
+ *
+ * macOS-only: every tool here drives Google Chrome through AppleScript. On
+ * Windows the tools degrade to a `macOSOnly` error so Gemini knows to fall
+ * back to telling the user instead of silently no-op'ing.
  */
 
 import { execSync, execFileSync } from 'node:child_process';
-import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { resolveCredential } from './credential-resolver.js';
+import { writeFileSync, unlinkSync, readFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
+import { isMacOS, isWindows, macOSOnlyError, resizeImage } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
+import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
+import { withScheme } from './url-scheme.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -33,6 +42,19 @@ export function injectText(session: any, text: string) {
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
 const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite';
 
+/** Accessibility trust as System Events reports it, memoized per process.
+ *  OBSERVATION ONLY — nothing branches on this; see the call site's comment. */
+let _axTrustedCache: boolean | null | undefined;
+function axTrusted(): boolean | null {
+	if (_axTrustedCache !== undefined) return _axTrustedCache;
+	try {
+		const out = execSync(`osascript -e 'tell application "System Events" to return UI elements enabled'`,
+			{ timeout: 3_000 }).toString().trim();
+		_axTrustedCache = out === 'true' ? true : out === 'false' ? false : null;
+	} catch { _axTrustedCache = null; }
+	return _axTrustedCache;
+}
+
 // --- Scroll ---
 
 export const scrollTool: ToolDefinition = {
@@ -47,6 +69,7 @@ export const scrollTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { direction, amount, target: _rawTarget } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		if (!isMacOS()) return macOSOnlyError('scroll');
 		// "window"/"page"/"main" etc. mean the MAIN page, not a CSS selector. The model
 		// habitually passes target:"window" (2026-06-09 live test): the selector branch
 		// matched nothing, its <500px-wide fallback skipped GitHub's full-width scroller,
@@ -65,6 +88,12 @@ export const scrollTool: ToolDefinition = {
 			console.log(`${ts()} [Scroll] frontApp=${frontApp} direction=${direction} isChrome=${isChrome}`);
 
 			let _scrollMoved: boolean | null = null;  // null = couldn't determine (no AppleEvent result)
+			// Setup faults the OS already explained, surfaced when nothing scrolled.
+			const _hints: string[] = [];
+			const _noteHint = (e: unknown) => {
+				const h = setupHint(e instanceof Error ? e.message : String(e));
+				if (h && !_hints.includes(h)) _hints.push(h);
+			};
 			if (isChrome && !target) {
 				// Chrome: try EACH scrollable element (widest first) until one ACTUALLY
 				// MOVES, then fall back to window scroll. The old code scrolled only the
@@ -91,7 +120,7 @@ export const scrollTool: ToolDefinition = {
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				let _out = '';
 				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
-				catch (e) { console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
+				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
 				if (_out) {
 					try {
@@ -118,7 +147,7 @@ export const scrollTool: ToolDefinition = {
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				let _out = '';
 				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
-				catch (e) { console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
+				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
 				try {
 					const d = JSON.parse(_out);
@@ -129,19 +158,20 @@ export const scrollTool: ToolDefinition = {
 
 			// Keyboard scroll on the frontmost app (works in any app, no focus steal)
 			const keyCode = direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down';
+			let _keyDenied = false;
 			try {
 				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}'`, { timeout: 3_000 });
-			} catch { /* keyboard fallback is best-effort */ }
+			} catch (e) { _noteHint(e); _keyDenied = true; }
 
 			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
-			// Honest result: if the JS pass found nothing moved (page already at the
-			// direction's limit), say so instead of falsely claiming a scroll — so the
-			// model can tell the user "looks like we're at the bottom" rather than insist.
-			if (_scrollMoved === false) {
-				return { status: 'at_limit', direction, app: frontApp, moved: false,
-				         message: `Nothing scrolled — the page appears to be at the ${direction === 'down' ? 'bottom' : direction === 'up' ? 'top' : direction}. Tell the user it can't scroll further that way.` };
+			// Record the probe wherever the scroll was NOT positively confirmed: on a host
+			// with Accessibility off, `axTrusted=false moved=null denied=false` is the
+			// observation this bug cannot be fixed without.
+			if (_scrollMoved !== true) {
+				console.log(`${ts()} [Scroll] probe: axTrusted=${axTrusted()} moved=${_scrollMoved} denied=${_keyDenied} hints=${_hints.length}`);
 			}
-			return { status: 'scrolled', direction, app: frontApp, moved: _scrollMoved };
+			return { ...scrollOutcome({ scrollMoved: _scrollMoved, keyDenied: _keyDenied, hints: _hints, direction }),
+			         direction, app: frontApp };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -170,6 +200,7 @@ export const switchTabTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { keyword } = args as { keyword: string };
+		if (!isMacOS()) return macOSOnlyError('switch_tab');
 		// Resolve aliases to URL patterns
 		const alias = TAB_ALIASES[keyword.toLowerCase()];
 		const searchTerms = alias ? [keyword, alias] : [keyword];
@@ -253,6 +284,7 @@ export const closeTabTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('close_tab');
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to close active tab'`, { timeout: 5_000 });
 			console.log(`${ts()} [CloseTab] closed active tab`);
@@ -287,6 +319,7 @@ export const openUrlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { url: rawUrl } = args as { url: string };
+		if (!isMacOS()) return macOSOnlyError('open_url');
 		// Normalize spoken-URL artifacts before handing to osascript. The LLM
 		// sometimes passes a URL with surrounding whitespace from voice
 		// transcription, or with embedded spaces that AppleScript / Chrome
@@ -312,11 +345,14 @@ export const openUrlTool: ToolDefinition = {
 			console.log(`${ts()} [OpenURL] rejected url with zero-width char: ${redactQuery(url)}`);
 			return { error: `Failed to open: URL contains zero-width character (got ${JSON.stringify(url)})` };
 		}
+		// AppleScript rejects a bare host ("Invalid URL entered. (5)"); only the
+		// omnibox infers a scheme, and this tool advertises the bare-host form.
+		const target = withScheme(url);
 		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		const safeUrl = target.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		// Parse target origin (scheme + host + port). If unparseable, fall back to new-tab behavior.
 		let targetOrigin = '';
-		try { targetOrigin = new URL(url).origin; } catch { /* not a real URL, e.g. "about:blank" — let Chrome handle */ }
+		try { targetOrigin = new URL(target).origin; } catch { /* not a real URL, e.g. "about:blank" — let Chrome handle */ }
 		try {
 			// Query active-tab URL to decide reuse vs new-tab. If origin matches, set URL on active
 			// tab; otherwise open a new tab. Falls back to new-tab on any error so callers never
@@ -338,16 +374,16 @@ export const openUrlTool: ToolDefinition = {
 			if (!reused) {
 				execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
 			}
-			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${url}`);
-			return { status: reused ? 'reused' : 'opened', url };
+			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${target}`);
+			return { status: reused ? 'reused' : 'opened', url: target };
 		} catch (err) {
 			// Log the URL too — the prior version returned the URL only in the
 			// error string, which voice-agent's stdout strips by the time it
 			// reaches the log, leaving "Invalid URL entered. (5)" with no
 			// hint of what URL voice actually passed. 2026-05-19 incident:
 			// three back-to-back open_url failures with no observable arg.
-			console.log(`${ts()} [OpenURL] FAILED url=${redactQuery(url)} err=${err instanceof Error ? err.message : err}`);
-			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
+			console.log(`${ts()} [OpenURL] FAILED url=${redactQuery(target)} err=${err instanceof Error ? err.message : err}`);
+			return { error: `Failed to open ${target}: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
@@ -362,16 +398,13 @@ export const openUrlTool: ToolDefinition = {
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
-		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
-		const safePath = imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
+		// Windows paths reach PowerShell through the environment, so only the sips argv is sanitized.
+		const safePath = isWindows() ? imagePath : imagePath.replace(/[^a-zA-Z0-9_\-./]/g, '');
 		const resized = safePath.endsWith('.png') ? safePath.replace(/\.png$/, '-sm.jpg') : safePath + '-sm.jpg';
-		try {
-			execFileSync('sips', ['-Z', '800', '-s', 'format', 'jpeg', safePath, '--out', resized], { timeout: 2_000, stdio: 'ignore' });
-		} catch { /* use original if resize fails */ }
-		const actualPath = existsSync(resized) ? resized : imagePath;
+		const actualPath = resizeImage(safePath, resized, 800, 2_000) ? resized : imagePath;
 		const mimeType = actualPath.endsWith('.jpg') ? 'image/jpeg' : 'image/png';
 		const imageData = readFileSync(actualPath).toString('base64');
 		// Issue #189: when continuing a narration, the vision model should build
@@ -463,6 +496,7 @@ export const clickTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { x, y, shortcut } = args as { x?: number; y?: number; shortcut?: string };
+		if (!isMacOS()) return macOSOnlyError('click');
 		try {
 			if (shortcut) {
 				// Parse shortcut like "cmd+shift+5"
@@ -534,9 +568,10 @@ export const pointAtTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { query } = args as { query: string };
+		if (!isMacOS()) return macOSOnlyError('point_at');
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
-		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		const apiKey = resolveCredential('gemini-voice').key;
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {
@@ -559,16 +594,10 @@ export const pointAtTool: ToolDefinition = {
 			if (!capRes.ok) return { error: `point_at capture HTTP ${capRes.status}` };
 			const cap = await capRes.json() as { status: string; path?: string; error?: string };
 			if (cap.status !== 'ok' || !cap.path) return { error: `point_at capture failed: ${cap.error || 'unknown'}` };
-			// Downscale; sips -Z preserves aspect, so 0–1 normalized coords map
-			// straight onto the display with no extra transform (open item #2).
-			// Per-invocation temp path + success flag so a failed sips can never
-			// feed a stale screenshot from a previous call into the model.
-			const small = `/tmp/pointer-shot-${process.pid}-${Date.now()}.jpg`;
-			let resized = false;
-			try {
-				execFileSync('sips', ['-s', 'format', 'jpeg', '-Z', '1568', cap.path, '--out', small], { timeout: 4_000, stdio: 'ignore' });
-				resized = existsSync(small);
-			} catch { /* fall back to the full-size capture below */ }
+			// Aspect-preserving downscale keeps 0–1 normalized coords valid on the display.
+			// Per-invocation temp path so a failed resize can never feed a stale frame.
+			const small = join(tmpdir(), `pointer-shot-${process.pid}-${Date.now()}.jpg`);
+			const resized = resizeImage(cap.path, small, 1568);
 			const imgPath = resized ? small : cap.path;
 			const imageData = readFileSync(imgPath).toString('base64');
 			if (resized) { try { unlinkSync(small); } catch { /* best-effort cleanup */ } }
@@ -665,4 +694,3 @@ export {
 	onCallEnd,
 	startRecordingNarration,
 } from './recording-tools.js';
-

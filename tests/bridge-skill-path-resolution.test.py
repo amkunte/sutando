@@ -28,7 +28,9 @@ Run: python3 tests/bridge-skill-path-resolution.test.py   (exit 0 pass / 1 fail)
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -51,7 +53,12 @@ _ccd = tempfile.mkdtemp(prefix="sutando-ccd-")
 _notify_rel = ("skills", "task-progress", "scripts", "notify.py")
 _notify_abs = Path(_ccd, *_notify_rel)
 _notify_abs.parent.mkdir(parents=True, exist_ok=True)
-_notify_abs.write_text("# fake notify.py for the existence gate\n")
+_notify_marker = _notify_abs.with_name("seen-claude-config-dir.txt")
+_notify_abs.write_text(
+    "import os\n"
+    "from pathlib import Path\n"
+    f"Path({str(_notify_marker)!r}).write_text(os.environ.get('CLAUDE_CONFIG_DIR', ''))\n"
+)
 
 _ws = tempfile.mkdtemp(prefix="sutando-ws-")
 os.environ["CLAUDE_CONFIG_DIR"] = _ccd
@@ -103,11 +110,21 @@ TASKS_DIR.mkdir(parents=True, exist_ok=True)
 mod.TASKS_DIR = TASKS_DIR
 
 
+_TS_SEQ = itertools.count(1)
+
+
 def write_task(text: str, user_id: str = "U_OWNER", tier_map: dict | None = None) -> Path | None:
-    """Call _write_task with access control mocked; return the written file path."""
-    event = {"user": user_id, "channel": "CFAKE", "channel_type": "im", "ts": "1000.001"}
+    """Call _write_task with access control mocked; return the written file path.
+
+    ts is unique per call: the ingress replay-dedup (already_admitted) drops a
+    second admission of the same provider ts as a replay.
+    """
+    event = {"user": user_id, "channel": "CFAKE", "channel_type": "im",
+             "ts": f"1000.{next(_TS_SEQ):03d}"}
+    effective_tier_map = tier_map if tier_map is not None else {user_id: "owner"}
     with patch.object(mod, "load_allowed", lambda: {user_id}), \
-         patch.object(mod, "load_tier_map", lambda: (tier_map or {})):
+         patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \
+         patch.object(mod, "load_tier_map", lambda: effective_tier_map):
         task_id = mod._write_task(event, "DM", text, "testowner")
     if not task_id:
         return None
@@ -129,6 +146,31 @@ if p_owner:
     check(
         "owner task: notify path is NOT the ~/.claude default",
         str(Path.home() / ".claude" / "skills" / "task-progress") not in body,
+    )
+    notify_line = next(
+        line for line in body.splitlines() if "NOTIFY FIRST:" in line
+    )
+    notify_command = notify_line.split("NOTIFY FIRST:", 1)[1].strip()
+    clean_env = os.environ.copy()
+    clean_env.pop("CLAUDE_CONFIG_DIR", None)
+    clean_env.pop("CLAUDE_HOME", None)
+    ran = subprocess.run(
+        notify_command,
+        shell=True,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check(
+        "owner task: injected NOTIFY command runs without inherited CLAUDE_CONFIG_DIR",
+        ran.returncode == 0,
+        ran.stderr,
+    )
+    check(
+        "owner task: injected NOTIFY command restores resolved CLAUDE_CONFIG_DIR",
+        _notify_marker.exists() and _notify_marker.read_text() == _ccd,
+        "generated command did not propagate the bridge-resolved config dir",
     )
 
 # ── (3) skill-existence gate: owner, but skill absent → no NOTIFY line ────────
