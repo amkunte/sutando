@@ -7758,6 +7758,9 @@ def check_daily_cron_punctuality() -> dict:
         # and never sees its real fleet-growth-<date>.mp4 output.
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
+        # A job may leave its dated artifact outside results/ — morning-briefing
+        # writes notes/briefings/, a NON-polled path, deliberately.
+        art_dir = str(e.get("artifact_dir") or "results").strip() or "results"
         launchd = bool(e.get("launchd"))
         # Each lane is a preference, not a restriction: `launchd` says how a job is
         # SCHEDULED, which does not determine what dated evidence it leaves behind.
@@ -7766,8 +7769,8 @@ def check_daily_cron_punctuality() -> dict:
         today_str = now.strftime("%Y-%m-%d")
         lane_thunks = [
             (lambda: (_daily_completion_minutes(ws / "state", jname) if launchd
-                      else _daily_artifact_minutes(ws / "results", stem)), not launchd),
-            (lambda: (_daily_artifact_minutes(ws / "results", stem) if launchd
+                      else _daily_artifact_minutes(ws / art_dir, stem)), not launchd),
+            (lambda: (_daily_artifact_minutes(ws / art_dir, stem) if launchd
                       else _daily_completion_minutes(ws / "state", jname)), launchd),
             (lambda: _daily_task_record_minutes(ws / "results", jname), False),
         ]
