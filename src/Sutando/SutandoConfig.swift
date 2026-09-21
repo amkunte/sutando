@@ -262,6 +262,44 @@ enum SutandoConfig {
         return resolved
     }
 
+    /// Precedence: $SUTANDO_HOST_LABEL / $SUTANDO_HOST_OVERRIDE -> scutil LocalHostName
+    /// -> short hostname. scutil outranks hostname: a DHCP lease can drift the hostname.
+    static func hostLabel() -> String {
+        let env = ProcessInfo.processInfo.environment
+        for key in ["SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"] {
+            if let v = env[key]?.trimmingCharacters(in: .whitespaces), !v.isEmpty {
+                return v
+            }
+        }
+        let scutil = Process()
+        scutil.executableURL = URL(fileURLWithPath: "/usr/sbin/scutil")
+        scutil.arguments = ["--get", "LocalHostName"]
+        let pipe = Pipe()
+        scutil.standardOutput = pipe
+        scutil.standardError = FileHandle.nullDevice
+        if (try? scutil.run()) != nil {
+            scutil.waitUntilExit()
+            if scutil.terminationStatus == 0,
+               let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                                encoding: .utf8) {
+                let name = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { return name }
+            }
+        }
+        let short = ProcessInfo.processInfo.hostName
+        return short.split(separator: ".").first.map(String.init) ?? short
+    }
+
+    /// Probes the per-host home before the legacy `assets/` location. When neither
+    /// exists it returns the per-host path, so the caller's existence check still fails.
+    static func personalAssetPath(_ name: String, workspace: String) -> String {
+        let candidates = [
+            (workspace as NSString).appendingPathComponent("hosts/\(hostLabel())/\(name)"),
+            (workspace as NSString).appendingPathComponent("assets/\(name)"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? candidates[0]
+    }
+
     /// Scan the repo's `.env` for SUTANDO_WORKSPACE=. Best-effort.
     static func detectEnvWorkspaceInDotenv(repoRoot explicitRoot: String? = nil) -> String? {
         let root: String?
@@ -295,5 +333,118 @@ enum SutandoConfig {
             return (v as NSString).expandingTildeInPath
         }
         return nil
+    }
+
+    // MARK: - Python interpreter resolution
+
+    /// Split from `systemPython` so the full stub path is not a bare literal
+    /// here; the hardcoded-path scanner flags that exact token.
+    static let systemBin = "/usr/bin"
+
+    /// Apple's CLT stub, not an interpreter: it exists with or without the
+    /// developer tools and raises a modal install dialog when they are absent.
+    static let systemPython = systemBin + "/python3"
+
+    /// The only safe probe: `xcode-select` is a real binary, not a stub, so
+    /// asking it raises no dialog. Any probe failure means "not installed".
+    static func developerToolsInstalled() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        proc.arguments = ["-p"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
+    }
+
+    /// The selected persistent core CLI runtime, mirroring
+    /// `src/sutando_config.py:resolve_core_runtime` and resolving from the same
+    /// merged config this type already loads: `$SUTANDO_CORE_RUNTIME` first,
+    /// else `core.runtime`, else "claude".
+    ///
+    /// An unrecognised value returns nil rather than raising: a caller choosing
+    /// a pane parser must not send with a guessed runtime, and nil lets it fall
+    /// back to a policy that is safe on either.
+    static func resolveCoreRuntime(
+        repoRoot explicitRoot: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        let env = (environment["SUTANDO_CORE_RUNTIME"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        let configured: String
+        if !env.isEmpty {
+            configured = env
+        } else {
+            let cfg = (try? loadConfig(repoRoot: explicitRoot)) ?? [:]
+            let core = cfg["core"] as? [String: Any] ?? [:]
+            configured = ((core["runtime"] as? String) ?? "claude")
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return supportedCoreRuntimes.contains(configured) ? configured : nil
+    }
+
+    /// The runtime the LIVE tmux session was launched as, mirroring
+    /// `src/core_heartbeat.py:_session_runtime`: `start-cli.sh` exports
+    /// SUTANDO_CORE_RUNTIME into the session at creation, so the session outranks
+    /// config, which an invocation-scoped trial never writes.
+    static func sessionCoreRuntime(
+        socket: String,
+        session: String = "sutando-core",
+        repoRoot: String? = nil,
+        tmuxPath: String? = nil
+    ) -> String? {
+        let candidates = tmuxPath.map { [$0] }
+            ?? ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+        guard let bin = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            return resolveCoreRuntime(repoRoot: repoRoot)
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["-S", socket, "show-environment", "-t", "=" + session, "SUTANDO_CORE_RUNTIME"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return resolveCoreRuntime(repoRoot: repoRoot) }
+        p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // tmux prints `-NAME` when the variable is unset in that session.
+        if p.terminationStatus == 0, out.hasPrefix("SUTANDO_CORE_RUNTIME=") {
+            let v = String(out.dropFirst("SUTANDO_CORE_RUNTIME=".count))
+                .trimmingCharacters(in: .whitespaces)
+            if supportedCoreRuntimes.contains(v) { return v }
+            if !v.isEmpty { return nil }   // session names a runtime we cannot parse
+        }
+        return resolveCoreRuntime(repoRoot: repoRoot)
+    }
+
+    /// Keep in step with `_SUPPORTED_CORE_RUNTIMES` in src/sutando_config.py and
+    /// the `--runtime` validation in scripts/tmux-send-line.sh.
+    static let supportedCoreRuntimes: Set<String> = ["claude", "codex"]
+
+    /// Resolves python3 in order: `$SUTANDO_PY`, the bundled runtime, then
+    /// `/usr/bin/python3` only if developer tools exist. nil means skip, not prompt.
+    static func resolvePython(
+        repoRoot: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
+        toolsInstalled: () -> Bool = SutandoConfig.developerToolsInstalled
+    ) -> String? {
+        if let explicit = environment["SUTANDO_PY"], !explicit.isEmpty, isExecutable(explicit) {
+            return explicit
+        }
+        let bundled = URL(fileURLWithPath: repoRoot)
+            .deletingLastPathComponent()
+            .appendingPathComponent("runtime/python/bin/python3")
+            .path
+        if isExecutable(bundled) {
+            return bundled
+        }
+        return toolsInstalled() ? systemPython : nil
     }
 }

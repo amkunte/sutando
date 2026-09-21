@@ -45,7 +45,10 @@
 // Load .env from the project root (3 levels up from this script), not cwd —
 // override: true ensures .env values win over stale shell env vars
 import { config as _dotenvConfig } from 'dotenv';
-_dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
+// fileURLToPath (as used below at _phoneSkillDir) instead of .pathname: URL.pathname
+// stays percent-encoded, so a spaced install path (".../Application Support/...")
+// yields a literal "%20" that points at no file and the .env silently never loads. (#2228)
+_dotenvConfig({ path: fileURLToPath(new URL('../../../.env', import.meta.url)), override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
@@ -54,6 +57,7 @@ import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace, statusReadPath } from '../../../src/workspace_default.js';
+import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
 
 import { execSync, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { isAllowedAudioPath } from './audio_path_guard.js';
@@ -200,15 +204,18 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (34 keys) — injection-guard-sweep
-// asserts this regex covers every py key. Synced on the 2026-07-13 main merge.
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (42 keys) — injection-guard-sweep
+// asserts this regex covers every py key. reply_chain_ids added with PR #2310.
 const _CONF_HEADER_RE = new RegExp(
-	'^(?:id|timestamp|task|source|access_tier|user_id|channel_id|priority|' +
+	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
 	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
-	'sender_name|room_name|parent_message_id|reminder|author_name|author_id|' +
-	'chat_id|thread_ts|reply_to_event|reply_to_me|callSid|caller|from|' +
-	'call_sid|hint|instructions|transcript|content_modalities|media_form|' +
-	'attachments|platform_card)\\s*:',
+	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
+	'author_name|author_id|' +
+	'chat_id|thread_ts|reply_to_event|reply_to_me|reply_to_sender|addressed_to|callSid|caller|from|' +
+	'thread_root|source_room_id|' +
+	'receiving_instance|' +
+	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
+	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
@@ -421,6 +428,19 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 	// confineUserContent() from #1806 — main's version dropped the wrapping.
 	const content = `id: ${taskId}\ntimestamp: ${new Date().toISOString()}\nsource: phone\ninteraction_type: realtime_audio\nmedia_form: live_stream\ncallSid: ${callSession.callSid}\ncaller: ${confineUserContent(callSession.callerNumber || 'unknown')}\naccess_tier: ${callSession.isOwner ? 'owner' : 'other'}\ntask: ${confineUserContent(taskDescription)}\nhint: Check ${skillsHint} for a matching skill before using raw commands.\ntranscript:\n${confineUserContent(fullTranscript)}\n`;
 	writeFileSync(taskPath, content);
+
+	// Anonymous, opt-out product telemetry: count the phone surface. The
+	// discord/slack/telegram bridges emit task_processed at their own accept
+	// points; phone tasks (and the co-located voice/chat paths) were the gap.
+	// Shell out to src/telemetry.py — one source of truth, no-ops when opted
+	// out / unconfigured. Fire-and-forget: detached + unref so it never blocks
+	// or delays the live call; source is always "phone" here.
+	try {
+		const telemetryPy = join(dirname(_phoneSkillDir), '..', 'src', 'telemetry.py');
+		spawn('python3', [telemetryPy, 'task_processed', 'phone'], { detached: true, stdio: 'ignore' })
+			.on('error', () => { /* telemetry must never break the call */ })
+			.unref();
+	} catch { /* telemetry must never break the call */ }
 
 	// Poll for result in background, inject when ready — don't block Gemini
 	const POLL_TIMEOUT_MS = 300_000; // 5 min — watcher gaps can cause delays
@@ -1077,7 +1097,7 @@ function cleanupCall(callSid: string): void {
 	try { if (session.channelScanHandle) clearInterval(session.channelScanHandle); } catch {}
 	try { if (session.progressNarrPoller) clearInterval(session.progressNarrPoller); } catch {}
 	try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-	try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+	try { unlinkSync(PLAYBACK_PATH); } catch {}
 
 	// Restore vision session to the prior (likely web) session before tearing
 	// down the call's VoiceSession so push-mode frames don't get sent to a

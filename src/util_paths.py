@@ -19,10 +19,16 @@ Usage:
 """
 from __future__ import annotations
 import os
+import re
 import socket
 import subprocess
 import sys
 from pathlib import Path
+
+# The sibling import must resolve both top-level (src/ on sys.path) and
+# package-style (`src.util_paths`), where src/ itself is not on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sutando_config import config_get, config_get_env_first  # noqa: E402
 
 def _memory_dir_env() -> str | None:
     """Return the resolved memory-dir env value, preferring the new name.
@@ -35,7 +41,7 @@ def _memory_dir_env() -> str | None:
 
     Returns the raw env value (caller must `os.path.expanduser` if needed),
     or None when neither is set."""
-    new = os.environ.get("SUTANDO_MEMORY_DIR")
+    new = config_get_env_first("SUTANDO_MEMORY_DIR")
     if new:
         return new
     legacy = os.environ.get("SUTANDO_PRIVATE_DIR")
@@ -88,8 +94,22 @@ def _workspace_root() -> Path:
             pass
         # Last-ditch default: the canonical post-v0.8 home-dir location
         # (~/sutando-workspace, matching sutando_config.py resolve_workspace) —
-        # NOT the pre-v0.8 dotted ~/.sutando/workspace, which no longer exists.
+        # The pre-v0.8 dotted path is no longer RESOLVED to, but may still exist
+        # and still take writes — health-check reports that divergence.
         return Path.home() / "sutando-workspace"
+
+
+def legacy_dotted_workspace() -> Path:
+    """The pre-v0.8 dotted workspace dir. NOT resolved to any more — but it can
+    still exist on disk and still take writes, which is why one file owns the
+    literal instead of each caller writing it fresh."""
+    return Path.home() / ".sutando" / "workspace"
+
+
+def legacy_dotted_workspace_path(*subpath: str) -> Path:
+    """Subpath under `legacy_dotted_workspace()`, which owns the literal.
+    Reaches unmigrated pre-v0.8 content; never resolves the live workspace."""
+    return legacy_dotted_workspace().joinpath(*subpath)
 
 
 def _host_label() -> str:
@@ -110,7 +130,16 @@ def _host_label() -> str:
     `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
     conventions stay in lockstep. Kept in lockstep with `_host()` in
     sync-workspace.sh (same precedence)."""
-    env = os.environ.get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    env = config_get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    # Strip before testing: a blank-but-set override (`SUTANDO_HOST_LABEL=" "`,
+    # trivially produced by an unquoted expansion in a launcher) is truthy in
+    # Python, so `if env:` returned the whitespace itself as the label. That
+    # yields `hosts/   /` and `state/cores/   .alive` — the same per-host path
+    # split as the 2026-06-22 DHCP-drift incident above, but self-inflicted and
+    # far harder to spot in a directory listing. Blank means "not set": fall
+    # through to scutil/hostname. Matches SutandoConfig.hostLabel() in
+    # src/Sutando/main.swift, which already trims.
+    env = (env or "").strip()
     if env:
         return env
     try:
@@ -154,7 +183,8 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     Returns the FIRST existing path. If none exist, returns the preferred
     private-dir path so the caller's `.exists()` check fails gracefully.
     """
-    ws = workspace if workspace is not None else _workspace_root()
+    explicit_ws = workspace is not None
+    ws = workspace if explicit_ws else _workspace_root()
 
     # New per-host canonical home (workspace-as-git-repo, #1717). Probed first
     # so relocated files are found; absent → falls through to legacy order.
@@ -179,8 +209,31 @@ def personal_path(filename: str, workspace: Path | None = None) -> Path:
     if p.exists():
         return p
 
-    # Nothing exists; return preferred (private if configured, else workspace)
+    # Nothing exists — this is the path the caller will CREATE. It must stay
+    # inside the workspace the caller named, or their isolation is a fiction.
+    #
+    # The read probes above may legitimately return a legacy machine-<host>/
+    # file: that is the migration fallback and it is load-bearing while those
+    # files still exist. But the WRITE destination is a different question, and
+    # answering it from $SUTANDO_MEMORY_DIR ignored the argument entirely — so
+    # `personal_path("x.md", <fresh tmp>)` handed back a path in the operator's
+    # real, vault-SYNCED memory tree. A test that passed a tmpdir believing it
+    # was isolated wrote into Chi's vault instead; ALPHA/BRAVO fixtures reached
+    # it that way (#2452). Passing a tmpdir is not isolation unless the resolved
+    # path is actually inside it.
+    #
+    # When no workspace was passed the caller has accepted ambient resolution,
+    # so the env-based private dir remains correct and behavior is unchanged.
+    # The escape exists ONLY when a private dir is configured: that is the branch
+    # that answered from the environment instead of from `ws`. When it is None the
+    # code already fell through to `ws / filename`, which is inside the workspace
+    # and needs no change — and `tests/util-paths-hosts-resolution.test.py` pins
+    # that as a deliberate #1717 decision ("the fix is read-side only; write
+    # target is untouched"). So keep the write target where #1717 put it, the
+    # workspace root, and change only WHOSE workspace answers.
     if private is not None:
+        if explicit_ws:
+            return ws / filename
         return private / filename
     if filename in {"stand-avatar.png"}:
         return ws / "assets" / filename
@@ -237,7 +290,7 @@ def shared_personal_path(filename: str, workspace: Path | None = None) -> Path:
 # `~/.claude/`. Does NOT create the dir.
 # ---------------------------------------------------------------------------
 
-def claude_home_path(*subpath: str) -> Path:
+def claude_home_path(*subpath: str, vanilla: bool = False) -> Path:
     """Resolve a path under Claude Code's per-user home (`~/.claude/` by default).
 
     Pass subpath components positionally, e.g.:
@@ -252,6 +305,17 @@ def claude_home_path(*subpath: str) -> Path:
       2. $CLAUDE_HOME (legacy alt-host override, kept for tests).
       3. ~/.claude/ (default — vanilla `claude` users).
 
+    `vanilla=True` asks a DIFFERENT question: where does *stock* Claude Code
+    keep this, regardless of where Sutando relocated its own config? It skips
+    $CLAUDE_CONFIG_DIR entirely and reads $SOURCE_CLAUDE_CONFIG_DIR (the name
+    the note below already gives that location) before the default. Use it ONLY
+    to read state written by a tool that hardcodes the stock home and does not
+    honour $CLAUDE_CONFIG_DIR — that surface stays as countable as this one.
+    A caller who wants the relocated dir wants the default form; collapsing the
+    two is the bug sonichi#2629 is about, where the official discord plugin
+    wrote approval markers to the stock home and the bridge read the relocated
+    one, so confirmations were silently never sent.
+
     The CLAUDE_CONFIG_DIR check goes first because for a claude-sutando
     install, that's where settings, sessions, channels, skills, and memory
     actually live post-migrate. The CLAUDE_HOME hatch still works for tests
@@ -264,52 +328,69 @@ def claude_home_path(*subpath: str) -> Path:
     RUNTIME path resolution. Migration code uses SOURCE_CLAUDE_CONFIG_DIR
     directly to keep the read-side / write-side distinction visible.
     """
-    ccd_env = os.environ.get("CLAUDE_CONFIG_DIR")
-    home_env = os.environ.get("CLAUDE_HOME")
+    ccd_env = None if vanilla else os.environ.get("CLAUDE_CONFIG_DIR")
+    home_env = (os.environ.get("SOURCE_CLAUDE_CONFIG_DIR") if vanilla
+                else config_get_env_first("CLAUDE_HOME"))
     if ccd_env:
         base = Path(os.path.expanduser(ccd_env))
     elif home_env:
         base = Path(os.path.expanduser(home_env))
     else:
-        _emit_claude_home_fallback_banner_once()
+        # `vanilla=True` landing here is the CORRECT answer, not a fallback, so
+        # it must not fire the "nothing is configured" banner.
+        if not vanilla:
+            _emit_claude_home_fallback_banner_once()
         base = Path.home() / ".claude"
     if not subpath:
         return base
     return base.joinpath(*subpath)
 
 
-def channel_access_path(source: str) -> Path:
-    """Resolve `channels/<source>/access.json` with the ~30-day legacy fallback.
+def claude_project_slug(path: str | Path) -> str:
+    """Derive the project slug Claude Code uses under `projects/<slug>/`.
 
-    Prefer the canonical claude_home_path() location. If that file does NOT
-    exist but the pre-migration `~/.claude/channels/<source>/access.json`
-    does, return the legacy path and emit a one-line stderr deprecation
-    warning — per the CLAUDE.md migration policy (readers prefer canonical,
-    fall back to legacy for ~30 days).
-
-    Why this exists: bridges restarted under a fresh $CLAUDE_CONFIG_DIR
-    before the channel-bridge migrate step copies channels/ would otherwise
-    see no access.json at all — Telegram/Slack then re-arm TOFU onboarding
-    and the next DM sender auto-enrolls as owner. Falling back to the
-    populated legacy allowlist keeps access control continuous across the
-    migration window. Writers (TOFU onboarding, /discord:access) use the
-    same resolved path, so the legacy file stays the single source of truth
-    until it is actually migrated.
+    Claude Code dashes every non-alphanumeric character of the path, not
+    just "/" — matching only "/" resolves to a nonexistent dir on any path
+    containing a space or dot (e.g. a desktop-bundled checkout under
+    "Application Support/space.ag2.app/"). Every caller must derive the slug
+    through this one function rather than re-implementing the regex, so the
+    derivation can't drift out of sync again.
     """
-    canonical = claude_home_path("channels", source, "access.json")
-    if canonical.exists():
-        return canonical
-    legacy = Path.home() / ".claude" / "channels" / source / "access.json"
-    if legacy != canonical and legacy.exists():
-        print(
-            f"[util_paths] DEPRECATION: using legacy {legacy} — canonical "
-            f"{canonical} missing. Run the channel-bridge migrate step "
-            f"(scripts/sutando-migrate.sh) to relocate; this fallback is "
-            f"removed ~30 days post-migration.",
-            file=sys.stderr,
-        )
-        return legacy
-    return canonical
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def default_memory_dir() -> Path:
+    """Claude Code's memory dir for THIS checkout, ignoring any override.
+
+    Composed here so `SUTANDO_MEMORY_DIR`'s divergence check and every reader
+    of the corpus agree on what the un-overridden location is.
+    """
+    repo = Path(__file__).parent.parent.resolve()
+    return claude_home_path("projects", claude_project_slug(repo), "memory")
+
+
+def memory_dir() -> Path:
+    """The core-memory dir a reader should actually read.
+
+    Resolves through `_memory_dir_env()`, exactly as `personal_path()` and
+    `shared_personal_path()` do, so a host on the legacy `SUTANDO_PRIVATE_DIR`
+    alias reads its real corpus instead of an empty default path.
+    """
+    root = _memory_dir_env()
+    return Path(os.path.expanduser(root)) if root else default_memory_dir()
+
+
+def channel_access_path(source: str) -> Path:
+    """Resolve `channels/<source>/access.json` inside the configured Claude home.
+
+    The pre-migration `~/.claude/channels/<source>/access.json` fallback shipped
+    2026-06-21 for a ~30-day window and is retired: it let any process whose
+    canonical file was absent — a bridge under a fresh $CLAUDE_CONFIG_DIR, or a
+    test that isolated one — read and WRITE the operator's real home. An absent
+    canonical file is now a migration to run (`scripts/sutando-migrate.sh`), not
+    a reason to reach outside the configured home.
+    """
+    return claude_home_path("channels", source, "access.json")
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +423,194 @@ def _emit_claude_home_fallback_banner_once() -> None:
         "location post-#1454. Suppress with SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1.",
         file=sys.stderr,
     )
+
+def write_private_text(path: "Path", text: str) -> None:
+    """Write ``text`` to ``path`` as an owner-only (0600) file, with no window.
+
+    ``Path.write_text()`` creates at the process umask — commonly 0644 — so the
+    familiar ``write_text(...)`` + ``os.chmod(..., 0o600)`` pair leaves the file
+    world-readable for the interval between the two calls. For access-control
+    data (allowlists, owner ids, tier maps) that interval is the whole exposure.
+
+    ``os.open`` applies the mode at CREATION, and ``fchmod`` covers the case
+    where the file already existed (the mode argument is ignored then). O_TRUNC
+    rather than O_EXCL deliberately: this is used on best-effort paths wrapped in
+    broad excepts, and O_EXCL would turn a leftover temp file from a crash into a
+    permanent silent failure.
+    """
+    # Order matters for DATA INTEGRITY, not just permissions. O_TRUNC empties the
+    # file at OPEN, so with `O_CREAT|O_TRUNC` then fchmod, a hardening failure
+    # leaves an EXISTING backup empty -- a permission error would destroy exactly
+    # the durable copy that exists to survive a wipe. (The old
+    # write_text()+chmod at least failed with correct data and loose perms.)
+    #
+    # So: open WITHOUT O_TRUNC, harden first, and only truncate once nothing can
+    # still fail destructively.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)   # existing file: mode arg above was ignored
+        os.ftruncate(fd, 0)    # nothing destroyed until hardening succeeded
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w") as fh:  # fdopen takes ownership of fd from here
+        fh.write(text)
+
+
+# Unset instance keeps the historic name; mirrored in src/watcher_sentinel.sh
+# and a test asserts the two namers agree.
+WATCHER_SENTINEL_STEM = "watch-tasks-stream"
+
+# `rundir.DEFAULT_ACTOR`, needed only on the path where rundir itself did not
+# import; a mismatch is caught by test_the_degraded_default_actor_matches_rundir.
+_DEGRADED_CANONICAL_ACTOR = "local-agent"
+
+
+def _runtime_identity():
+    """`(rundir, instance_key)` from src/runtime-api, or None when unavailable.
+
+    Imported lazily: util_paths is on the import path of probes that must not
+    acquire a runtime dependency merely to resolve a path.
+    """
+    import importlib.util
+    mods = {}
+    for name in ("instance_key", "rundir"):
+        src = Path(__file__).resolve().parent / "runtime-api" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"_wsent_{name}", src)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered only AFTER exec succeeds: a half-initialised module left in
+        # sys.modules poisons `rundir`'s own `from instance_key import ...`.
+        sys.modules[f"_wsent_{name}"] = mod
+        sys.modules.setdefault(name, mod)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:  # noqa: BLE001 — an absent runtime is not a path error
+            sys.modules.pop(f"_wsent_{name}", None)
+            if sys.modules.get(name) is mod:
+                del sys.modules[name]
+            return None
+        mods[name] = mod
+    return mods["rundir"], mods["instance_key"]
+
+
+def instance_scope_key(state_dir, instance=None, agent=None) -> str:
+    """This runtime's `(agent_id, instance_id)` key, or "" for the canonical
+    default — the ONE discriminator every per-instance path uses.
+
+    Identity comes from `rundir` and the encoding from `instance_key`, the same
+    owners the run dir and the durable registry use, so two instances cannot
+    alias here while staying distinct there.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        # NEITHER half is readable here, so "" would claim canonical identity
+        # rather than read it; only an explicit caller-stated pair is answerable.
+        if instance is None or agent is None:
+            raise RuntimeError(
+                "cannot resolve a per-instance path: "
+                "src/runtime-api/{instance_key,rundir}.py did not import, so "
+                "neither the instance nor the actor can be read — pass both "
+                "explicitly to name a path in this state")
+        if instance == "default" and agent == _DEGRADED_CANONICAL_ACTOR:
+            return ""
+        raise RuntimeError(
+            "cannot encode a per-instance path: "
+            "src/runtime-api/instance_key.py did not import")
+    rundir, ikey = ident
+    inst = instance if instance is not None else rundir.instance_id()
+    who = agent if agent is not None else rundir.agent_id(state_dir)
+    # The canonical actor is the ENROLLED agent where one exists — the pair
+    # `stated_default_identity()` reports, not the bare DEFAULT_ACTOR constant.
+    canonical_actor = rundir.enrolled_agent_id(state_dir) or rundir.DEFAULT_ACTOR
+    if inst == ikey.DEFAULT_INSTANCE and who == canonical_actor:
+        return ""
+    return ikey.instance_key(who, inst)
+
+
+def actor_env_names():
+    """The actor half's env precedence, from the module that defines it.
+
+    A consumer reading ANOTHER process's identity must use the same order the
+    owner uses, and a second copy of the list is how the two answer differently.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        return ()
+    rundir, _ikey = ident
+    return tuple(rundir.ACTOR_ENV_NAMES)
+
+
+def stated_default_identity(state_dir):
+    """The (instance, agent) pair a process names when it sets NEITHER env var.
+
+    A caller naming ANOTHER process's path cannot pass None for an observed
+    default: None re-resolves from the CALLER's own environment, which is a
+    different identity. This returns the values to pass explicitly instead.
+    """
+    ident = _runtime_identity()
+    if ident is None:
+        return None
+    rundir, ikey = ident
+    return ikey.DEFAULT_INSTANCE, (rundir.enrolled_agent_id(state_dir)
+                                   or rundir.DEFAULT_ACTOR)
+
+
+def watcher_sentinel_path(state_dir, instance=None, agent=None) -> Path:
+    """The sentinel THIS instance writes."""
+    key = instance_scope_key(state_dir, instance, agent)
+    suffix = f"-{key}" if key else ""
+    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
+
+
+def handler_fallbacks_dir(state_dir, instance=None, agent=None) -> Path:
+    """Where THIS instance records "my optional handler declined this task".
+
+    That receipt is instance-local knowledge. Shared, another instance reads it
+    as its own and bypasses its handler, sending the task to its live core.
+    """
+    key = instance_scope_key(state_dir, instance, agent)
+    base = Path(state_dir) / "task-event-handler-fallbacks"
+    return base / key if key else base
+
+
+def task_event_handler_config_path(state_dir) -> Path:
+    """Where a skill declares core's task-event handler, e.g. via worker-pool's
+    register_worker(). Core-only: workers never read this (their own inbox is
+    already the routing decision), so it is not instance-scoped.
+    """
+    return Path(state_dir) / "task-event-handler.json"
+
+
+def watcher_sentinel_paths(state_dir) -> "list[Path]":
+    """Every sentinel present, historic name first.
+
+    A reader must consider all of them: asking about one file answers about one
+    watcher, and on a pool host the others are equally real.
+    """
+    state = Path(state_dir)
+    bare = state / f"{WATCHER_SENTINEL_STEM}.pid"
+    found = [bare] if bare.exists() else []
+    try:
+        rest = sorted(p for p in state.glob(f"{WATCHER_SENTINEL_STEM}-*.pid")
+                      if p.is_file())
+    except OSError:
+        rest = []
+    return found + rest
+
+
+if __name__ == "__main__":
+    # Path resolution for shell callers, so there is no second implementation
+    # of the identity encoding to keep in step with this one.
+    if len(sys.argv) >= 3 and sys.argv[1] == "watcher-sentinel":
+        print(watcher_sentinel_path(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "handler-fallbacks-dir":
+        print(handler_fallbacks_dir(sys.argv[2]))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "task-event-handler-config-path":
+        print(task_event_handler_config_path(sys.argv[2]))
+    else:
+        print("usage: util_paths.py {watcher-sentinel|handler-fallbacks-dir|"
+              "task-event-handler-config-path} <state-dir>",
+              file=sys.stderr)
+        raise SystemExit(2)

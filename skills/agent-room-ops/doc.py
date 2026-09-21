@@ -18,8 +18,8 @@ from __future__ import annotations
 import base64
 import os
 
-from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason,
-                    HTTPError, URLError)
+from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason_from,
+                      HTTPError, URLError)
 
 DEFAULT_FOLDER = "room-live-context"
 
@@ -46,7 +46,35 @@ def _call(op, room_id, agent_mxid, gate, extra):
     try:
         _status, res = http_json("POST", f"{base}/v1/room", headers, payload)
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        # A 4xx may carry a structured {"error": ...} body — e.g. a genuine
+        # "<folder>/<name> not found" for a missing doc, which is distinct from
+        # an unimplemented verb. degrade_reason() alone flattens every 404 to
+        # "verb unimplemented (404)", which misreports an absent doc as a dead
+        # doc backend (observed 2026-07-28: a missing plan doc read as "verb
+        # unimplemented", masking that prep_get was in fact working). Prefer the
+        # server's own error string when it sent one; fall back to degrade_reason.
+        #
+        # But the override is NOT unconditional. degrade_reason() encodes one
+        # distinction the body must never be allowed to erase: 401 ("auth failed
+        # — check the gateway bearer token") vs 403 ("denied — agent not a joined
+        # member"). See _gateway.py's own comment at degrade_reason(). Those two
+        # send a debugger to different places — one to the credential, one to
+        # room membership — and the gateway's prose for either is not reliably
+        # about the same thing. Unscoped, a structured body on a 401 renders as a
+        # membership verdict, which is precisely backwards:
+        #
+        #   401 + {"error": "denied - agent not a joined member"}
+        #        -> read as a membership problem; the real fault is the token
+        #   403 + {"error": "roadmap/plan.md not found"}
+        #        -> read as a missing doc; the real fault is membership
+        #
+        # So for auth statuses the local diagnosis stays authoritative and the
+        # server's message is APPENDED, never substituted — surfacing what the
+        # server said without letting it overwrite what the status code means.
+        # Dropping it entirely would trade one silent loss for another.
+        reason = degrade_reason_from(e)
+        return _result(False, room_id=room_id, folder=extra.get("folder"),
+                       name=extra.get("filename"), reason=reason)
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
     if isinstance(res, dict) and res.get("error"):

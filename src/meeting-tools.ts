@@ -1,11 +1,16 @@
 /**
  * Meeting tools — Google Meet, phone call, and meeting ID lookup.
  * Zoom tools (summon, dismiss, join_zoom) live in skills/zoom/tools.ts.
+ *
+ * macOS-only: joinGmeet and callContact drive Chrome via AppleScript. On
+ * Windows they degrade to a `macOSOnly` error.
  */
 
 import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { isMacOS, macOSOnlyError } from './platform.js';
+import { requirePython } from './python-binary.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -23,6 +28,7 @@ export const joinGmeetTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { meetingCode } = args as { meetingCode: string };
+		if (!isMacOS()) return macOSOnlyError('join_gmeet');
 		// Extract code from URL or use as-is
 		// strip the query string by splitting on '?' (linear; avoids the
 		// polynomial-backtracking /\?.*$/ regex — CodeQL js/polynomial-redos)
@@ -65,7 +71,12 @@ export const joinGmeetTool: ToolDefinition = {
 			// The button is in the center-bottom of the preview area
 			await new Promise(r => setTimeout(r, 1000));
 			try {
-				execFileSync('/usr/bin/python3', ['-c', `
+				// requirePython throws when the host has no runnable interpreter —
+				// absorbed by the `catch {}` below, which already degrades this to
+				// "camera not toggled". Never hardcode /usr/bin/python3: on a Mac
+				// without developer tools that is the Xcode-CLT stub and spawning it
+				// raises a modal install dialog.
+				execFileSync(requirePython(), ['-c', `
 import Quartz, subprocess, time
 
 # Get Chrome window position and size
@@ -163,6 +174,7 @@ export const callContactTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { name, message } = args as { name: string; message?: string };
+		if (!isMacOS()) return macOSOnlyError('call_contact');
 		try {
 			// Ensure Contacts.app is running
 			execFileSync('open', ['-ga', 'Contacts'], { timeout: 5_000 });

@@ -31,6 +31,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from util_paths import claude_project_slug  # noqa: E402
+
 # Harness-injected noise that must not survive into the resumed context.
 _NOISE_BLOCK_RE = re.compile(
     r"<system-reminder>.*?</system-reminder>"
@@ -46,6 +49,11 @@ _NOISE_LINE_RE = re.compile(
     r"^\s*(Caveat: The messages below|\[SYSTEM NOTIFICATION\b|\[watcher-ping\])",
 )
 _PER_MESSAGE_CHAR_CAP = 1500  # one runaway message must not eat the budget
+
+# Public names for the noise rules so other transcript readers (import-claude-context)
+# strip the same harness tags. Same objects; the underscored names stay canonical.
+NOISE_BLOCK_RE = _NOISE_BLOCK_RE
+NOISE_LINE_RE = _NOISE_LINE_RE
 
 
 def _clean(text: str) -> str:
@@ -74,6 +82,12 @@ def _message_text(message: dict) -> tuple[str, list[str]]:
             tools.append(block.get("name", "?"))
         # thinking / tool_result / images: skipped — noise for resume purposes
     return "\n".join(texts), tools
+
+
+# Public aliases for import-claude-context. `clean_text` keeps the per-message cap:
+# it is a snippet cleaner; bulk readers apply NOISE_BLOCK_RE / NOISE_LINE_RE directly.
+message_text = _message_text
+clean_text = _clean
 
 
 def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int = 6000) -> str:
@@ -127,7 +141,7 @@ def _latest_transcript() -> Path:
         ["bash", str(repo / "scripts" / "sutando-config.sh"), "claude-home-path", "projects"],
         capture_output=True, text=True, timeout=15,
     ).stdout.strip()
-    slug = re.sub(r"[^a-zA-Z0-9]", "-", str(repo))
+    slug = claude_project_slug(repo)
     candidates = sorted(
         Path(proj, slug).glob("*.jsonl"),
         key=lambda p: p.stat().st_mtime,

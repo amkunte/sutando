@@ -10,7 +10,8 @@ Why aggregate, not re-probe
 ---------------------------
 Each sidecar already leaves a liveness trace — the core heartbeat's
 `state/cores/<host>.alive` (mtime = liveness), the task watcher's
-`state/watch-tasks-stream.pid`, a listening TCP port for network services.
+a per-instance `state/watch-tasks-stream[-<instance>].pid`, a listening TCP
+port for network services.
 This emitter *reads those existing signals* and folds them into one file the
 UI can consume, rather than inventing a second, divergent source of truth.
 
@@ -54,6 +55,7 @@ from pathlib import Path
 # a status file written to the wrong tree is invisible to every post-M0 reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 STATE_DIR = WORKSPACE / "state"
@@ -65,6 +67,11 @@ STATUS_PATH = STATE_DIR / "services-status.json"
 # Liveness window shared with the .alive heartbeat: a signal older than this is
 # treated as "the thing that writes it is gone", i.e. offline.
 ALIVE_TTL_S = 90.0
+# The gateway bridge rewrites state/gateway-status.json on EVERY poll outcome,
+# so a sidecar older than this means the bridge is wedged or predates the
+# sidecar — either way it has no usable opinion and pgrep answers instead.
+GATEWAY_STATUS_PATH = STATE_DIR / "gateway-status.json"
+GATEWAY_STATUS_TTL_S = 180.0
 
 
 def _host_label() -> str:
@@ -96,6 +103,49 @@ def probe_alive_file(path: Path, now: float, ttl: float = ALIVE_TTL_S) -> tuple[
         return ("offline", f"stale {int(age)}s", mtime)
     except OSError as e:  # pragma: no cover — defensive; hard to trigger in tests
         return ("unknown", f"stat failed: {e}", None)
+
+
+def probe_watcher_sentinels(state_dir: Path, pid_alive
+                            ) -> "tuple[str, str, float | None]":
+    """Every watcher sentinel as ONE row. Reporting the first file answers about
+    one instance, which is wrong in both directions on a pool: a dead historic
+    pid beside a live worker read `offline`, and the reverse read `running`.
+
+    Enumerated at probe time, so a sentinel written after startup is seen.
+    """
+    from util_paths import watcher_sentinel_path, watcher_sentinel_paths
+    found = watcher_sentinel_paths(state_dir)
+    if not found:
+        return probe_pidfile(watcher_sentinel_path(state_dir), pid_alive)
+    rows = [(sp.name, *probe_pidfile(sp, pid_alive)[:2]) for sp in found]
+    running = [r for r in rows if r[1] == "running"]
+    # Two sentinel FILES naming one pid is one watcher and a stale record, not
+    # two watchers; listing the pid twice reports a pool that does not exist.
+    seen = {}
+    for n, s, d in rows:
+        if s == "running":
+            seen.setdefault(d, []).append(n)
+    dup = {d: ns for d, ns in seen.items() if len(ns) > 1}
+    dup_note = ("; ".join(f"{' and '.join(ns)} both name {d}" for d, ns in dup.items())
+                if dup else "")
+    if dup and len(running) == len(rows):
+        return ("degraded", f"one pid, two sentinels: {dup_note}", None)
+    if len(running) == len(rows):
+        pids = ", ".join(d for _, _, d in rows)
+        return ("running", pids if len(rows) == 1 else
+                f"{len(rows)} watchers: {pids}", None)
+    rest = "; ".join(f"{n}: {d}" for n, s, d in rows if s != "running")
+    if not running:
+        # No instance is up. `unknown` outranks `offline`: an unreadable
+        # sentinel is a question, and answering it "offline" overstates.
+        worst = "unknown" if any(s == "unknown" for _, s, _ in rows) else "offline"
+        return (worst, rest, None)
+    # De-duplicate: two sentinels naming one live pid is one process, and
+    # counting it twice reports a pool that is not there.
+    ok = ", ".join(dict.fromkeys(d for _, s, d in rows if s == "running"))
+    live_n = len(set(d for _, s, d in rows if s == "running"))
+    tail = f"; one pid, two sentinels: {dup_note}" if dup_note else ""
+    return ("degraded", f"{live_n} of {len(rows)} up ({ok}); {rest}{tail}", None)
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
@@ -146,6 +196,41 @@ def probe_process(pattern: str, pgrep) -> tuple[str, str, float | None]:
         return ("unknown", f"probe error: {e}", None)
 
 
+def probe_gateway(
+    path: Path, pattern: str, now: float, pgrep, ttl: float = GATEWAY_STATUS_TTL_S
+) -> tuple[str, str, float | None]:
+    """Gateway liveness: prefer the bridge's OWN status sidecar, fall back to pgrep.
+
+    `probe_process` answers "does a process with this argv exist", which is not
+    the same question as "is the connection serving". A gateway whose route has
+    gone can sit in a retry/backoff loop for hours with the process healthy, and
+    the dashboard would show it green the whole time (observed 2026-07-28: 4.9h
+    of `connected: false` reported as `running`, pid and all).
+
+    `state/gateway-status.json` is written by the transport on every poll
+    outcome, so it answers the real question. Missing or stale (bridge wedged,
+    or too old to emit one) → no opinion, and the pgrep probe answers as before,
+    so hosts running an older bridge keep their previous behaviour.
+
+    Same precedence `core-input-watch.gateway_alive()` adopted in #2253.
+    """
+    # Serving verdict is gateway_serving's; the TTL, the rendering and the
+    # pgrep fallback are this reader's.
+    v = read_gateway_verdict(path, now=now, max_age=ttl)
+    if v is not None:
+        if v.serving:
+            return ("running", "connected", v.last_ok_ts)
+        if v.never_polled:
+            # connected, but no completed poll to point at — the shape a dead
+            # bridge's own last write leaves behind.
+            return ("offline", "not serving — no successful poll yet", None)
+        detail = "not serving"
+        if v.last_ok_ts:
+            detail = f"not serving — no successful poll for {int(now - v.last_ok_ts)}s"
+        return ("offline", detail, v.last_ok_ts)
+    return probe_process(pattern, pgrep)  # absent/unreadable/malformed/stale
+
+
 def _real_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -190,10 +275,18 @@ def service_registry() -> list[dict]:
     return [
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
+        # KNOWINGLY PRIMARY-ONLY (#2503): named GATEWAY_INSTANCE bridges publish
+        # SUFFIXED sidecars this probe does not read, and the pgrep fallback is
+        # identity-blind (instance identity lives only in env — the launcher's
+        # P1). With a live named secondary, a dead primary's stale sidecar falls
+        # through to pgrep and the secondary's process reads as "running".
+        # Instance-aware probing is tracked separately; until then this row
+        # reports the PRIMARY bridge only.
         {"id": "gateway", "name": "AG2 Gateway",
-         "probe": ("process", r"remote-gateway-bridge\.py$")},
+         "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
-         "probe": ("pidfile", STATE_DIR / "watch-tasks-stream.pid")},
+         # Every instance's sentinel; one fixed name reported only the newest.
+         "probe": ("watcher_sentinels", STATE_DIR)},
         {"id": "voice-agent", "name": "Voice Agent",
          "probe": ("port", 9900)},
         {"id": "web-client", "name": "Web Client",
@@ -204,12 +297,20 @@ def service_registry() -> list[dict]:
          "probe": ("port", 7845)},
         {"id": "credential-proxy", "name": "Credential Proxy",
          "probe": ("port", 7846)},
+        # `$`-anchored, like the gateway row above. An UNANCHORED pattern also
+        # matches any process that merely MENTIONS the script — most concretely
+        # `python3 src/discord-bridge.py send <channel> <text>`, the one-off REST
+        # send used to post from outside the daemon. Measured: with such a send
+        # in flight, `pgrep -f 'discord-bridge\.py'` returned BOTH it and the
+        # daemon, so a dead daemon would have read `running` for the life of the
+        # send. Anchoring keeps the daemon (each launches with the script path
+        # LAST in argv) and drops the sub-command form, which has trailing args.
         {"id": "discord-bridge", "name": "Discord",
-         "probe": ("process", r"discord-bridge\.py")},
+         "probe": ("process", r"discord-bridge\.py$")},
         {"id": "slack-bridge", "name": "Slack",
-         "probe": ("process", r"slack-bridge\.py")},
+         "probe": ("process", r"slack-bridge\.py$")},
         {"id": "telegram-bridge", "name": "Telegram",
-         "probe": ("process", r"telegram-bridge\.py")},
+         "probe": ("process", r"telegram-bridge\.py$")},
     ]
 
 
@@ -225,11 +326,16 @@ def build_payload(
     the injected `pid_alive`/`connect`/`pgrep` callables and `now`."""
     services = []
     for spec in registry:
-        kind, arg = spec["probe"]
-        if kind == "alive_file":
+        kind, *args = spec["probe"]
+        arg = args[0]
+        if kind == "gateway":
+            status, detail, since = probe_gateway(args[0], args[1], now, pgrep)
+        elif kind == "alive_file":
             status, detail, since = probe_alive_file(arg, now)
         elif kind == "pidfile":
             status, detail, since = probe_pidfile(arg, pid_alive)
+        elif kind == "watcher_sentinels":
+            status, detail, since = probe_watcher_sentinels(arg, pid_alive)
         elif kind == "port":
             status, detail, since = probe_port(arg, connect)
         elif kind == "process":

@@ -25,12 +25,12 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { join } from 'node:path';
+import { homedir, hostname } from 'node:os';
+import { dirname, join, win32 } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
-function expandHome(p: string): string {
-	return p.replace(/^~/, process.env.HOME || '');
+export function expandHome(p: string): string {
+	return p.replace(/^~/, homedir());
 }
 
 /**
@@ -85,7 +85,8 @@ function scutilLocalHostName(): string {
  * Per-host directory label. Precedence (mirrors `_host_label()` in
  * util_paths.py and `_host()` in sync-workspace.sh — the single source of
  * truth for the per-host segment):
- *   1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`) — used RAW.
+ *   1. `$SUTANDO_HOST_LABEL` (or legacy `$SUTANDO_HOST_OVERRIDE`), trimmed;
+ *      blank-after-trim counts as unset.
  *   2. macOS `scutil --get LocalHostName` — the STABLE Bonjour name.
  *   3. short `hostname` (mDNS/domain suffix stripped) — last resort.
  *
@@ -106,7 +107,12 @@ export function resolveHostLabel(
 	scutil: () => string = scutilLocalHostName,
 	rawHostname: string = hostname(),
 ): string {
-	const label = env.SUTANDO_HOST_LABEL || env.SUTANDO_HOST_OVERRIDE;
+	// Trim before testing: a blank-but-set override is TRUTHY in JS, so
+	// `if (label)` returned the whitespace itself as the label — `hosts/   /`,
+	// the same self-inflicted per-host split the DHCP note above describes.
+	// Blank means "not set": fall through to scutil/hostname. Lockstep with
+	// _host_label() in util_paths.py and _host() in sync-workspace.sh.
+	const label = (env.SUTANDO_HOST_LABEL || env.SUTANDO_HOST_OVERRIDE || '').trim();
 	if (label) return label;
 	const bonjour = scutil();
 	if (bonjour) return bonjour;
@@ -220,10 +226,29 @@ export function claudeHomePath(...subpath: string[]): string {
 		}
 		base = expandHome(home);
 	} else {
-		base = join(process.env.HOME || '', '.claude');
+		base = join(homedir(), '.claude');
 	}
 	if (subpath.length === 0) return base;
 	return join(base, ...subpath);
+}
+
+/**
+ * Derive the project slug Claude Code uses under `projects/<slug>/` for a
+ * given absolute path, by dashing every non-alphanumeric character (not just
+ * "/"). Matching only "/" resolves to a nonexistent dir on any path
+ * containing a space or dot — e.g. a desktop-bundled checkout under
+ * "Application Support/space.ag2.app/" — so every caller must derive the
+ * slug through this one function rather than re-implementing the regex.
+ */
+export function claudeProjectSlug(path: string): string {
+	return path.replace(/[^A-Za-z0-9]/g, '-');
+}
+
+/** Derive the Claude project slug for the repository containing an agent module directory. */
+export function voiceMemoryProjectSlug(agentModuleDir: string): string {
+	const moduleDir = agentModuleDir.replace(/[\\/]+$/, '');
+	const repoDir = moduleDir.includes('\\') ? win32.dirname(moduleDir) : dirname(moduleDir);
+	return claudeProjectSlug(repoDir.replace(/[\\/]+$/, ''));
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +259,7 @@ export function claudeHomePath(...subpath: string[]): string {
 // no-cors requests or read local files).
 // ---------------------------------------------------------------------------
 
-const _CAPTURE_TOKEN_PATH = join(process.env.HOME || '', '.config', 'sutando', 'screen-capture-token');
+const _CAPTURE_TOKEN_PATH = join(homedir(), '.config', 'sutando', 'screen-capture-token');
 
 /**
  * Read the screen-capture server token from disk.  Returns the token string

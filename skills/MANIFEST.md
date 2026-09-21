@@ -154,6 +154,7 @@ backend swap, never a re-format.
 | `contract` | opt | `{inputs, outputs, guarantees}` — what downstream depends on across versions |
 | `provenance` | opt | `{source_repo, forked_from, upstream_intent}` — keeps forks trackable |
 | `enabled`, `access_tier`, `tools`, `server`, `startup`, `config` | — | manifest-loaded skills only (see above) |
+| `documented_for_core`, `core_description` | opt | a skill the core runs (no `tools`): `core_description` is read by `loadCoreDocumentedSkills()` (`src/inline-tools.ts`) into the voice prompt, so voice delegates it through `work` instead of saying it cannot |
 
 `permissions` is a **declaration the linter cross-checks**: e.g. `network: false`
 on a skill whose code calls `fetch`/`urllib` is flagged, because a permission that
@@ -199,3 +200,28 @@ Phase 1 migrates the manifest-loaded skills (`zoom`, `screen-companion`,
 slash-command skills (adding a minimal `manifest.json` with `version`/`owner`/
 `stability`) is the mechanical follow-up. Later phases add the registry index,
 `skill.lock` + precedence resolution, and per-skill evals in CI.
+
+### Trusted GitHub resolver
+
+`skills/trusted-capabilities/` provides the first allowlisted GitHub resolver
+for the package model. It discovers `SKILL.md` packages in the repositories
+declared by its manifest, statically surfaces risk signals, resolves an exact
+upstream commit, and installs file-by-file into the runtime skills directory.
+Managed installs carry `.sutando-source.json`, which makes later update checks
+repeatable and preserves source, path, and commit provenance.
+
+Only sources marked `installable` may write files, and only below each source's
+declared root. Tool repositories can be discovered and inspected but, like
+awesome-list indexes, remain install-disabled: their install procedures and
+runtime permissions are too source-specific for the generic skill installer.
+Writes require `--yes` and replace the destination atomically; omitting it
+performs an inspection-only dry run.
+
+### Marketplace resolver
+
+`skills/marketplace/` is the Superpower Station counterpart: it installs the
+owner's marketplace skills (tar.gz bundles verified against the cloud's
+sha256) and activates cloud tools through the same cloud routes the Marketplace
+UI uses. Both resolvers share `src/skill_install.py` (atomic swap, symlink
+refusal, safe tar extraction) and write `.sutando-source.json`, so `update`
+and `uninstall` can tell whose directory is whose.

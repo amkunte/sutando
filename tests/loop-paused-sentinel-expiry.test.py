@@ -65,10 +65,8 @@ for junk in ("garbage", "", "   ", "not-a-date"):
 
 print("loop-paused-sentinel-expiry: 10 assertions passed")
 
-# --- offset-format robustness: the two writers do not share a serializer ----
-# scripts/presenter-mode.sh emits "...Z"; Swift's ISO8601DateFormatter emits a
-# numeric offset in some configurations. All three spellings of the SAME future
-# instant must read identically, and a non-zero offset must not be misread.
+# The two writers do not share a serializer: the shell emits "...Z", Swift a
+# numeric offset. All spellings of the same instant must read identically.
 import datetime as _dt
 _utc = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=30)
 for label, text in (

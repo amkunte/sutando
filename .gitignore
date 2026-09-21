@@ -1,6 +1,7 @@
 .env
 PERSONAL_CLAUDE.md
 node_modules/
+benchmark-runs/
 dist/
 *.log
 __pycache__/
@@ -42,6 +43,14 @@ telegram-inbox/
 discord-inbox/
 archive/
 assets/
+# the blanket assets/ rule above is for workspace runtime dirs; the package's
+# brand assets are versioned source
+!packages/ag2-sparrow/assets/
+!packages/ag2-sparrow/assets/**
+# skill assets are versioned source too: a Codex/OpenAI skill manifest
+# references ./assets/ icons, so the blanket rule must not swallow them.
+!skills/*/assets/
+!skills/*/assets/**
 stand-identity.json
 stand-avatar.png
 docs/youtube/
@@ -52,9 +61,20 @@ tests/*
 # (tests/kernel/, tests/adapters/, tests/policy/, …) — the companion to the
 # recursive runner glob. Without this, relocated tests are silently untracked.
 !tests/*/
+# `!tests/*/` re-includes EVERY dir under tests/, which defeats the global
+# `__pycache__/` above. Re-deny tool caches here; gitignore is last-match-wins.
+tests/**/__pycache__/
+tests/**/.pytest_cache/
+tests/**/.mypy_cache/
+tests/**/.ruff_cache/
+tests/**/node_modules/
+tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.test.ps1
+!tests/*.test.mjs
+tests/__pycache__/
 !tests/*.txt
 !tests/_helpers/
 !tests/_helpers/*.ts
@@ -105,7 +125,8 @@ done/
 # Runtime state file written by the voice client. Pure cruft, no commit value.
 voice-state.json
 
-# Single-instance lock written by src/voice-agent.ts (acquirePidLock).
+# Legacy pre-#2722 voice-agent lock path; canonical is workspace/state/locks/
+# (already covered by workspace/*). Keep through the transition window.
 .voice-agent.pid
 
 # Per-clone Sutando config overrides — workspace path, vault remote, etc.
@@ -137,9 +158,26 @@ skills/tv-price-watcher/
 # Playwright MCP cache (created by mcp__playwright tools)
 .playwright-mcp/
 
+# IDE / editor workspace state — per-user, never shared.
+.vscode/
 # coverage-gate artifacts (scripts/coverage-gate.sh)
 .coverage
 .coverage.*
 coverage.xml
 diff-cover.md
 coverage-summary.md
+
+# sw[n-p] only: a dot/underscore prefix plus `sw` still admits real assets
+# (`.interface.swg`), so the range is the discriminator.
+[._]*.sw[n-p]
+[._]sw[n-p]
+# Deep range, but only at a real dotenv boundary — `.env` as a bare substring
+# would hide `diagram.environment.svg` and `service.envoy.svc`.
+*.env.s[a-v][a-z]
+*.env.sw[a-p]
+*.env.*.s[a-v][a-z]
+*.env.*.sw[a-p]
+*~
+
+# Built locally from a GAIA copy; carries the answer key -- never commit.
+benchmarks/gaia-100.json

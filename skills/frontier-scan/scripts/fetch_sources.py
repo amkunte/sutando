@@ -14,8 +14,9 @@ Design notes:
   as a `skipped` note and does NOT abort the others (one dead repo must never make
   the whole weekly scan silent — that's the failure mode this skill exists to avoid).
 - Idempotent: every emitted item is keyed and recorded in seen.json; a second run
-  the same week emits nothing new. last_scan advances every run so the
-  scan-catchup backstop can tell the scan is alive.
+  the same week emits nothing new. last_scan advances on every run that fetched at
+  least one source, so the scan-catchup backstop can tell the scan is alive; a run
+  where every source failed leaves it untouched so the backstop retries.
 - Py3.9-safe (no PEP 604 unions, no datetime.UTC) — runs on either fleet interpreter.
 """
 from __future__ import annotations
@@ -122,9 +123,12 @@ def main():
     skipped = []
     web_sources = []
 
+    attempted = 0
+
     for src in cfg.get("sources", []):
         name = src.get("name", "?")
         if src.get("kind") == "github" and src.get("repo"):
+            attempted += 1
             items, note = _fetch_github(src["repo"])
             if note:
                 skipped.append({"source": name, "repo": src["repo"], "reason": note})
@@ -143,21 +147,27 @@ def main():
                 "why_track": src.get("why_track", ""),
             })
 
-    # Advance state regardless of whether anything was new (keeps last_scan fresh
-    # for the scan-catchup backstop, and records the run).
+    # A run where every source failed checked nothing, so it must not satisfy the
+    # scan-catchup backstop — holding last_scan back is what makes it re-fire.
+    blind = attempted > 0 and len(skipped) == attempted
+
     state["seen"] = seen
-    state["last_scan"] = _now_iso()
+    run_ts = _now_iso()
+    if not blind:
+        state["last_scan"] = run_ts
     hist = state.get("scan_history", [])
     hist.append({
-        "ts": state["last_scan"],
+        "ts": run_ts,
         "new_count": len(new_items),
         "skipped": skipped,
+        "blind": blind,
     })
     state["scan_history"] = hist[-30:]
     _save_state(state)
 
     print(json.dumps({
-        "last_scan": state["last_scan"],
+        "last_scan": state.get("last_scan"),
+        "blind": blind,
         "new_items": new_items,
         "web_sources": web_sources,
         "skipped": skipped,

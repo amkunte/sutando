@@ -41,6 +41,39 @@ def config(workspace: Path, **overrides):
     path.write_text(json.dumps([{"name": "session-job", "cron": "* * * * *", "prompt": "ignore"}, job]))
 
 
+def main_loop_config(workspace: Path):
+    path = workspace / "hosts" / "test-host" / "crons.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps([{
+        "name": "main-loop",
+        "cron": "*/5 * * * *",
+        "prompt_skill": "proactive-loop",
+    }]))
+
+
+def test_codex_runtime_owns_legacy_main_loop_without_mutating_config():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        main_loop_config(ws)
+
+        fired = scheduler.tick(ws, "test-host", at(6, 10), include_main_loop=True)
+        assert fired["job_count"] == 1
+        assert fired["events"][0]["job"] == "main-loop"
+        task = next((ws / "tasks").glob("task-cron-main-loop-*.txt"))
+        body = task.read_text()
+        assert "Run exactly one proactive-loop pass" in body
+        assert "Do not arm another recurring loop" in body
+        assert "[no-send]" in body
+
+        # Claude keeps the canonical session-owned loop; the Codex scheduler
+        # must not claim an unmarked entry after a runtime switch.
+        other_ws = Path(td) / "claude"
+        main_loop_config(other_ws)
+        skipped = scheduler.tick(other_ws, "test-host", at(6, 10), include_main_loop=False)
+        assert skipped["job_count"] == 0
+        assert not (other_ws / "tasks").exists()
+
+
 def test_cron_parser():
     local = datetime(2026, 7, 15, 6, 10, tzinfo=timezone.utc)
     assert scheduler.cron_matches("*/5 6 15 7 *", local)
@@ -152,6 +185,29 @@ def test_enqueue_retry_complete_and_no_duplicate():
         assert state["jobs"]["daily-news"]["current"] is None
 
 
+def test_an_assigned_task_is_active_so_no_duplicate_retry_fires():
+    # `.assigned-<inst>` is the claimed rename's sibling state; a `.claimed-`
+    # glob cannot see it, so the retry fires while the original is still live.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        config(ws)
+        scheduler.tick(ws, "test-host", at(6, 0))
+        task = next((ws / "tasks").glob("*.txt"))
+
+        assigned = task.with_name(f"{task.stem}.assigned-core-2.txt")
+        task.rename(assigned)
+        assert scheduler._task_is_active(ws, [task.stem]) is True
+        assert scheduler.tick(ws, "test-host", at(6, 7))["events"] == []
+        assert [p.name for p in (ws / "tasks").iterdir()] == [assigned.name]
+
+        # Control: once it is genuinely gone, the retry the assigned state was
+        # suppressing does fire — so the assertion above is not vacuous.
+        assigned.unlink()
+        retry = scheduler.tick(ws, "test-host", at(6, 8))
+        assert retry["events"] == [
+            {"job": "daily-news", "event": "retried", "attempt": 2}]
+
+
 def test_failure_alert_and_health():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -163,6 +219,26 @@ def test_failure_alert_and_health():
         assert len(list((ws / "results").glob("proactive-schedule-alert-*.txt"))) == 1
         code, report = scheduler.health(ws, "test-host", at(6, 5))
         assert code == 1 and "latest run failed" in report["problems"][0]
+
+
+def test_an_assigned_task_counts_as_active_so_no_duplicate_retry() -> None:
+    """The lead renames to .assigned-<inst>; a .claimed-only check read that as
+    gone and retried, which the retry guard's own comment calls duplicating
+    irreversible side effects."""
+    import tempfile
+    for name, label in (("task-x.txt", "bare"),
+                        ("task-x.claimed-core-2.txt", "claimed"),
+                        ("task-x.assigned-core-2.txt", "assigned")):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "tasks" / "processed").mkdir(parents=True)
+        (ws / "tasks" / name).write_text("id: task-x\ntask: y\n")
+        assert scheduler._task_is_active(ws, ["task-x"]), f"{label} must read active"
+
+    ws = Path(tempfile.mkdtemp())
+    (ws / "tasks" / "processed").mkdir(parents=True)
+    assert not scheduler._task_is_active(ws, ["task-x"]), "absent must read inactive"
+    (ws / "tasks" / "processed" / "task-x.txt").write_text("x")
+    assert scheduler._task_is_active(ws, ["task-x"]), "processed check must be retained"
 
 
 def test_stale_active_task_fails_instead_of_stalling_or_duplicating():
@@ -285,9 +361,12 @@ def test_main_dispatch_and_error_handling():
 def main():
     tests = [
         test_cron_parser,
+        test_codex_runtime_owns_legacy_main_loop_without_mutating_config,
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
+        test_an_assigned_task_is_active_so_no_duplicate_retry_fires,
         test_failure_alert_and_health,
+        test_an_assigned_task_counts_as_active_so_no_duplicate_retry,
         test_stale_active_task_fails_instead_of_stalling_or_duplicating,
         test_wake_catchup_and_timezone,
         test_prompt_cannot_forge_task_headers,

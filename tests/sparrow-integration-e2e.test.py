@@ -125,19 +125,22 @@ def drive_poll(rtc, tasks):
     added = False
     pending_ack = []
     for task in tasks:
-        tid = rtc._write_task(task)
-        if tid:
+        written = rtc._write_task(task)
+        if written:
+            tid, durable = written
             if tid not in inflight:
                 inflight.add(tid)
                 added = True
-            pending_ack.append(tid)
-    if added:
-        rtc._save_inflight(inflight)
-    # Ack only after task file + in-flight state are durable (main()'s ordering).
-    for tid in pending_ack:
-        rtc._post_task_ack(tid)
+            pending_ack.append((tid, durable))
+    # Ack only after task file, in-flight state and ack ledger are durable
+    # (main()'s ordering).
+    committed = rtc._save_inflight(inflight) if pending_ack else True
+    if pending_ack and committed:
+        committed = rtc._record_pending_acks(pending_ack)
+    for tid, durable in pending_ack if committed else ():
+        rtc._post_task_ack(tid, durable)
     rtc._post_ready_results(inflight)
-    return pending_ack
+    return [tid for tid, _ in pending_ack]
 
 
 def main() -> int:
@@ -206,12 +209,17 @@ def main() -> int:
           and STATE["acks"] == ["/v1/tasks/task-E2E1/ack"] * 2,
           "redelivery RE-ACKED upstream (acks=2) — matches main()'s pending_ack loop")
     real_after = [r for r in STATE["results"] if not str(r.get("body", "")).startswith("[no-send]")]
-    check(len(real_after) == 1 and len(STATE["results"]) == results_before,
+    marker_after = [r for r in STATE["results"] if str(r.get("body", "")).startswith("[no-send]")]
+    # The raw skip marker still POSTs to close the redelivered lease; the
+    # server suppresses its user-facing delivery.
+    check(len(real_after) == 1 and len(STATE["results"]) == results_before + 1,
           "exactly ONE real result across the whole cycle — no duplicate delivery")
+    check(len(marker_after) == 1 and "[no-send]" in str(marker_after[0].get("body", "")),
+          "redelivery marker POSTed raw exactly once — closes the lease, server suppresses")
     check(rtc._load_inflight() == set(), "inflight empty after recovery (no leaked in-flight)")
     log("gateway", f"final: tasks_served={STATE['tasks_served']}, acks={len(STATE['acks'])}, "
-                    f"real_results={len(real_after)}")
-    log("result", "[no-send] redelivery marker archived locally, never POSTed to gateway")
+                    f"real_results={len(real_after)}, marker_results={len(marker_after)}")
+    log("result", "[no-send] redelivery marker POSTed (lease closed) then archived")
 
     srv.shutdown()
     print()

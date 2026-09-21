@@ -11,7 +11,9 @@ working-state e2e would need a live core, which CI doesn't have.
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -51,6 +53,80 @@ WORKING_PANE = """\
 check("needs_login: false on a working pane", rh.needs_login(WORKING_PANE) is False)
 check("needs_login: false on empty pane", rh.needs_login("") is False)
 
+# 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
+#     import-time default reports a live core as offline. Prefer the recorded socket.
+_sock_tmp = tempfile.mkdtemp()
+_cores = os.path.join(_sock_tmp, "state", "cores")
+os.makedirs(_cores, exist_ok=True)
+_host = rh._host_label_safe() or "testhost"
+_alive = os.path.join(_cores, _host + ".alive")
+_orig_resolve, _orig_host = rh._resolve_workspace, rh._host_label_safe
+rh._resolve_workspace = lambda repo: _sock_tmp
+rh._host_label_safe = lambda: _host
+# The record is only consulted when no explicit socket was given, so these cases
+# must run with the variable clear however the suite happened to be launched.
+_env_before = os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/run/real.sock"}, _fh)
+check("_tmux_socket: prefers the socket the heartbeat recorded",
+      rh._tmux_socket() == "/run/real.sock")
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"session": "sutando-core"}, _fh)
+check("_tmux_socket: falls back when .alive carries no socket",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+with open(_alive, "w", encoding="utf-8") as _fh:
+    _fh.write("{not json")
+check("_tmux_socket: falls back on an unreadable .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.remove(_alive)
+check("_tmux_socket: falls back when .alive is absent",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: ""
+check("_tmux_socket: falls back when the host label is unknown",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+rh._host_label_safe = lambda: _host
+# A crashed core leaves its .alive behind; trusting it would pin the probe to a
+# dead socket, which is the failure this resolver exists to remove.
+with open(_alive, "w", encoding="utf-8") as _fh:
+    json.dump({"socket": "/tmp/stale.sock"}, _fh)
+os.utime(_alive, (time.time() - 10000, time.time() - 10000))
+check("_tmux_socket: refuses a stale .alive record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, None)
+check("_tmux_socket: accepts the same record once it is fresh",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+# A clock step leaves a future-dated record; a one-sided age test reads that as
+# fresh forever, so the bound has to hold on both sides.
+os.utime(_alive, (time.time() + 10000, time.time() + 10000))
+check("_tmux_socket: refuses a future-dated .alive",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+
+os.utime(_alive, (time.time() + 1, time.time() + 1))
+check("_tmux_socket: tolerates small clock skew",
+      rh._tmux_socket() == "/tmp/stale.sock")
+
+_prev_env = os.environ.get("SUTANDO_TMUX_SOCKET")
+os.environ["SUTANDO_TMUX_SOCKET"] = "/tmp/explicit.sock"
+check("_tmux_socket: an explicit SUTANDO_TMUX_SOCKET wins over the record",
+      rh._tmux_socket() == rh.TMUX_SOCKET)
+if _prev_env is None:
+    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+else:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _prev_env
+
+rh._resolve_workspace, rh._host_label_safe = _orig_resolve, _orig_host
+if _env_before is not None:
+    os.environ["SUTANDO_TMUX_SOCKET"] = _env_before
+shutil.rmtree(_sock_tmp, ignore_errors=True)
+
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.
 env = dict(os.environ)
 env["SUTANDO_TMUX_SOCKET"] = "/tmp/rh-test-nonexistent-%d.sock" % os.getpid()
@@ -68,8 +144,9 @@ check("offline: authenticated is null", out.get("authenticated") is None)
 check("offline: core_running is false", out.get("core_running") is False)
 check(
     "contract keys present",
-    set(out) == {"health", "authenticated", "core_running", "gateway_running",
-                 "tmux_socket", "session", "detail"},
+    set(out) == {"health", "severity", "authenticated", "core_running",
+                 "gateway_running", "ag2space_app_running", "station_available",
+                 "tmux_socket", "session", "detail", "signals"},
 )
 
 # 4) derive() maps every state correctly — drive it by patching the probes so we
@@ -108,8 +185,42 @@ check("derive: running with no ts -> working (can't prove stale)", d["health"] =
 d = _derive_with(core=True, pane="", status="idle")
 check("derive: idle status -> idle", d["health"] == "idle" and d["authenticated"] is True)
 
-d = _derive_with(core=True, pane=STUCK_PANE, status="running")
-check("derive: login pane wins over status -> needs_login", d["health"] == "needs_login" and d["authenticated"] is False)
+# CHANGED by #2456. This previously asserted "login pane wins over status" with a
+# FRESH status — which is the short-circuit the issue reports: the agent is
+# demonstrably advancing, so a sign-in prompt cannot also be true, and the
+# needs_login verdict erased the wedge signal. The code comment justifying cheap
+# false positives is about an UNRESPONSIVE agent; it does not reach a fresh one.
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts="fresh")
+check("derive: login marker + FRESH status -> not needs_login (false positive)",
+      d["health"] == "working" and d["authenticated"] is True)
+check("derive: ...and the marker is still reported, not silently dropped",
+      "false positive" in d["detail"])
+
+# The marker is still authoritative wherever there is no positive evidence of
+# progress — a real sign-in prompt stops the loop, so these corroborate.
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts="stale")
+check("derive: login marker + STALE status -> needs_login",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+check("derive: ...and the wedge signal survives in the detail",
+      "stale" in d["detail"].lower())
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts=None)
+check("derive: login marker + NO timestamp -> needs_login (absence of evidence is not freshness)",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="idle", ts="fresh")
+check("derive: login marker + fresh IDLE -> idle, not needs_login",
+      d["health"] == "idle" and d["authenticated"] is True)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status=None, ts="fresh")
+check("derive: login marker + unknown status -> needs_login (no proof of acting)",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+
+# CONTROL: a clean pane must be unaffected in every one of those shapes.
+check("derive: CONTROL clean pane + stale running -> unknown (wedge preserved)",
+      _derive_with(core=True, pane="", status="running", ts="stale")["health"] == "unknown")
+check("derive: CONTROL clean pane + fresh running -> working",
+      _derive_with(core=True, pane="", status="running", ts="fresh")["health"] == "working")
 
 d = _derive_with(core=True, pane="", status=None)
 check("derive: running but no status -> unknown", d["health"] == "unknown")
@@ -118,7 +229,6 @@ d = _derive_with(core=False, pane="", status="running")
 check("derive: no core -> offline", d["health"] == "offline" and d["authenticated"] is None)
 
 # 5) _core_status reads the status field from a fixture core-status.json.
-import tempfile
 T = tempfile.mkdtemp()
 os.makedirs(os.path.join(T, "state"))
 with open(os.path.join(T, "state", "core-status.json"), "w") as f:
@@ -147,11 +257,31 @@ check("_core_status: non-numeric ts -> (status, None)", rh._core_status(Tt) == (
 #    subprocess-only e2e above doesn't leave _run/_core_running/_gateway_running/
 #    _pane_text/main uncovered. Point at a socket with no session → offline, and
 #    call each real helper directly (they degrade to empty/false, never crash).
+# _core_running() resolves via _tmux_socket(), not the bare TMUX_SOCKET constant --
+# on a live fresh-heartbeat host that finds the REAL socket, so mock the function too.
+_orig_tmux_socket = rh._tmux_socket
 _orig_socket = rh.TMUX_SOCKET
+rh._tmux_socket = lambda: "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 rh.TMUX_SOCKET = "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 try:
     check("real _core_running: false on bogus socket", rh._core_running() is False)
-    check("real _gateway_running returns a bool", isinstance(rh._gateway_running(), bool))
+    # _gateway_running() short-circuits to None unless a gateway is CONFIGURED
+    # (src/runtime-health.py:229). Clean-install CI has none, so the real probe
+    # branch is only reachable when we force the precondition — otherwise this
+    # asserts a bool against None and fails host-dependently (qingyun CR #2527).
+    _ogc = rh._gateway_configured
+    rh._gateway_configured = lambda: True
+    try:
+        check("real _gateway_running returns a bool (configured host)",
+              isinstance(rh._gateway_running(), bool))
+    finally:
+        rh._gateway_configured = _ogc
+    # Explicit unconfigured-host control: not-configured -> None, never a down-vote.
+    rh._gateway_configured = lambda: False
+    try:
+        check("_gateway_running: unconfigured host -> None", rh._gateway_running() is None)
+    finally:
+        rh._gateway_configured = _ogc
     check("real _pane_text returns a str", isinstance(rh._pane_text(), str))
     check("real _resolve_workspace returns a path", rh._resolve_workspace(REPO).startswith("/"))
     d = rh.derive()
@@ -161,10 +291,14 @@ try:
     check("real main() ran without error", True)
 finally:
     rh.TMUX_SOCKET = _orig_socket
+    rh._tmux_socket = _orig_tmux_socket
 
 # 7) Defensive branches (the degrade-not-crash paths).
+# A command that cannot execute returns rc None (UNKNOWN — distinct from a
+# command that ran and returned non-zero) so a probe outage is never counted as
+# a positive "down" observation (qingyun CR on #2527).
 rc, out = rh._run(["/nonexistent-rh-binary-xyz"])
-check("_run: missing binary -> (127, '')", rc == 127 and out == "")
+check("_run: missing binary -> (None, '')", rc is None and out == "")
 
 
 def _fake_run_gw(cmd):
@@ -176,11 +310,17 @@ def _fake_run_gw(cmd):
 
 
 _o = rh._run
+_ogc2 = rh._gateway_configured
 rh._run = _fake_run_gw
+# The window-scan fallback is only reached past the configured short-circuit
+# (src/runtime-health.py:229), so mark the gateway configured here too — else
+# this returns None on a clean host and never exercises the fallback (qingyun CR #2527).
+rh._gateway_configured = lambda: True
 try:
     check("_gateway_running: window-scan fallback", rh._gateway_running() is True)
 finally:
     rh._run = _o
+    rh._gateway_configured = _ogc2
 
 _ow = rh._resolve_workspace
 rh._resolve_workspace = lambda repo: "/dev/null/cannot-mkdir-here"
@@ -189,6 +329,23 @@ try:
     check("main(): survives an unwritable state dir", True)
 finally:
     rh._resolve_workspace = _ow
+
+# 7) The tri-state process probe has ONE owner: _core_running delegates to
+#    tmux_probe.has_session with _tmux_socket()'s result (not the bare
+#    constant -- same reason as section 6) plus this module's session/budget.
+_seen = {}
+_oh = rh._tmux_has_session
+_ot = rh._tmux_socket
+_injected_sock = "/tmp/rh-delegation-check-%d.sock" % os.getpid()
+rh._tmux_has_session = lambda sock, sess, timeout=None: _seen.update(sock=sock, sess=sess, timeout=timeout)
+rh._tmux_socket = lambda: _injected_sock
+try:
+    check("_core_running: delegates to tmux_probe.has_session(_tmux_socket(), SESSION, timeout=8)",
+          rh._core_running() is None
+          and _seen == {"sock": _injected_sock, "sess": rh.SESSION, "timeout": 8})
+finally:
+    rh._tmux_has_session = _oh
+    rh._tmux_socket = _ot
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

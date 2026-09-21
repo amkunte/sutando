@@ -45,6 +45,7 @@ class TestEnumAndDefaults(unittest.TestCase):
     def test_discord_owner_tier_normal_other_tier_low(self):
         self.assertEqual(default_priority_for_source("discord", "owner"), "normal")
         self.assertEqual(default_priority_for_source("discord", "team"), "low")
+        self.assertEqual(default_priority_for_source("discord", "guest"), "low")
         self.assertEqual(default_priority_for_source("discord", "other"), "low")
         # Missing access_tier defaults to owner per the helper.
         self.assertEqual(default_priority_for_source("discord", None), "normal")
@@ -52,6 +53,15 @@ class TestEnumAndDefaults(unittest.TestCase):
     def test_telegram_owner_tier_normal_other_tier_low(self):
         self.assertEqual(default_priority_for_source("telegram", "owner"), "normal")
         self.assertEqual(default_priority_for_source("telegram", "team"), "low")
+
+    def test_slack_owner_tier_normal_other_tier_low(self):
+        # Slack carries the same owner/team/other tier model as discord — its
+        # non-owner tasks must demote identically (Air's finding 2026-07-24;
+        # slack was omitted from the tier branch originally).
+        self.assertEqual(default_priority_for_source("slack", "owner"), "normal")
+        self.assertEqual(default_priority_for_source("slack", "team"), "low")
+        self.assertEqual(default_priority_for_source("slack", "other"), "low")
+        self.assertEqual(default_priority_for_source("slack", None), "normal")
 
     def test_health_check_and_cron_default_low(self):
         self.assertEqual(default_priority_for_source("health-check"), "low")

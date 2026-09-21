@@ -67,8 +67,7 @@ def test_stale_idle_suppressed_while_deliberately_paused():
     mod = _load(); ws = _ws(mod)
     _status(ws, "idle", 5400)
     # A real presenter sentinel holds an ISO-8601 expiry (scripts/presenter-mode.sh);
-    # an empty file is malformed and must NOT read as paused. See
-    # tests/loop-paused-sentinel-expiry.test.py.
+    # an empty file is malformed and must NOT read as paused.
     future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
     (ws / "state" / "presenter-mode.sentinel").write_text(future + "\n")
     assert mod.check_core_proactive_loop()["status"] == "ok"
